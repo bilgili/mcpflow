@@ -112,7 +112,7 @@ command builds the wheel and passes it to Docker through a named build context.
 | `SESSION_TTL_SECONDS` | `604800` | session lifetime |
 | `CHILD_START_TIMEOUT` | `60` | probe timeout in seconds |
 | `LOG_LEVEL` | `INFO` | process log level |
-| `PUBLIC_URL` | unset | externally reachable base URL; else the request host. The OAuth redirect URI is `PUBLIC_URL` plus `/oauth/callback` |
+| `PUBLIC_URL` | unset | externally reachable base URL; else the request host |
 | `UV_CACHE_DIR` | Docker: `/data/cache/uv` | uvx cache |
 | `npm_config_cache` | Docker: `/data/cache/npm` | npx cache |
 
@@ -125,7 +125,7 @@ The process keeps all state under one data directory.
 - `secret_key`: the cookie signing key. The process creates it on first start with mode `0600`.
 - `logs/{namespace}.log`: the stderr of one child. The process truncates it on each start.
 - `servers/{namespace}/`: the inline source files of one child (see Inline source servers). Directories are mode `0700`, files `0600`.
-- `creds/{namespace}/`: `client.json` and `token.json` for an OAuth child (see Connect Gmail). Files are mode `0600`.
+- `creds/{namespace}/`: `client.json` and `token.json` for an OAuth child. Files are mode `0600`.
 - `cache/uv` and `cache/npm`: the package caches in Docker.
 
 ## Add a server
@@ -180,54 +180,6 @@ follow redirects.
 The import can fail. mcpmarket.com can answer `429`. The page can carry no MCP
 config. On a failure the UI shows the error and a JSON paste field. Paste the
 server config and confirm.
-
-## Connect Gmail
-
-Gmail signs in with Google OAuth. MCP Flow runs the sign-in for you; no file on
-disk is made by hand.
-
-1. In Google Cloud Console, create an OAuth client of type **Web application**.
-2. Open `/marketplace/gmail`. Copy the redirect URI shown on the detail.
-3. Add that redirect URI to the client's authorized redirect URIs in Google
-   Cloud Console.
-4. Copy the client id and the client secret from Google Cloud Console.
-5. Enter the client id and the client secret on `/marketplace/gmail` and select
-   **Connect with Google**.
-6. Sign in at Google and grant consent. Google returns to MCP Flow.
-7. Wait for the `gmail` server to report `running` on `/servers`.
-
-Set `PUBLIC_URL` to the externally reachable base URL when MCP Flow runs behind
-a reverse proxy, so the redirect URI matches the one registered at Google.
-
-A failed or expired flow leaves a disabled `gmail` server with an `awaiting
-authorization` mark on `/servers`. Delete that server and connect again to
-retry.
-
-## Re-authorize a Google service
-
-A refresh token can be revoked at the vendor, or a consent screen in "Testing"
-mode expires it after seven days. The child then fails. Instead of deleting and
-reconnecting, re-authorize in place: open `/servers/{namespace}/reauthorize`,
-re-enter the client id and the client secret, and sign in again. MCP Flow writes
-the new token and restarts the child. The namespace, its visibility settings,
-and its catalog tag stay.
-
-The server keeps serving on its old token until the sign-in finishes. A failed
-or cancelled re-authorization leaves the old token in place, so nothing is lost.
-A `re-authorize` link appears on the `/servers` row of any connected OAuth
-child.
-
-## Connect a remote OAuth service
-
-Some marketplace entries are remote servers that authenticate with a bearer
-token in an `Authorization` header — Linear, for example. MCP Flow signs in the
-same way as Gmail: open `/marketplace/{id}`, create an OAuth application at the
-vendor, add the redirect URI shown on the detail, enter the client id and
-secret, and sign in. MCP Flow puts the access token in the child's
-`Authorization` header instead of a file. No credential file is written; the
-token lives in the server record (`servers.json`, mode `0600`), the same as a
-token you would paste by hand. A remote token does not auto-refresh; when it
-expires, re-authorize from the `/servers` row.
 
 ## API tokens
 
