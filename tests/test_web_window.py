@@ -23,6 +23,10 @@ _DASHBOARD = (
     / "dashboard.html"
 )
 
+_STYLE = (
+    Path(__file__).resolve().parents[1] / "src" / "mcpflow" / "static" / "style.css"
+)
+
 
 def _tagged(ns: str = "gmail") -> ServerSpec:
     return ServerSpec(
@@ -189,6 +193,32 @@ def test_the_forms_in_the_window_do_not_nest(server_factory):
     edit = body.index('id="server-form"')
     close = body.index("</form>", edit)
     assert close < body.index('action="/servers/gmail/restart"')
+
+
+def test_the_window_lists_the_published_names_in_one_column(server_factory):
+    """A published name carries the namespace prefix and is far longer than a
+    catalogue tool name. In two columns it overflowed its column and painted
+    over the next one, which is unreadable rather than merely clipped."""
+    server = server_factory(seed_registry(fake_child_spec("time", "two")))
+    server.wait(running=1)
+    client = server.login()
+    body = client.get("/servers/time").text
+    client.close()
+    assert 'class="tools published"' in body
+    css = _STYLE.read_text()
+    assert ".tools.published { columns: 1; }" in css
+    # The break rule guards every tool list, including the marketplace's.
+    tools_li = [ln for ln in css.splitlines() if ln.startswith(".tools li")][0]
+    assert "overflow-wrap: anywhere" in tools_li
+
+
+def test_a_btn_anchor_is_styled_as_a_button():
+    """`.btn` is worn by both <button> and <a>. Without these the anchor keeps
+    the user-agent link look and reads as a link inside a border."""
+    css = _STYLE.read_text()
+    rule = css[css.index("button, .btn {") : css.index("input, textarea, select")]
+    assert "text-decoration: none" in rule
+    assert "display: inline-block" in rule
 
 
 def test_the_window_shows_the_catalog_identity(server_factory):

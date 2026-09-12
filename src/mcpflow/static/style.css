@@ -58,6 +58,10 @@ code { font-family: ui-monospace, monospace; }
   padding: 0 .25rem;
 }
 form.inline { display: inline; }
+/* `.btn` is worn by both <button> and <a>. Without these two the anchor keeps
+   the user-agent link look — underlined, link-coloured — and reads as a link
+   sitting inside a border rather than as a button. `inline-block` makes the
+   padding above apply to the anchor as well. */
 button, .btn {
   font: inherit;
   background: var(--panel);
@@ -66,8 +70,10 @@ button, .btn {
   border-radius: 5px;
   padding: 0.3rem 0.65rem;
   cursor: pointer;
+  display: inline-block;
+  text-decoration: none;
 }
-button:hover { border-color: var(--accent); }
+button:hover, .btn:hover { border-color: var(--accent); color: var(--fg); }
 input, textarea, select {
   font: inherit;
   background: var(--bg);
@@ -183,7 +189,15 @@ dialog.detail::backdrop { background: rgba(0, 0, 0, .6); }
 .dbody h3:first-child { margin-top: 0; }
 .dbody .what { margin: 0 0 .5rem; }
 .tools { margin: 0; padding: 0; list-style: none; columns: 2; column-gap: 1rem; font-size: .9rem; }
-.tools li { break-inside: avoid; padding: .1rem 0; }
+/* A tool name is one unbroken token. Without a break rule it overflows its
+   column and paints over the next one, which is unreadable rather than merely
+   clipped. `anywhere` lets the name wrap at any character, the same trade the
+   command block already makes. */
+.tools li { break-inside: avoid; padding: .1rem 0; overflow-wrap: anywhere; }
+/* The server window lists the PUBLISHED names, which carry the namespace
+   prefix and are far longer than the catalogue's bare tool names. Two columns
+   cannot hold them at this width, so that list runs in one. */
+.tools.published { columns: 1; }
 .dbody pre.code { white-space: pre-wrap; word-break: break-all; font-size: .82rem; line-height: 1.45; }
 .notice { color: var(--warn); font-size: .85rem; margin: .5rem 0 0; }
 .req { font-size: .8rem; color: var(--warn); }
