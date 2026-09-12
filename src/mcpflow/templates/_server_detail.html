@@ -37,16 +37,11 @@
     {% include "_server_form_fields.html" %}
   </div>
 
+  {# No tool list here. The child's group on the dashboard already lists its
+     tools with the description, the schema summary, and the control that mutes
+     each one, so this column would carry a shorter, poorer copy of the same
+     thing — and filling it cost a probe of every running child. #}
   <div class="side">
-    <h3>Tools</h3>
-    <ul class="tools published">
-      {% for t in tools %}
-      <li><code>{{ t.name }}</code></li>
-      {% else %}
-      <li class="muted">No tools yet.</li>
-      {% endfor %}
-    </ul>
-
     <h3>Runs as</h3>
     <pre class="code">{{ command }}</pre>
 

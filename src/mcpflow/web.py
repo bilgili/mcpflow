@@ -367,12 +367,17 @@ def build_routes(
     ) -> dict | None:
         """The server window's render context, or None for an unknown namespace.
 
-        The window reads only what the dashboard already reads. The raw
-        `source`, `env`, and `headers` reach the form inputs alone, the same
-        rule as the edit form before: `Registry.update` rebuilds `headers` from
-        the form, so a masked value would replace the `Authorization` token of
-        a header sink child on the next save. The row and the command show the
-        source through `redact_source`.
+        The window reads the registry and the catalog, and nothing else. It
+        does not call `Supervisor.tools()`: the child's group on the dashboard
+        owns the tool list, and that call probes every running child and marks
+        one `failed` when its probe raises, so filling a one-child page from it
+        could change an unrelated child's status.
+
+        The raw `source`, `env`, and `headers` reach the form inputs alone, the
+        same rule as the edit form before: `Registry.update` rebuilds `headers`
+        from the form, so a masked value would replace the `Authorization`
+        token of a header sink child on the next save. The row and the command
+        show the source through `redact_source`.
 
         `values` carries the typed values back on a 400; `None` reads them from
         the stored spec.
@@ -381,12 +386,10 @@ def build_routes(
             child = supervisor.get(ns)
         except KeyError:
             return None
-        views = await supervisor.tools()
         entry = _catalog().get(child.spec.catalog) if child.spec.catalog else None
         return {
             "ns": ns,
             "c": child,
-            "tools": [t for t in views if t.namespace == ns],
             "values": _form_values(child.spec) if values is None else values,
             "tab": child.spec.kind,
             "editing": True,

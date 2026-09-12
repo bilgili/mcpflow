@@ -194,10 +194,6 @@ dialog.detail::backdrop { background: rgba(0, 0, 0, .6); }
    clipped. `anywhere` lets the name wrap at any character, the same trade the
    command block already makes. */
 .tools li { break-inside: avoid; padding: .1rem 0; overflow-wrap: anywhere; }
-/* The server window lists the PUBLISHED names, which carry the namespace
-   prefix and are far longer than the catalogue's bare tool names. Two columns
-   cannot hold them at this width, so that list runs in one. */
-.tools.published { columns: 1; }
 .dbody pre.code { white-space: pre-wrap; word-break: break-all; font-size: .82rem; line-height: 1.45; }
 .notice { color: var(--warn); font-size: .85rem; margin: .5rem 0 0; }
 .req { font-size: .8rem; color: var(--warn); }

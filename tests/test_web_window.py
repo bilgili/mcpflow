@@ -195,19 +195,49 @@ def test_the_forms_in_the_window_do_not_nest(server_factory):
     assert close < body.index('action="/servers/gmail/restart"')
 
 
-def test_the_window_lists_the_published_names_in_one_column(server_factory):
-    """A published name carries the namespace prefix and is far longer than a
-    catalogue tool name. In two columns it overflowed its column and painted
-    over the next one, which is unreadable rather than merely clipped."""
+def test_the_window_lists_no_tool(server_factory):
+    """The child's group on the dashboard owns the tool list, and its copy is
+    richer: description, schema summary, and the control that mutes a tool."""
     server = server_factory(seed_registry(fake_child_spec("time", "two")))
     server.wait(running=1)
     client = server.login()
-    body = client.get("/servers/time").text
+    window = client.get("/servers/time").text
+    page = client.get("/").text
     client.close()
-    assert 'class="tools published"' in body
+    # The window names no tool and holds no list element for them.
+    assert "time_get_current_time" not in window
+    assert "time_convert_time" not in window
+    assert 'class="tools' not in window
+    # The group still lists every one of them.
+    assert "time_get_current_time" in page
+    assert "time_convert_time" in page
+
+
+def test_the_window_probes_no_child(server_factory, monkeypatch):
+    """`Supervisor.tools()` probes every running child and marks one `failed`
+    when its probe raises. A read-only window must not be able to do that to an
+    unrelated child."""
+    server = server_factory(seed_registry(fake_child_spec("time", "two")))
+    server.wait(running=1)
+    sup = server.supervisor
+    calls = []
+    real = sup.tools
+
+    async def counting():
+        calls.append(1)
+        return await real()
+
+    monkeypatch.setattr(sup, "tools", counting)
+    client = server.login()
+    assert client.get("/servers/time").status_code == 200
+    client.close()
+    assert calls == []
+
+
+def test_the_break_rule_still_guards_the_marketplace_list():
+    """The marketplace detail keeps its two-column list, so the rule that stops
+    a long name painting over the next column must stay."""
     css = _STYLE.read_text()
-    assert ".tools.published { columns: 1; }" in css
-    # The break rule guards every tool list, including the marketplace's.
     tools_li = [ln for ln in css.splitlines() if ln.startswith(".tools li")][0]
     assert "overflow-wrap: anywhere" in tools_li
 
