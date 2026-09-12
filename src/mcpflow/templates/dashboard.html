@@ -1,5 +1,63 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>Tools</h1>
+<div class="page-head">
+  <h1>Servers</h1>
+  <a class="btn primary" href="/add-server" hx-get="/add-server"
+     hx-target="#detail" hx-swap="innerHTML">Add server</a>
+</div>
+
 {% include "_tools_tree.html" %}
+
+{# The server window and the add-server window land here. The dialog sits
+   outside the tree, so a tree swap (a poll or a visibility control) never
+   replaces a window the admin is typing in. The guard keeps the JSON import
+   swap, which lands inside the dialog and bubbles the same event, from
+   re-opening it.
+
+   htmx answers a 4xx with `swap:false`, so the JSON tab's parse error would
+   reach this element and render nothing. A parse error is a normal answer of
+   a window, not a transport fault, so the host that owns the window says the
+   400 may swap. The override lives here because htmx fires `beforeSwap` on
+   the swap target, not on the form that made the request. #}
+<dialog id="detail" class="detail"
+        hx-on::before-swap="if (event.detail.xhr.status === 400) { event.detail.shouldSwap = true; event.detail.isError = false; }"
+        hx-on::after-swap="if (event.target === this) this.showModal()"></dialog>
+
+<script>
+  // The open state of the groups has one owner: this DOM. The server renders
+  // none, so a control answer cannot re-open a group the admin collapsed
+  // during the round trip. The restore runs on `afterSwap`, in the same task
+  // as the insert; `afterSettle` runs 20 ms later and would paint a collapsed
+  // tree and lose a toggle made in that window. The record step identifies the
+  // tree through the event target, the restore step finds the new element by
+  // id, so neither step holds a reference to the old node.
+  (function () {
+    var open = [];
+    document.body.addEventListener("htmx:beforeSwap", function (event) {
+      var target = event.detail.target;
+      if (!target || target.id !== "tools-tree") return;
+      // A rejected answer replaces nothing, so it leaves no record to spend.
+      // Without this guard the stale record would outlive the request and
+      // re-open a group the admin collapsed after it.
+      if (event.detail.shouldSwap === false) return;
+      open = Array.prototype.slice
+        .call(target.querySelectorAll("details[data-ns]"))
+        .filter(function (d) { return d.open; })
+        .map(function (d) { return d.dataset.ns; });
+    });
+    document.body.addEventListener("htmx:afterSwap", function () {
+      if (!open.length) return;
+      var groups = open;
+      // Spend the record here. A later swap of another target must not
+      // re-open a group the admin collapsed after this one landed.
+      open = [];
+      var tree = document.getElementById("tools-tree");
+      if (!tree) return;
+      groups.forEach(function (ns) {
+        var group = tree.querySelector('details[data-ns="' + ns + '"]');
+        if (group) group.open = true;
+      });
+    });
+  })();
+</script>
 {% endblock %}

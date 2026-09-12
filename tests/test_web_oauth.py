@@ -371,14 +371,14 @@ def test_callback_without_session(server_factory):
 # --- 7.6 awaiting mark -------------------------------------------------------
 
 
-def test_servers_table_awaiting_mark(server_factory):
+def test_group_header_shows_awaiting_mark(server_factory):
     server = server_factory(PUBLIC_URL=PUBLIC, CHILD_START_TIMEOUT="2")
     client = server.login()
     client.post(
         "/marketplace/gmail/connect",
         data={"namespace": "gmail", "client_id": "abc", "client_secret": "shhh"},
     )
-    html = client.get("/servers").text
+    html = client.get("/").text
     client.close()
     assert "awaiting authorization" in html
 
@@ -639,11 +639,12 @@ def test_reauth_callback_malformed_expiry_keeps_child_running(server_factory, mo
     assert cli["web"]["client_id"] == "old-id"  # unchanged
 
 
-def test_servers_table_offers_reauth(server_factory):
+def test_window_offers_reauth(server_factory):
     server = server_factory(seed_registry(_gmail_child()), PUBLIC_URL=PUBLIC, CHILD_START_TIMEOUT="2")
     _seed_connected_gmail(server)
     client = server.login()
-    html = client.get("/servers").text
+    # The action lives in the window, not on the dashboard row.
+    html = client.get("/servers/gmail").text
     client.close()
     assert 'href="/servers/gmail/reauthorize"' in html
 
@@ -696,6 +697,9 @@ def test_callback_header_sink_sets_header(server_factory, mock_token_endpoint):
 def test_pending_header_child_shows_mark(server_factory):
     server = server_factory(seed_registry(_linear_child()), PUBLIC_URL=PUBLIC, CHILD_START_TIMEOUT="2")
     client = server.login()
-    html = client.get("/servers").text
+    # The group header on the dashboard and the head of the window both mark it.
+    page = client.get("/").text
+    window = client.get("/servers/linear").text
     client.close()
-    assert "awaiting authorization" in html
+    assert "awaiting authorization" in page
+    assert "awaiting authorization" in window

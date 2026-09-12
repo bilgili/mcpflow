@@ -35,10 +35,10 @@ def _local(data_dir, name, entry):
 
 def test_nav_order(server_factory):
     client = server_factory().login()
-    html = client.get("/servers").text
+    html = client.get("/marketplace").text
     client.close()
     names = re.findall(r'<nav>.*?</nav>', html, re.S)[0]
-    assert re.findall(r">([A-Za-z]+)</a>", names) == ["Dashboard", "Servers", "Marketplace", "Tokens"]
+    assert re.findall(r">([A-Za-z]+)</a>", names) == ["Dashboard", "Marketplace", "Tokens"]
 
 
 def test_marketplace_without_session(server_factory):
@@ -67,7 +67,7 @@ def test_page_lists_cards(server_factory):
     client.close()
     assert 'href="/marketplace/gmail"' in html
     assert 'href="/marketplace/slack"' in html
-    assert 'href="/servers/new"' in html
+    assert 'href="/add-server"' in html
     assert "<dialog" in html
 
 

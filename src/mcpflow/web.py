@@ -40,7 +40,7 @@ from .oauth import (
     authorize_url,
     token_request,
 )
-from .registry import RegistryError, ServerSpec, redact_source, spec_from_dict
+from .registry import RegistryError, ServerSpec, spec_command, spec_from_dict
 from .supervisor import Supervisor
 
 logger = logging.getLogger(__name__)
@@ -161,9 +161,6 @@ def build_routes(
         loader=FileSystemLoader(str(_TEMPLATES)),
         autoescape=select_autoescape(),
     )
-    # The servers table renders the redacted source; the raw value stays in the
-    # edit form only, the same rule as raw `env`.
-    env.filters["redact_source"] = redact_source
 
     def render(
         name: str, request: Request, *, status_code: int = 200, **ctx
@@ -174,16 +171,16 @@ def build_routes(
     def is_htmx(request: Request) -> bool:
         return request.headers.get("HX-Request") == "true"
 
-    def servers_response(request: Request) -> Response:
+    async def servers_response(request: Request) -> Response:
+        """The answer to a successful action.
+
+        An htmx caller gets the tool tree, the element the dashboard shows the
+        child in. A plain caller posted from the server window, so the page
+        reload closes the dialog and shows the new state.
+        """
         if is_htmx(request):
-            return render(
-                "_servers_table.html",
-                request,
-                children=supervisor.children(),
-                awaiting=_awaiting(),
-                reauthable=_reauthable(),
-            )
-        return RedirectResponse("/servers", status_code=303)
+            return await tools_tree(request, "_tools_tree.html")
+        return RedirectResponse("/", status_code=303)
 
     # --- auth ------------------------------------------------------------
 
@@ -232,14 +229,15 @@ def build_routes(
 
     # --- dashboard and servers ------------------------------------------
 
-    async def tools_tree(
-        request: Request, name: str = "dashboard.html", open_ns: str | None = None
-    ) -> Response:
+    async def tools_tree(request: Request, name: str = "dashboard.html") -> Response:
         """Render the tool tree.
 
-        `open_ns` re-opens the group the admin just acted in. The swap
-        replaces the whole tree, so without it every control the admin clicks
-        collapses the group under their cursor.
+        Every group renders collapsed, in every render: the page load, the
+        poll answer, and a control answer alike. The browser owns the open
+        state; `dashboard.html` records it before a tree swap and restores it
+        after. A server-side hint would name the group that was open when the
+        admin clicked, not when the answer lands, so it would re-open a group
+        the admin collapsed during the round trip.
         """
         views = await supervisor.tools()
         return render(
@@ -251,11 +249,18 @@ def build_routes(
             # The `mcpflow` group has no `Child`, so its namespace control reads
             # this flag instead of `c.spec.muted`.
             mcpflow_muted=supervisor.mcpflow_muted(),
-            open_ns=open_ns,
+            spec_command=spec_command,
+            awaiting=_awaiting(),
+            reauthable=_reauthable(),
+            catalog_names=_catalog_names(),
         )
 
     async def dashboard(request: Request) -> Response:
         return await tools_tree(request)
+
+    async def tools_tree_partial(request: Request) -> Response:
+        """The poll's route. No parameters: the tree carries no open state."""
+        return await tools_tree(request, "_tools_tree.html")
 
     # --- visibility ------------------------------------------------------
     #
@@ -279,9 +284,7 @@ def build_routes(
             supervisor.set_namespace_muted(request.path_params["ns"], _muted(form))
         except KeyError:
             return PlainTextResponse("not found", status_code=404)
-        return await tools_tree(
-            request, "_tools_tree.html", open_ns=request.path_params["ns"]
-        )
+        return await tools_tree(request, "_tools_tree.html")
 
     async def visibility_tool(request: Request) -> Response:
         # The tool name travels in the body, never in the path. A child names
@@ -298,33 +301,45 @@ def build_routes(
             supervisor.set_tool_muted(request.path_params["ns"], tool, _muted(form))
         except KeyError:
             return PlainTextResponse("not found", status_code=404)
-        return await tools_tree(
-            request, "_tools_tree.html", open_ns=request.path_params["ns"]
-        )
+        return await tools_tree(request, "_tools_tree.html")
 
     async def servers(request: Request) -> Response:
-        return render(
-            "servers.html",
-            request,
-            children=supervisor.children(),
-            awaiting=_awaiting(),
-            reauthable=_reauthable(),
-        )
+        """The old servers page. The dashboard is the one page for the child
+        servers now, so a bookmark lands there."""
+        return RedirectResponse("/", status_code=303)
 
-    async def servers_table(request: Request) -> Response:
+    def _add_window(
+        request: Request,
+        *,
+        tab: str,
+        values: dict,
+        error: str | None = None,
+        paste: str = "",
+        status_code: int = 200,
+        page: bool | None = None,
+    ) -> Response:
+        """The add-server window: the partial in the dialog, the page without.
+
+        `page` forces the full page for a plain form post, which answers a
+        reload rather than a swap.
+        """
+        as_page = (not is_htmx(request)) if page is None else page
         return render(
-            "_servers_table.html",
+            "server_form.html" if as_page else "_server_form.html",
             request,
-            children=supervisor.children(),
-            awaiting=_awaiting(),
-            reauthable=_reauthable(),
+            status_code=status_code,
+            page=as_page,
+            tab=tab,
+            values=values,
+            error=error,
+            editing=False,
+            paste=paste,
         )
 
     async def server_new(request: Request) -> Response:
-        tab = request.query_params.get("tab", "python")
-        return render(
-            "server_form.html", request, tab=tab, values={}, error=None, editing=False
-        )
+        # `new` is a legal namespace, so `GET /servers/{ns}` owns that space
+        # and the add window lives at its own path.
+        return _add_window(request, tab=request.query_params.get("tab", "python"), values={})
 
     async def server_create(request: Request) -> Response:
         form = await request.form()
@@ -332,30 +347,68 @@ def build_routes(
             spec = _spec_from_form(form)
             await supervisor.add(spec)
         except RegistryError as exc:
-            return render(
-                "server_form.html",
+            # The form posts without htmx, so the answer is the full page with
+            # the typed values, the same as the marketplace connect.
+            return _add_window(
                 request,
-                status_code=400,
                 tab=form.get("kind", "python"),
                 values=dict(form),
                 error=str(exc),
-                editing=False,
+                status_code=400,
+                page=True,
             )
-        return RedirectResponse("/servers", status_code=303)
+        return RedirectResponse("/", status_code=303)
 
-    async def server_edit(request: Request) -> Response:
-        ns = request.path_params["ns"]
+    async def _server_detail_ctx(
+        ns: str,
+        request: Request,
+        values: dict | None = None,
+        error: str | None = None,
+    ) -> dict | None:
+        """The server window's render context, or None for an unknown namespace.
+
+        The window reads only what the dashboard already reads. The raw
+        `source`, `env`, and `headers` reach the form inputs alone, the same
+        rule as the edit form before: `Registry.update` rebuilds `headers` from
+        the form, so a masked value would replace the `Authorization` token of
+        a header sink child on the next save. The row and the command show the
+        source through `redact_source`.
+
+        `values` carries the typed values back on a 400; `None` reads them from
+        the stored spec.
+        """
         try:
             child = supervisor.get(ns)
         except KeyError:
+            return None
+        views = await supervisor.tools()
+        entry = _catalog().get(child.spec.catalog) if child.spec.catalog else None
+        return {
+            "ns": ns,
+            "c": child,
+            "tools": [t for t in views if t.namespace == ns],
+            "values": _form_values(child.spec) if values is None else values,
+            "tab": child.spec.kind,
+            "editing": True,
+            "command": spec_command(child.spec),
+            "awaiting": _awaiting(),
+            "reauthable": _reauthable(),
+            "e": entry,
+            "error": error,
+        }
+
+    async def server_detail(request: Request) -> Response:
+        ctx = await _server_detail_ctx(request.path_params["ns"], request)
+        if ctx is None:
             return PlainTextResponse("not found", status_code=404)
-        return render(
-            "server_form.html",
-            request,
-            tab=child.spec.kind,
-            values=_form_values(child.spec),
-            error=None,
-            editing=True,
+        if is_htmx(request):
+            return render("_server_detail.html", request, page=False, **ctx)
+        return render("server_detail.html", request, page=True, **ctx)
+
+    async def server_edit(request: Request) -> Response:
+        """The old edit page. The window holds the edit form now."""
+        return RedirectResponse(
+            f"/servers/{request.path_params['ns']}", status_code=303
         )
 
     async def server_update(request: Request) -> Response:
@@ -369,16 +422,15 @@ def build_routes(
             spec = _spec_from_form(form, namespace=ns)
             await supervisor.update(spec)
         except RegistryError as exc:
-            return render(
-                "server_form.html",
-                request,
-                status_code=400,
-                tab=form.get("kind", "custom"),
-                values=dict(form),
-                error=str(exc),
-                editing=True,
+            ctx = await _server_detail_ctx(
+                ns, request, values=dict(form), error=str(exc)
             )
-        return RedirectResponse("/servers", status_code=303)
+            if ctx is None:  # pragma: no cover - a delete raced the save
+                return PlainTextResponse("not found", status_code=404)
+            return render(
+                "server_detail.html", request, status_code=400, page=True, **ctx
+            )
+        return RedirectResponse("/", status_code=303)
 
     def _action(op):
         async def handler(request: Request) -> Response:
@@ -388,8 +440,18 @@ def build_routes(
             except KeyError:
                 return PlainTextResponse("not found", status_code=404)
             except RegistryError as exc:
-                return PlainTextResponse(str(exc), status_code=400)
-            return servers_response(request)
+                # An htmx caller reads the bare reason. A plain caller posted
+                # from the server window, so it gets the window back with the
+                # reason on it.
+                if is_htmx(request):
+                    return PlainTextResponse(str(exc), status_code=400)
+                ctx = await _server_detail_ctx(ns, request, error=str(exc))
+                if ctx is None:  # pragma: no cover - a delete raced the action
+                    return PlainTextResponse(str(exc), status_code=400)
+                return render(
+                    "server_detail.html", request, status_code=400, page=True, **ctx
+                )
+            return await servers_response(request)
 
         return handler
 
@@ -405,19 +467,23 @@ def build_routes(
     # --- imports ---------------------------------------------------------
 
     async def import_json(request: Request) -> Response:
+        """Parse a pasted config block into the add window.
+
+        The answer is the whole window, pre-filled, so the dialog keeps one
+        owner and the footer button switches from `Parse` to `Add server`. A
+        parse error answers the same window with the paste still in place.
+        """
         form = await request.form()
+        paste = form.get("config", "")
         try:
-            specs = parse_config_block(form.get("config", ""))
+            specs = parse_config_block(paste)
         except RegistryError as exc:
-            return render(
-                "_import_error.html", request, status_code=400, error=str(exc)
+            return _add_window(
+                request, tab="json", values={}, error=str(exc), paste=paste,
+                status_code=400,
             )
-        return render(
-            "_server_form_fields.html",
-            request,
-            values=_form_values(specs[0]),
-            editing=False,
-        )
+        values = _form_values(specs[0])
+        return _add_window(request, tab=values["kind"], values=values)
 
     # --- marketplace -----------------------------------------------------
 
@@ -489,6 +555,15 @@ def build_routes(
             if child.spec.catalog:
                 out.setdefault(child.spec.catalog, []).append(child.spec.namespace)
         return out
+
+    def _catalog_names() -> dict[str, str]:
+        """Catalog entry id -> entry name.
+
+        The server row and the window head name the marketplace entry a child
+        came from. A tag that matches no entry is absent from the map, so the
+        page shows nothing rather than a dangling id.
+        """
+        return {e.id: e.name for e in _catalog().entries()}
 
     def _market_ctx(request: Request) -> dict:
         catalog = _catalog()
@@ -851,6 +926,8 @@ def build_routes(
         Route("/login", login_post, methods=["POST"]),
         Route("/logout", logout, methods=["POST"]),
         Route("/", dashboard, methods=["GET"]),
+        # The poll's route. Not a public prefix, so the session gate covers it.
+        Route("/tools/tree", tools_tree_partial, methods=["GET"]),
         Route("/visibility/root", visibility_root, methods=["POST"]),
         # Namespaces live under their own prefix: `root` is a legal namespace
         # name, so `/visibility/{ns}` would shadow the gateway-wide route.
@@ -859,8 +936,7 @@ def build_routes(
             "/visibility/namespaces/{ns}/tool", visibility_tool, methods=["POST"]
         ),
         Route("/servers", servers, methods=["GET"]),
-        Route("/servers/table", servers_table, methods=["GET"]),
-        Route("/servers/new", server_new, methods=["GET"]),
+        Route("/add-server", server_new, methods=["GET"]),
         Route("/servers", server_create, methods=["POST"]),
         Route("/servers/{ns}/edit", server_edit, methods=["GET"]),
         Route("/servers/{ns}", server_update, methods=["POST"]),
@@ -871,6 +947,9 @@ def build_routes(
         Route("/servers/{ns}/log", server_log, methods=["GET"]),
         Route("/servers/{ns}/reauthorize", reauthorize_get, methods=["GET"]),
         Route("/servers/{ns}/reauthorize", reauthorize_post, methods=["POST"]),
+        # Declared after the literal suffixes above so `/log`, `/edit`, and
+        # `/reauthorize` keep matching their own routes.
+        Route("/servers/{ns}", server_detail, methods=["GET"]),
         Route("/import/json", import_json, methods=["POST"]),
         Route("/marketplace", marketplace, methods=["GET"]),
         Route("/marketplace/grid", marketplace_grid, methods=["GET"]),

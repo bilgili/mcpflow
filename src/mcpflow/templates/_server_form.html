@@ -1,0 +1,90 @@
+{# The add-server window. One partial, two frames: inside the <dialog> on `/`,
+   or inside the full page at `/add-server`. `page` picks the close control.
+
+   The frame is a plain `<div class="dbody">`, the same as the server window,
+   so the footer button reaches the form through the native `form=` attribute
+   and no form nests inside another.
+
+   The JSON tab has one owner: this window. Before a parse the left column
+   holds the paste form and the footer reads `Parse`; `POST /import/json`
+   answers this whole window pre-filled, and the footer then reads
+   `Add server` with `form="server-form"`, the same as the other two tabs. #}
+{% set unparsed = tab == 'json' and not values %}
+<div class="dhead">
+  <span class="icon plain">+</span>
+  <div>
+    <h2>Add server</h2>
+    <div class="vendor">By package, by URL, or from a JSON config block</div>
+  </div>
+  {% if page %}
+  <a class="btn close" href="/">Back to servers</a>
+  {% else %}
+  <form method="dialog" class="inline close"><button type="submit">Close</button></form>
+  {% endif %}
+</div>
+
+<div class="dbody">
+  <div>
+    {# The `page` flag picks the host, and the host owns the navigation. In the
+       dialog a tab swaps this window in place. On the full page there is no
+       `#detail` element, so the control must stay a plain link: htmx handles
+       a click before the browser does, and an hx-get at a missing target
+       would abort the navigation instead of loading the tab. #}
+    <div class="tabs">
+      <a href="/add-server?tab=python"
+         {% if not page %}hx-get="/add-server?tab=python" hx-target="#detail" hx-swap="innerHTML"{% endif %}
+         class="{{ 'active' if tab == 'python' }}">Python</a>
+      <a href="/add-server?tab=npm"
+         {% if not page %}hx-get="/add-server?tab=npm" hx-target="#detail" hx-swap="innerHTML"{% endif %}
+         class="{{ 'active' if tab == 'npm' }}">npm</a>
+      <a href="/add-server?tab=json"
+         {% if not page %}hx-get="/add-server?tab=json" hx-target="#detail" hx-swap="innerHTML"{% endif %}
+         class="{{ 'active' if tab == 'json' }}">JSON</a>
+    </div>
+
+    {% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+    {% if unparsed %}
+    {# htmx answers a 4xx with `swap:false`, so a parse error would render
+       nothing. The dialog in `dashboard.html` owns that override: htmx fires
+       `beforeSwap` on the swap target, not on the requesting form, so a
+       handler here would never see the event. The plain post carries the same
+       400 as a page reload. #}
+    <form id="import-form" method="post" action="/import/json"
+          {% if not page %}hx-post="/import/json" hx-target="#detail" hx-swap="innerHTML"{% endif %}>
+      <label>Paste JSON config</label>
+      <textarea name="config" rows="8"
+                placeholder='{"mcpServers": {...}}'>{{ paste }}</textarea>
+    </form>
+    {% else %}
+    {% include "_server_form_fields.html" %}
+    {% endif %}
+  </div>
+
+  <div class="side">
+    <h3>What gets registered</h3>
+    <p class="small muted">MCP Flow writes one server record to
+      <code>servers.json</code> and starts the child. Edit it later from its
+      group on the dashboard.</p>
+    <h3>Namespace</h3>
+    <p class="small muted">The prefix every tool of this server carries on
+      <code>/mcp</code>. Lower-case letters, digits, and underscores.</p>
+    <h3>Source</h3>
+    <p class="small muted">Optional. A git URL or a <code>github:</code>
+      reference installs the package from there instead of the public
+      registry. With a source, Package is the bin name.</p>
+    <h3>JSON</h3>
+    <p class="small muted">Paste an <code>mcpServers</code> block from another
+      client. MCP Flow fills the fields; nothing is saved until you add it.</p>
+  </div>
+
+  <div class="dfoot">
+    {% if unparsed %}
+    <span class="hint">Parses the block into the fields. Nothing is saved yet.</span>
+    <button form="import-form" class="primary">Parse</button>
+    {% else %}
+    <span class="hint">Starts the server after saving. Tools appear on the dashboard once it reports running.</span>
+    <button form="server-form" class="primary">Add server</button>
+    {% endif %}
+  </div>
+</div>

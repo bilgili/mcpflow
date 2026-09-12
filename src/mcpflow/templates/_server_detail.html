@@ -1,0 +1,78 @@
+{# The server window. One partial, two frames: inside the <dialog> on `/`, or
+   inside the full page at `/servers/{ns}`. `page` picks the close control.
+
+   The frame is a plain `<div class="dbody">`, not a `<form>` like the
+   marketplace detail. The window needs one save form and four action forms,
+   and HTML drops a nested `<form>`. The footer button reaches the edit form
+   through the native `form="server-form"` attribute instead.
+
+   Every form here posts without htmx. A success redirects to `/`, so the page
+   reload closes the dialog and shows the new state. #}
+<div class="dhead">
+  {% if e %}
+  <span class="icon" style="background:{{ e.color }}">{{ e.monogram }}</span>
+  {% else %}
+  <span class="icon plain">{{ ns[0] | upper }}</span>
+  {% endif %}
+  <div>
+    <h2>{{ ns }}</h2>
+    <div class="vendor">
+      <span class="status status-{{ c.status }}">{{ c.status }}</span>
+      · <span class="kind">{{ c.spec.kind }}</span>
+      {% if e %} · from marketplace entry {{ e.name }}{% endif %}
+      {% if ns in awaiting %}<span class="awaiting" title="Delete this server and connect again to retry.">awaiting authorization</span>{% endif %}
+    </div>
+  </div>
+  {% if page %}
+  <a class="btn close" href="/">Back to servers</a>
+  {% else %}
+  <form method="dialog" class="inline close"><button type="submit">Close</button></form>
+  {% endif %}
+</div>
+
+<div class="dbody">
+  <div>
+    <h3>Settings</h3>
+    {% if error %}<p class="error">{{ error }}</p>{% endif %}
+    {% include "_server_form_fields.html" %}
+  </div>
+
+  <div class="side">
+    <h3>Tools</h3>
+    <ul class="tools">
+      {% for t in tools %}
+      <li><code>{{ t.name }}</code></li>
+      {% else %}
+      <li class="muted">No tools yet.</li>
+      {% endfor %}
+    </ul>
+
+    <h3>Runs as</h3>
+    <pre class="code">{{ command }}</pre>
+
+    {% if c.last_error %}
+    <h3>Last error</h3>
+    <p class="error">{{ c.last_error }}</p>
+    {% endif %}
+
+    <h3>Actions</h3>
+    <div class="actions">
+      <form method="post" action="/servers/{{ ns }}/restart"><button>restart</button></form>
+      {% if c.spec.enabled %}
+      <form method="post" action="/servers/{{ ns }}/disable"><button>disable</button></form>
+      {% else %}
+      <form method="post" action="/servers/{{ ns }}/enable"><button>enable</button></form>
+      {% endif %}
+      <form method="post" action="/servers/{{ ns }}/delete"><button class="danger">remove</button></form>
+      <a class="btn" href="/servers/{{ ns }}/log" target="_blank" rel="noopener">log</a>
+      {% if ns in reauthable %}
+      <a class="btn" href="/servers/{{ ns }}/reauthorize">re-authorize</a>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="dfoot">
+    <span class="hint">Saving restarts the server.</span>
+    <button form="server-form" class="primary">Save changes</button>
+  </div>
+</div>

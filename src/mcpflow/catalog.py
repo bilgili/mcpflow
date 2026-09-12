@@ -32,8 +32,8 @@ from pydantic import (
 from .registry import (
     RegistryError,
     ServerSpec,
-    build_command,
     redact_source,
+    spec_command,
     validate_namespace,
     validate_source,
 )
@@ -238,26 +238,11 @@ class CatalogEntry(CatalogFile):
         """The command line the child runs as, with the same args the
         preview shows (`None` = the entry args).
 
-        The view adapter, not the command rule: `registry.build_command` owns
-        the rule, this joins the result for a page. A `remote` entry has no
-        argument list, so it never reaches `build_command`.
-
-        The source is redacted here. `build_command` returns what it is given
-        and the detail renders the result into a `<pre>`, so a source that
-        carries user information would otherwise reach the page verbatim.
+        `registry.spec_command` owns the view, `registry.build_command` owns
+        the rule. The dashboard server row and the server window call the same
+        adapter, so the three pages can never disagree.
         """
-        s = self.spec
-        shown = list(s.args) if args is None else list(args)
-        if s.kind == "remote":
-            return f"{s.transport.upper()} {s.url}"
-        command, argv = build_command(
-            kind=s.kind,
-            package=s.package or "",
-            args=shown,
-            command=s.command or "",
-            source=redact_source(s.source),
-        )
-        return " ".join([command, *argv]).strip()
+        return spec_command(self.spec, args)
 
     def preview(self, namespace: str, args: list[str] | None = None) -> dict:
         """The spec the connect action registers, every secret masked."""

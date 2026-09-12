@@ -207,3 +207,23 @@ dialog.detail::backdrop { background: rgba(0, 0, 0, .6); }
   color: var(--warn);
   font-size: 0.75rem;
 }
+
+/* Unified dashboard: page head, server row, window actions. */
+.page-head { display: flex; align-items: center; gap: 1rem; margin-bottom: .5rem; }
+.page-head h1 { margin: 0; }
+.page-head .btn { margin-left: auto; }
+.page-head .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+/* One row per child, directly under the group header. */
+.server-row { display: flex; align-items: center; gap: .8rem; flex-wrap: wrap; padding: .5rem .8rem; border-bottom: 1px solid var(--border); }
+.server-row .cmd { font-size: .82rem; word-break: break-all; min-width: 0; }
+.server-row .error { margin: 0; font-size: .85rem; }
+.server-row .btn { margin-left: auto; white-space: nowrap; }
+
+/* The action group in the server window: one small form per action. */
+.actions { display: flex; align-items: center; gap: .4rem; flex-wrap: wrap; margin: .35rem 0; }
+.actions form { margin: 0; }
+.actions .danger { border-color: var(--err); color: var(--err); }
+
+/* A child with no catalog entry shows a plain monogram, not a brand colour. */
+.icon.plain { background: var(--border); color: var(--muted); }
