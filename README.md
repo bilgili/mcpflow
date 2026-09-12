@@ -33,8 +33,56 @@ a child takes effect without a process restart.
 - The gateway keeps its persistent state under one data directory. See "Files under
   `DATA_DIR`".
 
+## Screens
+
+Select a picture to open it at full size.
+
+<table>
+  <tr>
+    <td width="50%">
+      <a href="docs/screenshots/01-dashboard.png"><img src="docs/screenshots/thumbs/01-dashboard.png" alt="The dashboard with one group per server"></a>
+      <br><b>Dashboard.</b> One collapsible group per registered server.
+    </td>
+    <td width="50%">
+      <a href="docs/screenshots/02-dashboard-group-expanded.png"><img src="docs/screenshots/thumbs/02-dashboard-group-expanded.png" alt="An expanded group showing the server row and the tool table"></a>
+      <br><b>An expanded group.</b> The run command, then every tool it publishes.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <a href="docs/screenshots/03-server-window.png"><img src="docs/screenshots/thumbs/03-server-window.png" alt="The server window open over the dashboard"></a>
+      <br><b>Server window.</b> Edit, restart, disable, remove, and read the log.
+    </td>
+    <td width="50%">
+      <a href="docs/screenshots/04-add-server.png"><img src="docs/screenshots/thumbs/04-add-server.png" alt="The add-server window on the Python tab"></a>
+      <br><b>Add a server.</b> By Python package, by npm package, or by URL.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <a href="docs/screenshots/05-add-server-json.png"><img src="docs/screenshots/thumbs/05-add-server-json.png" alt="The add-server window on the JSON tab"></a>
+      <br><b>Paste a config.</b> An <code>mcpServers</code> block from another client fills the fields.
+    </td>
+    <td width="50%">
+      <a href="docs/screenshots/06-marketplace.png"><img src="docs/screenshots/thumbs/06-marketplace.png" alt="The marketplace grid"></a>
+      <br><b>Marketplace.</b> Ready-made entries; a connected one shows its namespace.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <a href="docs/screenshots/07-marketplace-detail.png"><img src="docs/screenshots/thumbs/07-marketplace-detail.png" alt="A marketplace entry detail"></a>
+      <br><b>Marketplace entry.</b> The record it writes and the command it runs as.
+    </td>
+    <td width="50%">
+      <a href="docs/screenshots/08-tokens.png"><img src="docs/screenshots/thumbs/08-tokens.png" alt="The tokens page"></a>
+      <br><b>Tokens.</b> Create a bearer token and copy the client config.
+    </td>
+  </tr>
+</table>
+
 ## Contents
 
+- [Screens](#screens)
 - [Install](#install)
 - [Set the admin password](#set-the-admin-password)
 - [Run the server](#run-the-server)
@@ -44,6 +92,7 @@ a child takes effect without a process restart.
 - [Add a server](#add-a-server)
 - [Import from mcpmarket](#import-from-mcpmarket)
 - [API tokens](#api-tokens)
+- [Connect an agent](#connect-an-agent)
 - [Admin API](#admin-api)
 - [Admin MCP tools](#admin-mcp-tools)
 - [Inline source servers](#inline-source-servers)
@@ -203,6 +252,79 @@ Authorization: Bearer mcpflow_<token>
 ```
 
 The gateway publishes every tool of a running child as `{namespace}_{tool}`.
+
+## Connect an agent
+
+Every client needs the same two facts: the URL of the gateway and one bearer
+token. MCP Flow speaks streamable HTTP at `/mcp`. It is one server to the
+client, however many children it runs behind that address.
+
+Create a token at `/tokens` first. That page prints the two blocks below with
+your real host and token already filled in, so copy from there rather than
+retyping.
+
+```
+URL     https://mcp.example/mcp
+Header  Authorization: Bearer mcpflow_<token>
+```
+
+### Claude Code
+
+Run one command. It writes the server into the Claude Code config for you.
+
+```sh
+claude mcp add --transport http mcpflow https://mcp.example/mcp --header "Authorization: Bearer mcpflow_<token>"
+```
+
+Check it with `claude mcp list`. To share the server with a repository instead
+of your user account, add `--scope project`; Claude Code then writes `.mcp.json`
+beside your code, so use a token you are willing to commit, or none at all.
+
+### Any client that reads an `mcpServers` block
+
+Most clients take the same JSON. Paste this into the client's MCP config file:
+
+```json
+{
+  "mcpServers": {
+    "mcpflow": {
+      "type": "http",
+      "url": "https://mcp.example/mcp",
+      "headers": {
+        "Authorization": "Bearer mcpflow_<token>"
+      }
+    }
+  }
+}
+```
+
+Where that file lives differs by client:
+
+| Client | Config file |
+| --- | --- |
+| Claude Code | `~/.claude.json`, or `.mcp.json` in a project |
+| Cursor | `~/.cursor/mcp.json`, or `.cursor/mcp.json` in a project |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` |
+| Claude Desktop | `claude_desktop_config.json` in the app's support directory |
+
+Two clients differ from the block above. **VS Code** names the top-level key
+`servers`, not `mcpServers`, and reads `.vscode/mcp.json` in a workspace.
+**Codex CLI** keeps its servers in `~/.codex/config.toml` as
+`[mcp_servers.mcpflow]` rather than in JSON.
+
+These formats move. If a client rejects the block, check that client's own
+documentation for the current key names; the URL and the `Authorization` header
+are the parts that come from MCP Flow.
+
+### Check the connection
+
+Ask the agent to list its tools. Every tool MCP Flow publishes carries its
+namespace as a prefix, so a `time` server appears as `time_get_current_time`.
+If the agent sees nothing, confirm the child reports `running` on the dashboard
+and that the namespace is not muted.
+
+An `admin` token additionally exposes the built-in `mcpflow_*` tools, so the
+agent can add and restart servers itself. See "Admin MCP tools" below.
 
 ## Admin API
 
