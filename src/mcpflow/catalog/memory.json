@@ -1,0 +1,30 @@
+{
+  "id": "memory",
+  "name": "Memory",
+  "vendor": "Anthropic",
+  "category": "util",
+  "color": "#f59e0b",
+  "description": "A small knowledge graph the model reads and writes between sessions.",
+  "auth": "none",
+  "tools": [
+    "create_entities",
+    "create_relations",
+    "add_observations",
+    "delete_entities",
+    "read_graph",
+    "search_nodes",
+    "open_nodes"
+  ],
+  "spec": {
+    "kind": "npm",
+    "package": "@modelcontextprotocol/server-memory"
+  },
+  "setup": [
+    {
+      "key": "MEMORY_FILE_PATH",
+      "where": "env",
+      "hint": "path of the graph file (default: inside the package)",
+      "required": false
+    }
+  ]
+}

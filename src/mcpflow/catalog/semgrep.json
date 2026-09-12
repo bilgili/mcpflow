@@ -1,0 +1,21 @@
+{
+  "id": "semgrep",
+  "name": "Semgrep",
+  "vendor": "Semgrep",
+  "category": "dev",
+  "color": "#00a67d",
+  "description": "Static analysis and security checks on code snippets.",
+  "auth": "none",
+  "tools": [
+    "semgrep_scan",
+    "security_check",
+    "get_abstract_syntax_tree",
+    "semgrep_rule_schema"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://mcp.semgrep.ai/sse",
+    "transport": "sse"
+  },
+  "setup": []
+}

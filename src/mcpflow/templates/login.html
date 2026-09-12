@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MCP Flow login</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main style="max-width:360px">
+    <h1><img src="/static/logo.svg" alt="MCP Flow" class="logo logo-lg"></h1>
+    {% if error %}<p class="error">{{ error }}</p>{% endif %}
+    <form method="post" action="/login">
+      <input type="hidden" name="next" value="{{ next }}">
+      <label>Password</label>
+      <input type="password" name="password" autofocus>
+      <p><button type="submit">Log in</button></p>
+    </form>
+  </main>
+</body>
+</html>

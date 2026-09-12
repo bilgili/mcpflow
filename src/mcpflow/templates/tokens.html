@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>API tokens</h1>
+{% if new_token %}
+<div class="newtoken">
+  <p class="once">⚠ New token — copy it now, it is shown once.</p>
+  <div class="row">
+    <span class="token" id="tok">{{ new_token }}</span>
+    <button class="btn" type="button" onclick="mcpflowCopy('tok', this)">Copy</button>
+  </div>
+  {% if new_token %}
+  {# One variable owns which tab opens first; every `active`, `aria-selected`
+     and `hidden` below derives from it. REST leads for an admin token. #}
+  {% set first = 'curl' if curl else 'json' %}
+  <div class="mcp">
+    <h2>Add to your coding agent</h2>
+    {% if curl %}
+    <p class="hint">An <code>admin</code> token authenticates the REST API at <code>/api</code>
+      and MCP over Streamable HTTP at <code>{{ mcp.mcp_url }}</code>.
+      In a coding agent, this entry also exposes the built-in admin tools.</p>
+    {% else %}
+    <p class="hint">MCP Flow speaks MCP over Streamable HTTP at <code>{{ mcp.mcp_url }}</code>.
+      Paste this into the agent's MCP config; the token goes in the <code>Authorization</code> header.</p>
+    {% endif %}
+    <div class="tabs" role="tablist">
+      {% if curl %}
+      <button type="button" role="tab" id="tabbtn-curl" data-tab="curl" aria-controls="tab-curl" class="{{ 'active' if first == 'curl' }}" aria-selected="{{ 'true' if first == 'curl' else 'false' }}" onclick="mcpflowTab(this)">REST API (curl)</button>
+      {% endif %}
+      <button type="button" role="tab" id="tabbtn-json" data-tab="json" aria-controls="tab-json" class="{{ 'active' if first == 'json' }}" aria-selected="{{ 'true' if first == 'json' else 'false' }}" onclick="mcpflowTab(this)">JSON (Cursor / Claude Desktop / Windsurf)</button>
+      <button type="button" role="tab" id="tabbtn-cli" data-tab="cli" aria-controls="tab-cli" class="{{ 'active' if first == 'cli' }}" aria-selected="{{ 'true' if first == 'cli' else 'false' }}" onclick="mcpflowTab(this)">Claude Code CLI</button>
+    </div>
+    {% if curl %}
+    <div class="pane" id="tab-curl" role="tabpanel" aria-labelledby="tabbtn-curl"{% if first != 'curl' %} hidden{% endif %}>
+      <pre class="code"><button class="copy btn" type="button" onclick="mcpflowCopy('curl', this)">Copy</button><code id="curl">{{ curl }}</code></pre>
+    </div>
+    {% endif %}
+    <div class="pane" id="tab-json" role="tabpanel" aria-labelledby="tabbtn-json"{% if first != 'json' %} hidden{% endif %}>
+      <pre class="code"><button class="copy btn" type="button" onclick="mcpflowCopy('mcp-json', this)">Copy</button><code id="mcp-json">{{ mcp.mcp_json }}</code></pre>
+    </div>
+    <div class="pane" id="tab-cli" role="tabpanel" aria-labelledby="tabbtn-cli"{% if first != 'cli' %} hidden{% endif %}>
+      <pre class="code"><button class="copy btn" type="button" onclick="mcpflowCopy('mcp-cli', this)">Copy</button><code id="mcp-cli">{{ mcp.mcp_cli }}</code></pre>
+    </div>
+  </div>
+  {% endif %}
+</div>
+{% endif %}
+<form method="post" action="/tokens">
+  <label>Name</label>
+  <input name="name" placeholder="claude-desktop">
+  <label>Scope</label>
+  <select name="scope">
+    <option value="mcp" selected>mcp</option>
+    <option value="admin">admin</option>
+  </select>
+  <p><button type="submit">Create token</button></p>
+</form>
+<table>
+  <thead>
+    <tr><th>ID</th><th>Name</th><th>Scope</th><th>Created</th><th>Last used</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for t in tokens %}
+    <tr>
+      <td><code>{{ t.id }}</code></td>
+      <td>{{ t.name }}</td>
+      <td>{{ t.scope }}</td>
+      <td>{{ t.created_at }}</td>
+      <td>{{ t.last_used_at or '—' }}</td>
+      <td>
+        <form class="inline" method="post" action="/tokens/{{ t.id }}/delete"><button>revoke</button></form>
+      </td>
+    </tr>
+    {% endfor %}
+    {% if not tokens %}
+    <tr><td colspan="6" class="muted">No tokens yet.</td></tr>
+    {% endif %}
+  </tbody>
+</table>
+<script>
+function mcpflowTab(btn) {
+  const name = btn.dataset.tab;
+  const panel = btn.closest('.mcp');
+  for (const p of panel.querySelectorAll('.pane')) p.hidden = p.id !== 'tab-' + name;
+  for (const b of btn.parentNode.querySelectorAll('button')) {
+    const on = b === btn;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+  }
+}
+function mcpflowCopy(id, btn) {
+  const text = document.getElementById(id).innerText;
+  if (navigator.clipboard) navigator.clipboard.writeText(text);
+  const old = btn.textContent;
+  btn.textContent = 'Copied';
+  setTimeout(() => { btn.textContent = old; }, 1200);
+}
+</script>
+{% endblock %}

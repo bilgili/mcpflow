@@ -1,0 +1,29 @@
+{
+  "id": "brave",
+  "name": "Brave Search",
+  "vendor": "Brave",
+  "category": "research",
+  "color": "#fb542b",
+  "description": "Web, news, image, video, and local search from Brave.",
+  "auth": "env",
+  "tools": [
+    "brave_web_search",
+    "brave_news_search",
+    "brave_image_search",
+    "brave_video_search",
+    "brave_local_search",
+    "brave_summarizer"
+  ],
+  "spec": {
+    "kind": "npm",
+    "package": "@brave/brave-search-mcp-server"
+  },
+  "setup": [
+    {
+      "key": "BRAVE_API_KEY",
+      "where": "env",
+      "hint": "BSA... API key",
+      "required": true
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "id": "gdrive",
+  "name": "Google Drive",
+  "vendor": "Google",
+  "category": "google",
+  "color": "#0f9d58",
+  "description": "Search and read files in Drive, including Docs and Sheets.",
+  "auth": "oauth",
+  "tools": [
+    "search",
+    "read",
+    "download",
+    "list_folder",
+    "export_pdf"
+  ],
+  "spec": {
+    "kind": "npm",
+    "package": "mcp-server-gdrive",
+    "source": "github:dylancaponi/gdrive-mcp-server#b2bb3c706d2916cf81948ac2056c837d979ea342"
+  },
+  "oauth": {
+    "provider": "google",
+    "scopes": [
+      "https://www.googleapis.com/auth/drive.readonly"
+    ],
+    "client_file": {"env": "GDRIVE_OAUTH_PATH", "format": "google-client"},
+    "token_file":  {"env": "GDRIVE_CREDENTIALS_PATH", "format": "google-auth-library"}
+  }
+}

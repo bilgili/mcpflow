@@ -1,0 +1,29 @@
+{
+  "id": "attio",
+  "name": "Attio",
+  "vendor": "Attio",
+  "category": "crm",
+  "color": "#1f2937",
+  "description": "Records, lists, and notes in the Attio CRM.",
+  "auth": "oauth",
+  "tools": [
+    "search_records",
+    "get_record",
+    "create_record",
+    "update_record",
+    "list_lists"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://mcp.attio.com/mcp",
+    "transport": "http"
+  },
+  "setup": [
+    {
+      "key": "Authorization",
+      "where": "header",
+      "hint": "Bearer <token>, when the vendor issues one",
+      "required": false
+    }
+  ]
+}

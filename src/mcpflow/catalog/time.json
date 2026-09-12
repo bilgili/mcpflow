@@ -1,0 +1,18 @@
+{
+  "id": "time",
+  "name": "Time",
+  "vendor": "Anthropic",
+  "category": "util",
+  "color": "#0ea5e9",
+  "description": "Current time and time-zone conversion.",
+  "auth": "none",
+  "tools": [
+    "get_current_time",
+    "convert_time"
+  ],
+  "spec": {
+    "kind": "python",
+    "package": "mcp-server-time"
+  },
+  "setup": []
+}

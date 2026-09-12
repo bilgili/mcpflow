@@ -1,0 +1,29 @@
+{
+  "id": "monday",
+  "name": "monday.com",
+  "vendor": "monday.com",
+  "category": "projects",
+  "color": "#ff3d57",
+  "description": "Boards, items, and updates in monday.com.",
+  "auth": "oauth",
+  "tools": [
+    "list_boards",
+    "get_board_schema",
+    "get_board_items_by_name",
+    "create_item",
+    "create_update"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://mcp.monday.com/sse",
+    "transport": "sse"
+  },
+  "setup": [
+    {
+      "key": "Authorization",
+      "where": "header",
+      "hint": "Bearer <token>, when the vendor issues one",
+      "required": false
+    }
+  ]
+}

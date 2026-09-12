@@ -1,0 +1,27 @@
+{
+  "id": "tavily",
+  "name": "Tavily",
+  "vendor": "Tavily",
+  "category": "research",
+  "color": "#0ea5e9",
+  "description": "Search, extract, crawl, and map the web with Tavily.",
+  "auth": "env",
+  "tools": [
+    "tavily-search",
+    "tavily-extract",
+    "tavily-crawl",
+    "tavily-map"
+  ],
+  "spec": {
+    "kind": "npm",
+    "package": "tavily-mcp"
+  },
+  "setup": [
+    {
+      "key": "TAVILY_API_KEY",
+      "where": "env",
+      "hint": "tvly-... API key",
+      "required": true
+    }
+  ]
+}

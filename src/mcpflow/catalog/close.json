@@ -1,0 +1,29 @@
+{
+  "id": "close",
+  "name": "Close",
+  "vendor": "Close",
+  "category": "crm",
+  "color": "#1463ff",
+  "description": "Leads, opportunities, and activities in Close.",
+  "auth": "header",
+  "tools": [
+    "search_leads",
+    "get_lead",
+    "create_lead",
+    "list_opportunities",
+    "log_activity"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://mcp.close.com/mcp",
+    "transport": "http"
+  },
+  "setup": [
+    {
+      "key": "Authorization",
+      "where": "header",
+      "hint": "Bearer <API key>",
+      "required": true
+    }
+  ]
+}

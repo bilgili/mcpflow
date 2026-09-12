@@ -1,0 +1,32 @@
+{
+  "id": "neon",
+  "name": "Neon",
+  "vendor": "Neon",
+  "category": "dev",
+  "color": "#00e599",
+  "description": "Projects, branches, and SQL on Neon Postgres.",
+  "auth": "env",
+  "tools": [
+    "list_projects",
+    "create_project",
+    "run_sql",
+    "get_connection_string",
+    "describe_table_schema",
+    "prepare_database_migration"
+  ],
+  "spec": {
+    "kind": "npm",
+    "package": "@neondatabase/mcp-server-neon",
+    "args": [
+      "start"
+    ]
+  },
+  "setup": [
+    {
+      "key": "NEON_API_KEY",
+      "where": "env",
+      "hint": "napi_... API key",
+      "required": true
+    }
+  ]
+}

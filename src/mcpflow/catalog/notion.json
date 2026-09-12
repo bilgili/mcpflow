@@ -1,0 +1,30 @@
+{
+  "id": "notion",
+  "name": "Notion",
+  "vendor": "Notion",
+  "category": "projects",
+  "color": "#000000",
+  "description": "Search pages and databases, read and write content.",
+  "auth": "env",
+  "tools": [
+    "API-post-search",
+    "API-retrieve-a-page",
+    "API-post-page",
+    "API-patch-page",
+    "API-get-block-children",
+    "API-patch-block-children",
+    "API-post-database-query"
+  ],
+  "spec": {
+    "kind": "npm",
+    "package": "@notionhq/notion-mcp-server"
+  },
+  "setup": [
+    {
+      "key": "NOTION_TOKEN",
+      "where": "env",
+      "hint": "ntn_... internal integration token",
+      "required": true
+    }
+  ]
+}

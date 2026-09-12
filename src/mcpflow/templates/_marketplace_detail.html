@@ -1,0 +1,77 @@
+{# One partial, two frames: inside the <dialog> on /marketplace, or inside the
+   full page at /marketplace/{id}. `page` picks the close control. #}
+<div class="dhead">
+  <span class="icon" style="background:{{ e.color }}">{{ e.monogram }}</span>
+  <div>
+    <h2>{{ e.name }}</h2>
+    <div class="vendor">{{ e.vendor }} · {{ 'hosted server' if e.spec.kind == 'remote' else 'runs locally in MCP Flow' }}{% if e.origin == 'local' %} · local entry{% endif %}</div>
+  </div>
+  {% if page %}
+  <a class="btn close" href="/marketplace">Back to marketplace</a>
+  {% else %}
+  <form method="dialog" class="inline close"><button type="submit">Close</button></form>
+  {% endif %}
+</div>
+
+<form method="post" action="/marketplace/{{ e.id }}/connect" class="dbody" autocomplete="off">
+  <div>
+    <h3>What it does</h3>
+    <p class="what">{{ e.description }}</p>
+
+    <h3>Tools it adds</h3>
+    <ul class="tools">
+      {% for t in e.tools %}<li><code>{{ namespace }}_{{ t }}</code></li>{% endfor %}
+    </ul>
+
+    <h3>Set-up</h3>
+    {% if error %}<p class="error">{{ error }}</p>{% endif %}
+    <label>Namespace <span class="muted">(tool prefix)</span></label>
+    <input name="namespace" value="{{ namespace }}" required pattern="[a-z][a-z0-9_]{0,31}">
+    {% if e.oauth %}
+    <p class="help">{{ provider.help }}</p>
+    <label>Redirect URI <span class="muted">(add this to the vendor's authorized redirect URIs)</span></label>
+    <pre class="code">{{ redirect_uri }}</pre>
+    <p><a href="{{ provider.help_url }}" target="_blank" rel="noopener">How to create the client</a></p>
+    <label>Client ID <span class="req">required</span></label>
+    <input name="client_id" autocomplete="off" spellcheck="false">
+    <label>Client secret <span class="req">required</span></label>
+    <input name="client_secret" type="password" autocomplete="off" spellcheck="false">
+    {% else %}
+    {% if e.auth == 'oauth' %}
+    <p class="notice">{{ e.vendor }} signs in with OAuth. MCP Flow cannot complete an OAuth sign-in yet.{% if e.spec.kind == 'remote' %} Enter a bearer token below if {{ e.vendor }} issues one.{% endif %}</p>
+    {% endif %}
+    {% for f in e.setup %}
+    <label><code>{{ f.key }}</code> <span class="muted">{{ f.where }}</span>{% if f.required %} <span class="req">required</span>{% endif %}</label>
+    <input name="setup_{{ f.key }}" placeholder="{{ f.hint }}" autocomplete="off" spellcheck="false">
+    {% endfor %}
+    {% endif %}
+    {% if e.spec.args %}
+    <label>Arguments <span class="muted">(space-separated)</span></label>
+    <input name="args" value="{{ args }}">
+    {% endif %}
+    {% if not e.oauth and not e.setup and not e.spec.args %}
+    <p class="muted">No credentials needed.</p>
+    {% endif %}
+  </div>
+
+  <div class="side">
+    <h3>What gets registered</h3>
+    <p class="small muted">The server record MCP Flow writes to <code>servers.json</code>. Edit it later on the Servers page.</p>
+    <pre class="code">{{ preview }}</pre>
+    <h3>Runs as</h3>
+    <pre class="code">{{ run_command }}</pre>
+  </div>
+
+  <div class="dfoot">
+    {% if connected %}
+    <span class="hint">Already connected as <code>{{ connected | join(', ') }}</code>. A second connect needs a new namespace.</span>
+    {% else %}
+    <span class="hint">Starts the server after saving. Tools appear on the dashboard once it reports running.</span>
+    {% endif %}
+    {% if e.oauth %}
+    <button type="submit" class="primary">Connect with {{ provider.name }}</button>
+    {% else %}
+    <button type="submit" class="primary">Connect {{ e.name }}</button>
+    {% endif %}
+  </div>
+</form>

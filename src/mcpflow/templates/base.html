@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MCP Flow</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/htmx.min.js"></script>
+</head>
+<body>
+  <header>
+    <a class="brand" href="/"><img src="/static/logo.svg" alt="MCP Flow" class="logo"></a>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a href="/servers">Servers</a>
+      <a href="/marketplace">Marketplace</a>
+      <a href="/tokens">Tokens</a>
+    </nav>
+    <form class="inline" method="post" action="/logout" style="margin-left:auto">
+      <button type="submit">Log out</button>
+    </form>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

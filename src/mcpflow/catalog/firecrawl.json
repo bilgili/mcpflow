@@ -1,0 +1,28 @@
+{
+  "id": "firecrawl",
+  "name": "Firecrawl",
+  "vendor": "Firecrawl",
+  "category": "research",
+  "color": "#ff6b00",
+  "description": "Scrape, crawl, map, and extract structured data from websites.",
+  "auth": "env",
+  "tools": [
+    "firecrawl_scrape",
+    "firecrawl_map",
+    "firecrawl_crawl",
+    "firecrawl_search",
+    "firecrawl_extract"
+  ],
+  "spec": {
+    "kind": "npm",
+    "package": "firecrawl-mcp"
+  },
+  "setup": [
+    {
+      "key": "FIRECRAWL_API_KEY",
+      "where": "env",
+      "hint": "fc-... API key",
+      "required": true
+    }
+  ]
+}

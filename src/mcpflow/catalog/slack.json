@@ -1,0 +1,37 @@
+{
+  "id": "slack",
+  "name": "Slack",
+  "vendor": "Slack",
+  "category": "chat",
+  "color": "#4a154b",
+  "description": "Post messages, read channels and threads, react, look up users.",
+  "auth": "env",
+  "tools": [
+    "slack_list_channels",
+    "slack_post_message",
+    "slack_reply_to_thread",
+    "slack_add_reaction",
+    "slack_get_channel_history",
+    "slack_get_thread_replies",
+    "slack_get_users",
+    "slack_get_user_profile"
+  ],
+  "spec": {
+    "kind": "npm",
+    "package": "@modelcontextprotocol/server-slack"
+  },
+  "setup": [
+    {
+      "key": "SLACK_BOT_TOKEN",
+      "where": "env",
+      "hint": "xoxb-...",
+      "required": true
+    },
+    {
+      "key": "SLACK_TEAM_ID",
+      "where": "env",
+      "hint": "T...",
+      "required": true
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "id": "wolfram",
+  "name": "Wolfram",
+  "vendor": "Wolfram Research",
+  "category": "research",
+  "color": "#dd1100",
+  "description": "Wolfram|Alpha answers and Wolfram Language evaluation from the cloud.",
+  "auth": "none",
+  "tools": [
+    "WolframAlpha",
+    "WolframLanguageEvaluator",
+    "WolframContext"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://agenttools.wolfram.com/mcp",
+    "transport": "http"
+  },
+  "setup": []
+}

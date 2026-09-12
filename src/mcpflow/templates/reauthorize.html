@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Re-authorize {{ e.name }}</h1>
+<p class="muted">Server <code>{{ ns }}</code> signs in again to replace its token. The namespace and its settings stay. It keeps serving on the old token until you finish.</p>
+
+<form method="post" action="/servers/{{ ns }}/reauthorize" autocomplete="off">
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+  <p class="help">{{ provider.help }}</p>
+  <label>Redirect URI <span class="muted">(already registered at the vendor)</span></label>
+  <pre class="code">{{ redirect_uri }}</pre>
+  <p><a href="{{ provider.help_url }}" target="_blank" rel="noopener">How to create the client</a></p>
+  <label>Client ID <span class="req">required</span></label>
+  <input name="client_id" autocomplete="off" spellcheck="false">
+  <label>Client secret <span class="req">required</span></label>
+  <input name="client_secret" type="password" autocomplete="off" spellcheck="false">
+  <div class="dfoot">
+    <span class="hint">A failed or cancelled sign-in leaves the old token in place, so the server keeps working.</span>
+    <button type="submit" class="primary">Re-authorize with {{ provider.name }}</button>
+  </div>
+</form>
+<p><a class="btn" href="/servers">Back to servers</a></p>
+{% endblock %}

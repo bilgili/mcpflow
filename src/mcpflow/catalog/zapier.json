@@ -1,0 +1,26 @@
+{
+  "id": "zapier",
+  "name": "Zapier",
+  "vendor": "Zapier",
+  "category": "automation",
+  "color": "#ff4f00",
+  "description": "Run the Zapier actions you enable for this server, across 8000+ apps.",
+  "auth": "header",
+  "tools": [
+    "add_tools",
+    "edit_tools"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://mcp.zapier.com/api/mcp/mcp",
+    "transport": "http"
+  },
+  "setup": [
+    {
+      "key": "Authorization",
+      "where": "header",
+      "hint": "Bearer <Zapier MCP token>",
+      "required": true
+    }
+  ]
+}

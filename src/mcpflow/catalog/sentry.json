@@ -1,0 +1,35 @@
+{
+  "id": "sentry",
+  "name": "Sentry",
+  "vendor": "Sentry",
+  "category": "dev",
+  "color": "#362d59",
+  "description": "Organizations, projects, issues, and events in Sentry.",
+  "auth": "env",
+  "tools": [
+    "find_organizations",
+    "find_projects",
+    "find_issues",
+    "get_issue_details",
+    "search_events",
+    "update_issue"
+  ],
+  "spec": {
+    "kind": "npm",
+    "package": "@sentry/mcp-server"
+  },
+  "setup": [
+    {
+      "key": "SENTRY_ACCESS_TOKEN",
+      "where": "env",
+      "hint": "sntrys_... user auth token",
+      "required": true
+    },
+    {
+      "key": "SENTRY_HOST",
+      "where": "env",
+      "hint": "self-hosted host name",
+      "required": false
+    }
+  ]
+}

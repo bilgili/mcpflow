@@ -1,0 +1,29 @@
+{
+  "id": "mongodb",
+  "name": "MongoDB",
+  "vendor": "MongoDB",
+  "category": "data",
+  "color": "#00ed64",
+  "description": "Find, aggregate, and inspect collections in MongoDB.",
+  "auth": "env",
+  "tools": [
+    "find",
+    "aggregate",
+    "count",
+    "list-databases",
+    "list-collections",
+    "collection-schema"
+  ],
+  "spec": {
+    "kind": "npm",
+    "package": "mongodb-mcp-server"
+  },
+  "setup": [
+    {
+      "key": "MDB_MCP_CONNECTION_STRING",
+      "where": "env",
+      "hint": "mongodb+srv://user:pass@cluster/db",
+      "required": true
+    }
+  ]
+}

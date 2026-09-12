@@ -1,0 +1,33 @@
+{
+  "id": "github",
+  "name": "GitHub",
+  "vendor": "GitHub",
+  "category": "dev",
+  "color": "#24292f",
+  "description": "Issues, pull requests, code search, and files for your repositories.",
+  "auth": "header",
+  "tools": [
+    "search_repositories",
+    "get_file_contents",
+    "list_issues",
+    "create_issue",
+    "list_pull_requests",
+    "get_pull_request",
+    "create_pull_request",
+    "list_commits",
+    "search_code"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://api.githubcopilot.com/mcp/",
+    "transport": "http"
+  },
+  "setup": [
+    {
+      "key": "Authorization",
+      "where": "header",
+      "hint": "Bearer <personal access token>",
+      "required": true
+    }
+  ]
+}

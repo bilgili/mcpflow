@@ -1,0 +1,32 @@
+{
+  "id": "postgres",
+  "name": "PostgreSQL",
+  "vendor": "Crystal DBA",
+  "category": "data",
+  "color": "#336791",
+  "description": "Schemas, SQL, query plans, and health checks on one Postgres database.",
+  "auth": "env",
+  "tools": [
+    "list_schemas",
+    "list_objects",
+    "get_object_details",
+    "execute_sql",
+    "explain_query",
+    "analyze_db_health"
+  ],
+  "spec": {
+    "kind": "python",
+    "package": "postgres-mcp",
+    "args": [
+      "--access-mode=restricted"
+    ]
+  },
+  "setup": [
+    {
+      "key": "DATABASE_URI",
+      "where": "env",
+      "hint": "postgresql://user:pass@host:5432/db",
+      "required": true
+    }
+  ]
+}

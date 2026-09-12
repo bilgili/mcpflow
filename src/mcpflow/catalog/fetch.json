@@ -1,0 +1,17 @@
+{
+  "id": "fetch",
+  "name": "Fetch",
+  "vendor": "Anthropic",
+  "category": "util",
+  "color": "#16a34a",
+  "description": "Fetch a URL and return it as text or markdown.",
+  "auth": "none",
+  "tools": [
+    "fetch"
+  ],
+  "spec": {
+    "kind": "python",
+    "package": "mcp-server-fetch"
+  },
+  "setup": []
+}

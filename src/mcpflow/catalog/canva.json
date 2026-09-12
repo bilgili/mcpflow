@@ -1,0 +1,29 @@
+{
+  "id": "canva",
+  "name": "Canva",
+  "vendor": "Canva",
+  "category": "design",
+  "color": "#00c4cc",
+  "description": "Search, create, and export designs in Canva.",
+  "auth": "oauth",
+  "tools": [
+    "search_designs",
+    "get_design",
+    "create_design",
+    "export_design",
+    "list_folders"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://mcp.canva.com/mcp",
+    "transport": "http"
+  },
+  "setup": [
+    {
+      "key": "Authorization",
+      "where": "header",
+      "hint": "Bearer <token>, when the vendor issues one",
+      "required": false
+    }
+  ]
+}

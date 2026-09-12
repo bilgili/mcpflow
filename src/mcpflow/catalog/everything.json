@@ -1,0 +1,24 @@
+{
+  "id": "everything",
+  "name": "Everything",
+  "vendor": "Anthropic",
+  "category": "util",
+  "color": "#8b5cf6",
+  "description": "A test server that exercises every MCP feature.",
+  "auth": "none",
+  "tools": [
+    "echo",
+    "add",
+    "longRunningOperation",
+    "printEnv",
+    "sampleLLM",
+    "getTinyImage",
+    "annotatedMessage",
+    "getResourceReference"
+  ],
+  "spec": {
+    "kind": "npm",
+    "package": "@modelcontextprotocol/server-everything"
+  },
+  "setup": []
+}

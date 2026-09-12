@@ -1,0 +1,28 @@
+{
+  "id": "bigquery",
+  "name": "BigQuery",
+  "vendor": "Google",
+  "category": "google",
+  "color": "#4285f4",
+  "description": "List datasets and tables and run SQL in BigQuery.",
+  "auth": "header",
+  "tools": [
+    "list_datasets",
+    "list_tables",
+    "get_table_info",
+    "execute_sql"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://bigquery.googleapis.com/mcp",
+    "transport": "http"
+  },
+  "setup": [
+    {
+      "key": "Authorization",
+      "where": "header",
+      "hint": "Bearer <OAuth access token>",
+      "required": true
+    }
+  ]
+}

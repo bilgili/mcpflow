@@ -1,0 +1,16 @@
+services:
+  mcpflow:
+    build:
+      context: .
+      args:
+        PIP_INDEX_URL: "https://pypi.org/simple/"
+    image: mcpflow:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      - "mcpflow-data:/data"
+    env_file: .env
+    restart: unless-stopped
+
+volumes:
+  mcpflow-data:

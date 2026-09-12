@@ -1,0 +1,28 @@
+{
+  "id": "composio",
+  "name": "Composio (Rube)",
+  "vendor": "Composio",
+  "category": "automation",
+  "color": "#7c3aed",
+  "description": "One server that reaches 500+ apps through Composio connections.",
+  "auth": "oauth",
+  "tools": [
+    "RUBE_SEARCH_TOOLS",
+    "RUBE_MULTI_EXECUTE_TOOL",
+    "RUBE_CREATE_PLAN",
+    "RUBE_MANAGE_CONNECTIONS"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://rube.app/mcp",
+    "transport": "http"
+  },
+  "setup": [
+    {
+      "key": "Authorization",
+      "where": "header",
+      "hint": "Bearer <token>, when the vendor issues one",
+      "required": false
+    }
+  ]
+}

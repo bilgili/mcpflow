@@ -1,0 +1,25 @@
+{
+  "id": "sqlite",
+  "name": "SQLite",
+  "vendor": "Anthropic",
+  "category": "data",
+  "color": "#0f80cc",
+  "description": "Query and change one SQLite database file.",
+  "auth": "none",
+  "tools": [
+    "read_query",
+    "write_query",
+    "create_table",
+    "list_tables",
+    "describe_table"
+  ],
+  "spec": {
+    "kind": "python",
+    "package": "mcp-server-sqlite",
+    "args": [
+      "--db-path",
+      "/data/app.db"
+    ]
+  },
+  "setup": []
+}

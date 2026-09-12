@@ -1,0 +1,39 @@
+{% set polling = children | selectattr('status', 'equalto', 'starting') | list | length > 0 %}
+<table {% if polling %}hx-get="/servers/table" hx-trigger="every 3s" hx-target="#servers-table"{% endif %}>
+  <thead>
+    <tr><th>Kind</th><th>Namespace</th><th>Source</th><th>Status</th><th>Error</th><th>Actions</th></tr>
+  </thead>
+  <tbody>
+    {% for c in children %}
+    {% set ns = c.spec.namespace %}
+    <tr>
+      <td>{{ c.spec.kind }}</td>
+      <td>{{ ns }}</td>
+      <td>{{ c.spec.source | redact_source or '' }}</td>
+      <td class="status status-{{ c.status }}">{{ c.status }}{% if ns in awaiting %}<span class="awaiting" title="Delete this server and connect again to retry.">awaiting authorization</span>{% endif %}</td>
+      <td class="error">{{ c.last_error or '' }}</td>
+      <td>
+        <a href="/servers/{{ ns }}/edit">edit</a>
+        <form class="inline" method="post" action="/servers/{{ ns }}/restart"
+              hx-post="/servers/{{ ns }}/restart" hx-target="#servers-table"><button>restart</button></form>
+        {% if c.spec.enabled %}
+        <form class="inline" method="post" action="/servers/{{ ns }}/disable"
+              hx-post="/servers/{{ ns }}/disable" hx-target="#servers-table"><button>disable</button></form>
+        {% else %}
+        <form class="inline" method="post" action="/servers/{{ ns }}/enable"
+              hx-post="/servers/{{ ns }}/enable" hx-target="#servers-table"><button>enable</button></form>
+        {% endif %}
+        <form class="inline" method="post" action="/servers/{{ ns }}/delete"
+              hx-post="/servers/{{ ns }}/delete" hx-target="#servers-table"><button>remove</button></form>
+        <a href="/servers/{{ ns }}/log" target="_blank">log</a>
+        {% if reauthable is defined and ns in reauthable %}
+        <a href="/servers/{{ ns }}/reauthorize">re-authorize</a>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+    {% if not children %}
+    <tr><td colspan="6" class="muted">No servers yet.</td></tr>
+    {% endif %}
+  </tbody>
+</table>

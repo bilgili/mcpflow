@@ -1,0 +1,13 @@
+dist/
+.venv/
+__pycache__/
+*.pyc
+data/
+.env
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+node_modules/
+specs/tla/states/
+.claude/worktrees/
+uv.lock

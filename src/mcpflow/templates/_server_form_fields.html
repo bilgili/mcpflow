@@ -1,0 +1,39 @@
+{% set k = values.get('kind') or tab %}
+<form method="post" action="{{ '/servers/' ~ values.get('namespace') if editing else '/servers' }}">
+  <input type="hidden" name="kind" value="{{ k }}">
+  <label>Namespace</label>
+  <input name="namespace" value="{{ values.get('namespace', '') }}" {{ 'readonly' if editing }}>
+  {% if k in ['python', 'npm'] %}
+    <label>Package</label>
+    <input name="package" value="{{ values.get('package', '') }}">
+    <label>Source (optional)</label>
+    <input name="source" value="{{ values.get('source', '') }}"
+           placeholder="git+https://host/owner/repo">
+    {% if k == 'npm' %}
+    <small>With a source, Package is the bin name, not the npm package name.</small>
+    {% endif %}
+  {% elif k == 'remote' %}
+    <label>URL</label>
+    <input name="url" value="{{ values.get('url', '') }}">
+    <label>Transport</label>
+    <select name="transport">
+      <option value="http" {{ 'selected' if values.get('transport') == 'http' }}>http</option>
+      <option value="sse" {{ 'selected' if values.get('transport') == 'sse' }}>sse</option>
+    </select>
+    <label>Headers (KEY=VALUE per line)</label>
+    <textarea name="headers" rows="3">{{ values.get('headers', '') }}</textarea>
+  {% elif k == 'custom' %}
+    <label>Command</label>
+    <input name="command" value="{{ values.get('command', '') }}">
+  {% endif %}
+  {% if k != 'remote' %}
+    <label>Arguments (space-separated)</label>
+    <input name="args" value="{{ values.get('args', '') }}">
+    <label>Environment (KEY=VALUE per line)</label>
+    <textarea name="env" rows="3">{{ values.get('env', '') }}</textarea>
+  {% endif %}
+  <label>Description</label>
+  <input name="description" value="{{ values.get('description', '') }}">
+  <label><input type="checkbox" name="enabled" value="on" {{ 'checked' if values.get('enabled', True) }}> Enabled</label>
+  <p><button type="submit">Save</button></p>
+</form>

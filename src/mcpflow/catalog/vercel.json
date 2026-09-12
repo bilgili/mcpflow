@@ -1,0 +1,30 @@
+{
+  "id": "vercel",
+  "name": "Vercel",
+  "vendor": "Vercel",
+  "category": "dev",
+  "color": "#000000",
+  "description": "Projects, deployments, and build logs on Vercel.",
+  "auth": "oauth",
+  "tools": [
+    "list_projects",
+    "get_project",
+    "list_deployments",
+    "get_deployment",
+    "get_deployment_build_logs",
+    "search_vercel_documentation"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://mcp.vercel.com/",
+    "transport": "http"
+  },
+  "setup": [
+    {
+      "key": "Authorization",
+      "where": "header",
+      "hint": "Bearer <token>, when the vendor issues one",
+      "required": false
+    }
+  ]
+}

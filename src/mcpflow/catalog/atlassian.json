@@ -1,0 +1,31 @@
+{
+  "id": "atlassian",
+  "name": "Atlassian",
+  "vendor": "Atlassian",
+  "category": "projects",
+  "color": "#0052cc",
+  "description": "Jira issues and Confluence pages in your Atlassian cloud site.",
+  "auth": "oauth",
+  "tools": [
+    "jira_search",
+    "jira_get_issue",
+    "jira_create_issue",
+    "jira_update_issue",
+    "confluence_search",
+    "confluence_get_page",
+    "confluence_create_page"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://mcp.atlassian.com/v1/sse",
+    "transport": "sse"
+  },
+  "setup": [
+    {
+      "key": "Authorization",
+      "where": "header",
+      "hint": "Bearer <token>, when the vendor issues one",
+      "required": false
+    }
+  ]
+}

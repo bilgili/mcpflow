@@ -1,0 +1,10 @@
+{
+  "id": "google",
+  "name": "Google",
+  "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth",
+  "token_url": "https://oauth2.googleapis.com/token",
+  "authorize_params": {"access_type": "offline", "prompt": "consent"},
+  "pkce": true,
+  "help": "In Google Cloud Console, create an OAuth client of type Web application. Add the redirect URI shown here to its authorized redirect URIs. Copy the client id and the client secret.",
+  "help_url": "https://developers.google.com/identity/protocols/oauth2/web-server#creatingcred"
+}

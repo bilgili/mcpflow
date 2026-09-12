@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Servers</h1>
+<p><a class="btn" href="/servers/new">Add server</a></p>
+<div id="servers-table">
+  {% include "_servers_table.html" %}
+</div>
+{% endblock %}

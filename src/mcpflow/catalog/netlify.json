@@ -1,0 +1,28 @@
+{
+  "id": "netlify",
+  "name": "Netlify",
+  "vendor": "Netlify",
+  "category": "dev",
+  "color": "#00c7b7",
+  "description": "Sites, deploys, and project settings on Netlify.",
+  "auth": "oauth",
+  "tools": [
+    "netlify-project-services",
+    "netlify-deploy-services",
+    "netlify-user-services",
+    "netlify-coding-guidelines"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://netlify-mcp.netlify.app/mcp",
+    "transport": "http"
+  },
+  "setup": [
+    {
+      "key": "Authorization",
+      "where": "header",
+      "hint": "Bearer <token>, when the vendor issues one",
+      "required": false
+    }
+  ]
+}

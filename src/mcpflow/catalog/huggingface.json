@@ -1,0 +1,30 @@
+{
+  "id": "huggingface",
+  "name": "Hugging Face",
+  "vendor": "Hugging Face",
+  "category": "dev",
+  "color": "#ff9d00",
+  "description": "Search models, datasets, Spaces, and papers on the Hub.",
+  "auth": "none",
+  "tools": [
+    "model_search",
+    "dataset_search",
+    "space_search",
+    "paper_search",
+    "hub_repo_details",
+    "hf_whoami"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://hf.co/mcp",
+    "transport": "http"
+  },
+  "setup": [
+    {
+      "key": "Authorization",
+      "where": "header",
+      "hint": "Bearer hf_... (optional)",
+      "required": false
+    }
+  ]
+}

@@ -1,0 +1,142 @@
+{#
+  The tool tree. One collapsible group per namespace, one visibility control
+  per level. Every control posts to its own route and swaps this whole
+  partial back in, so the three levels never render a stale mark.
+
+  Two constraints shape the markup:
+
+  - A tool name comes from the child, so it travels in the form body, never
+    in the URL path. A child that names a tool `../../servers/x/delete` would
+    otherwise produce a link the browser normalises into a different
+    authenticated route.
+  - Every control syncs on `#tools-tree` with `replace`, not `queue`. The
+    response swaps this whole partial, so a queued request would be owned by
+    a form the swap already detached, and htmx would drop it silently.
+    `replace` cancels the in-flight request instead. Note this is
+    cancellation, not ordering: the server may already have accepted the
+    cancelled request, so two clicks inside one request window can still
+    commit out of order. The next render corrects the page.
+  - The namespace control sits just below its `<summary>`, not inside it.
+    Clicking any child of a `<summary>` toggles the group, so a control
+    placed there could not be operated without JavaScript.
+  - The `mcpflow` group is the built-in admin server. It has no child, so its
+    header shows `built-in` in place of a status and its namespace control
+    reads `mcpflow_muted`, not `c.spec.muted`. The root does not cover it, so
+    the root state never disables one of its controls. A pinned row carries
+    a checked, disabled control: visibility never hides that tool, so the
+    admin cannot lock themselves out of the MCP admin surface.
+#}
+<div id="tools-tree">
+<form class="vis-root" hx-post="/visibility/root" hx-target="#tools-tree"
+      hx-swap="outerHTML" hx-sync="#tools-tree:replace">
+  <label class="vis">
+    <input type="checkbox" name="visible" {% if not root_muted %}checked{% endif %}
+           onchange="this.form.requestSubmit()">
+    <span>Publish tools</span>
+  </label>
+  {% if root_muted %}<span class="muted">All tools are hidden from /mcp.</span>{% endif %}
+</form>
+{% set mcpflow_tools = tools | selectattr('namespace', 'equalto', 'mcpflow') | list %}
+{% if mcpflow_tools %}
+{% set mcpflow_shown = mcpflow_tools | selectattr('visible') | list | length %}
+<details class="ns-group" {% if open_ns == 'mcpflow' %}open{% endif %}>
+  <summary>
+    <span class="ns">mcpflow</span>
+    <span class="count">{{ mcpflow_shown }} of {{ mcpflow_tools | length }} tools</span>
+    <span class="status status-builtin">built-in</span>
+  </summary>
+  <form class="vis-ns" hx-post="/visibility/namespaces/mcpflow"
+        hx-target="#tools-tree" hx-swap="outerHTML"
+        hx-sync="#tools-tree:replace">
+    <label class="vis">
+      <input type="checkbox" name="visible" {% if not mcpflow_muted %}checked{% endif %}
+             onchange="this.form.requestSubmit()">
+      <span>Publish this namespace</span>
+    </label>
+  </form>
+  <table>
+    <thead>
+      <tr><th>Publish</th><th>Tool</th><th>Description</th><th>Schema</th></tr>
+    </thead>
+    <tbody>
+      {% for t in mcpflow_tools %}
+      <tr class="{% if not t.visible %}hidden-tool{% endif %}">
+        <td>
+          {% if t.pinned %}
+          <input type="checkbox" checked disabled title="always published">
+          {% else %}
+          <form hx-post="/visibility/namespaces/mcpflow/tool"
+                hx-target="#tools-tree" hx-swap="outerHTML"
+                hx-sync="#tools-tree:replace">
+            <input type="hidden" name="tool" value="{{ t.tool }}">
+            <input type="checkbox" name="visible" {% if t.visible %}checked{% endif %}
+                   {% if mcpflow_muted %}disabled{% endif %}
+                   onchange="this.form.requestSubmit()">
+          </form>
+          {% endif %}
+        </td>
+        <td><code>{{ t.name }}</code>{% if t.pinned %} <span class="pin">pinned</span>{% endif %}</td>
+        <td>{{ t.description }}</td>
+        <td>{{ t.schema_summary }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</details>
+{% endif %}
+{% set ns_groups = [] %}
+{% for c in children %}
+  {% set ns_tools = tools | selectattr('namespace', 'equalto', c.spec.namespace) | list %}
+  {% if ns_tools or c.status == 'failed' %}
+    {% set _ = ns_groups.append((c, ns_tools)) %}
+  {% endif %}
+{% endfor %}
+{% for c, ns_tools in ns_groups %}
+{% set shown = ns_tools | selectattr('visible') | list | length %}
+<details class="ns-group" {% if open_ns == c.spec.namespace %}open{% endif %}>
+  <summary>
+    <span class="ns">{{ c.spec.namespace }}</span>
+    <span class="count">{{ shown }} of {{ ns_tools | length }} tools</span>
+    <span class="status status-{{ c.status }}">{{ c.status }}</span>
+  </summary>
+  <form class="vis-ns" hx-post="/visibility/namespaces/{{ c.spec.namespace }}"
+        hx-target="#tools-tree" hx-swap="outerHTML"
+        hx-sync="#tools-tree:replace">
+    <label class="vis">
+      <input type="checkbox" name="visible" {% if not c.spec.muted %}checked{% endif %}
+             {% if root_muted %}disabled{% endif %}
+             onchange="this.form.requestSubmit()">
+      <span>Publish this namespace</span>
+    </label>
+  </form>
+  {% if ns_tools %}
+  <table>
+    <thead>
+      <tr><th>Publish</th><th>Tool</th><th>Description</th><th>Schema</th></tr>
+    </thead>
+    <tbody>
+      {% for t in ns_tools %}
+      <tr class="{% if not t.visible %}hidden-tool{% endif %}">
+        <td>
+          <form hx-post="/visibility/namespaces/{{ t.namespace }}/tool"
+                hx-target="#tools-tree" hx-swap="outerHTML"
+                hx-sync="#tools-tree:replace">
+            <input type="hidden" name="tool" value="{{ t.tool }}">
+            <input type="checkbox" name="visible" {% if t.visible %}checked{% endif %}
+                   {% if root_muted or c.spec.muted %}disabled{% endif %}
+                   onchange="this.form.requestSubmit()">
+          </form>
+        </td>
+        <td><code>{{ t.name }}</code></td>
+        <td>{{ t.description }}</td>
+        <td>{{ t.schema_summary }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+  {% if c.last_error %}<p class="error">{{ c.last_error }}</p>{% endif %}
+</details>
+{% endfor %}
+{% if not ns_groups %}<p class="muted">No child tool runs.</p>{% endif %}
+</div>

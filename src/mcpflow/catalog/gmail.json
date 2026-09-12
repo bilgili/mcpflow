@@ -1,0 +1,32 @@
+{
+  "id": "gmail",
+  "name": "Gmail",
+  "vendor": "Google",
+  "category": "google",
+  "color": "#d93025",
+  "description": "Read, search, label, and send mail from a Google account.",
+  "auth": "oauth",
+  "tools": [
+    "search_emails",
+    "read_email",
+    "send_email",
+    "draft_email",
+    "modify_email",
+    "delete_email",
+    "list_email_labels",
+    "batch_modify_emails"
+  ],
+  "spec": {
+    "kind": "npm",
+    "package": "@gongrzhe/server-gmail-autoauth-mcp"
+  },
+  "oauth": {
+    "provider": "google",
+    "scopes": [
+      "https://www.googleapis.com/auth/gmail.modify",
+      "https://www.googleapis.com/auth/gmail.settings.basic"
+    ],
+    "client_file": {"env": "GMAIL_OAUTH_PATH", "format": "google-client"},
+    "token_file":  {"env": "GMAIL_CREDENTIALS_PATH", "format": "google-auth-library"}
+  }
+}

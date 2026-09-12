@@ -1,0 +1,36 @@
+{
+  "id": "gcal",
+  "name": "Google Calendar",
+  "vendor": "Google",
+  "category": "google",
+  "color": "#1a73e8",
+  "description": "List, search, create, and update events across your calendars.",
+  "auth": "oauth",
+  "tools": [
+    "list-calendars",
+    "list-events",
+    "search-events",
+    "get-event",
+    "list-colors",
+    "create-event",
+    "create-events",
+    "update-event",
+    "delete-event",
+    "get-freebusy",
+    "get-current-time",
+    "respond-to-event",
+    "manage-accounts"
+  ],
+  "spec": {
+    "kind": "npm",
+    "package": "@cocal/google-calendar-mcp@2.6.3"
+  },
+  "oauth": {
+    "provider": "google",
+    "scopes": [
+      "https://www.googleapis.com/auth/calendar"
+    ],
+    "client_file": {"env": "GOOGLE_OAUTH_CREDENTIALS", "format": "google-client-flat"},
+    "token_file":  {"env": "GOOGLE_CALENDAR_MCP_TOKEN_PATH", "format": "google-calendar"}
+  }
+}

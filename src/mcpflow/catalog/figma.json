@@ -1,0 +1,28 @@
+{
+  "id": "figma",
+  "name": "Figma",
+  "vendor": "Figma",
+  "category": "design",
+  "color": "#f24e1e",
+  "description": "Read layout and style data from Figma files and export images.",
+  "auth": "env",
+  "tools": [
+    "get_figma_data",
+    "download_figma_images"
+  ],
+  "spec": {
+    "kind": "npm",
+    "package": "figma-developer-mcp",
+    "args": [
+      "--stdio"
+    ]
+  },
+  "setup": [
+    {
+      "key": "FIGMA_API_KEY",
+      "where": "env",
+      "hint": "figd_... personal access token",
+      "required": true
+    }
+  ]
+}

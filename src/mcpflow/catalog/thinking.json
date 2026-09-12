@@ -1,0 +1,17 @@
+{
+  "id": "thinking",
+  "name": "Sequential Thinking",
+  "vendor": "Anthropic",
+  "category": "util",
+  "color": "#64748b",
+  "description": "A scratchpad for step-by-step reasoning with revisions and branches.",
+  "auth": "none",
+  "tools": [
+    "sequentialthinking"
+  ],
+  "spec": {
+    "kind": "npm",
+    "package": "@modelcontextprotocol/server-sequential-thinking"
+  },
+  "setup": []
+}

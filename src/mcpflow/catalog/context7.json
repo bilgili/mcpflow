@@ -1,0 +1,26 @@
+{
+  "id": "context7",
+  "name": "Context7",
+  "vendor": "Upstash",
+  "category": "dev",
+  "color": "#0f766e",
+  "description": "Up-to-date library documentation for code generation.",
+  "auth": "none",
+  "tools": [
+    "resolve-library-id",
+    "get-library-docs"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://mcp.context7.com/mcp",
+    "transport": "http"
+  },
+  "setup": [
+    {
+      "key": "CONTEXT7_API_KEY",
+      "where": "header",
+      "hint": "API key for a higher rate limit (optional)",
+      "required": false
+    }
+  ]
+}

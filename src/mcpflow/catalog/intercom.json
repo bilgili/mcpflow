@@ -1,0 +1,29 @@
+{
+  "id": "intercom",
+  "name": "Intercom",
+  "vendor": "Intercom",
+  "category": "crm",
+  "color": "#286efa",
+  "description": "Conversations, contacts, and help articles in Intercom.",
+  "auth": "oauth",
+  "tools": [
+    "search_conversations",
+    "get_conversation",
+    "search_contacts",
+    "get_contact",
+    "list_articles"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://mcp.intercom.com/sse",
+    "transport": "sse"
+  },
+  "setup": [
+    {
+      "key": "Authorization",
+      "where": "header",
+      "hint": "Bearer <token>, when the vendor issues one",
+      "required": false
+    }
+  ]
+}

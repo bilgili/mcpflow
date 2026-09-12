@@ -1,0 +1,33 @@
+{
+  "id": "stripe",
+  "name": "Stripe",
+  "vendor": "Stripe",
+  "category": "finance",
+  "color": "#635bff",
+  "description": "Customers, products, prices, payment links, and invoices in Stripe.",
+  "auth": "header",
+  "tools": [
+    "list_customers",
+    "create_customer",
+    "list_products",
+    "create_product",
+    "list_prices",
+    "create_payment_link",
+    "list_invoices",
+    "retrieve_balance",
+    "search_stripe_resources"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://mcp.stripe.com/",
+    "transport": "http"
+  },
+  "setup": [
+    {
+      "key": "Authorization",
+      "where": "header",
+      "hint": "Bearer sk_... (restricted key recommended)",
+      "required": true
+    }
+  ]
+}

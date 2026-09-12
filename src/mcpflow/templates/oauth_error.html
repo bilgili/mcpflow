@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Authorization did not complete</h1>
+<p class="error">{{ reason }}</p>
+<p>Delete the pending server and connect again to retry.</p>
+<p><a class="btn" href="/marketplace">Back to marketplace</a></p>
+{% endblock %}

@@ -1,0 +1,37 @@
+{
+  "id": "gitlab",
+  "name": "GitLab",
+  "vendor": "GitLab",
+  "category": "dev",
+  "color": "#fc6d26",
+  "description": "Merge requests, issues, pipelines, and files on any GitLab host.",
+  "auth": "env",
+  "tools": [
+    "search_repositories",
+    "get_project",
+    "get_file_contents",
+    "create_merge_request",
+    "get_merge_request",
+    "list_issues",
+    "create_issue",
+    "list_pipelines"
+  ],
+  "spec": {
+    "kind": "npm",
+    "package": "@zereight/mcp-gitlab"
+  },
+  "setup": [
+    {
+      "key": "GITLAB_PERSONAL_ACCESS_TOKEN",
+      "where": "env",
+      "hint": "glpat-...",
+      "required": true
+    },
+    {
+      "key": "GITLAB_API_URL",
+      "where": "env",
+      "hint": "https://gitlab.example/api/v4 (default gitlab.com)",
+      "required": false
+    }
+  ]
+}

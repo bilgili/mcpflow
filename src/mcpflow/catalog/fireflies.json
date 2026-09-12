@@ -1,0 +1,28 @@
+{
+  "id": "fireflies",
+  "name": "Fireflies",
+  "vendor": "Fireflies.ai",
+  "category": "chat",
+  "color": "#ff6b35",
+  "description": "Meeting transcripts, summaries, and search across recorded calls.",
+  "auth": "oauth",
+  "tools": [
+    "fireflies_get_transcripts",
+    "fireflies_get_transcript",
+    "fireflies_search",
+    "fireflies_get_summary"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://api.fireflies.ai/mcp",
+    "transport": "http"
+  },
+  "setup": [
+    {
+      "key": "Authorization",
+      "where": "header",
+      "hint": "Bearer <token>, when the vendor issues one",
+      "required": false
+    }
+  ]
+}

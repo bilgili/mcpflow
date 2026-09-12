@@ -1,0 +1,29 @@
+{
+  "id": "hubspot",
+  "name": "HubSpot",
+  "vendor": "HubSpot",
+  "category": "crm",
+  "color": "#ff7a59",
+  "description": "Contacts, companies, deals, and engagements in HubSpot.",
+  "auth": "header",
+  "tools": [
+    "hubspot-get-user-details",
+    "hubspot-list-objects",
+    "hubspot-search-objects",
+    "hubspot-batch-create-objects",
+    "hubspot-create-engagement"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://app.hubspot.com/mcp/v1/http",
+    "transport": "http"
+  },
+  "setup": [
+    {
+      "key": "Authorization",
+      "where": "header",
+      "hint": "Bearer <private app access token>",
+      "required": true
+    }
+  ]
+}

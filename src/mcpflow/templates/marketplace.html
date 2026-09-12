@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Marketplace</h1>
+<p class="lede">Connect a ready-made MCP server in one step. Each entry fills the add-server form for you; you only supply credentials.</p>
+
+{# One GET form. The rail buttons submit it too (form="market"), so a category
+   click carries whatever the admin has typed since the page loaded. #}
+<form id="market" class="toolbar" method="get" action="/marketplace">
+  <input type="search" name="q" value="{{ q }}" autocomplete="off"
+         placeholder="Search by name, vendor, or tool (e.g. gmail, calendar, send_email)"
+         hx-get="/marketplace/grid" hx-trigger="input changed delay:200ms, search"
+         hx-target="#grid" hx-vals='{"cat": "{{ cat or '' }}"}'>
+  <button type="submit">Search</button>
+</form>
+
+<div class="market">
+  <aside class="rail">
+    <button type="submit" form="market" name="cat" value="" class="{{ 'active' if not cat }}">All <small>{{ total }}</small></button>
+    {% for id, label in categories.items() %}
+    <button type="submit" form="market" name="cat" value="{{ id }}" class="{{ 'active' if cat == id }}">{{ label }} <small>{{ counts[id] }}</small></button>
+    {% endfor %}
+    <hr>
+    <div class="src">
+      Catalog sources<br>
+      <b>built-in</b> {{ origins.builtin }}<br>
+      <b>data/catalog/</b> {{ origins.local }}
+    </div>
+  </aside>
+  <div id="grid">
+    {% include "_marketplace_grid.html" %}
+  </div>
+</div>
+
+{% if errors %}
+<p class="muted skipped">Skipped catalog files:
+  {% for path, reason in errors %}<code>{{ path.name }}</code> ({{ reason }}){{ ', ' if not loop.last }}{% endfor %}
+</p>
+{% endif %}
+
+{# The detail partial lands here; htmx opens the dialog after the swap. #}
+<dialog id="detail" class="detail" hx-on::after-swap="this.showModal()"></dialog>
+{% endblock %}

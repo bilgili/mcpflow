@@ -1,0 +1,37 @@
+{
+  "id": "m365",
+  "name": "Microsoft 365",
+  "vendor": "Microsoft",
+  "category": "microsoft",
+  "color": "#0078d4",
+  "description": "Outlook mail and calendar, Teams chats, OneDrive and SharePoint files.",
+  "auth": "oauth",
+  "tools": [
+    "list-mail-messages",
+    "send-mail",
+    "list-calendar-events",
+    "create-calendar-event",
+    "list-chats",
+    "send-chat-message",
+    "list-files",
+    "search-files"
+  ],
+  "spec": {
+    "kind": "npm",
+    "package": "@softeria/ms-365-mcp-server"
+  },
+  "setup": [
+    {
+      "key": "MS365_MCP_CLIENT_ID",
+      "where": "env",
+      "hint": "Entra app client id, for your own app registration",
+      "required": false
+    },
+    {
+      "key": "MS365_MCP_TENANT_ID",
+      "where": "env",
+      "hint": "Entra tenant id",
+      "required": false
+    }
+  ]
+}

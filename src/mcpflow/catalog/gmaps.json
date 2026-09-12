@@ -1,0 +1,27 @@
+{
+  "id": "gmaps",
+  "name": "Google Maps",
+  "vendor": "Google",
+  "category": "google",
+  "color": "#34a853",
+  "description": "Places, routes, and weather through the Maps grounding API.",
+  "auth": "header",
+  "tools": [
+    "search_places",
+    "compute_routes",
+    "lookup_weather"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://mapstools.googleapis.com/mcp",
+    "transport": "http"
+  },
+  "setup": [
+    {
+      "key": "X-Goog-Api-Key",
+      "where": "header",
+      "hint": "Google Maps API key",
+      "required": true
+    }
+  ]
+}

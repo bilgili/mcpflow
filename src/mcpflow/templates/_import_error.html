@@ -1,0 +1,9 @@
+<div class="error">
+  <p>{{ error }}</p>
+  <p class="muted">Paste the JSON config for the server instead.</p>
+  <form hx-post="/import/json" hx-target="#import-result">
+    <label>Paste JSON config</label>
+    <textarea name="config" rows="8" autofocus placeholder='{"mcpServers": {...}}'></textarea>
+    <p><button type="submit">Parse</button></p>
+  </form>
+</div>

@@ -1,0 +1,29 @@
+{
+  "id": "linear",
+  "name": "Linear",
+  "vendor": "Linear",
+  "category": "projects",
+  "color": "#5e6ad2",
+  "description": "Issues, projects, cycles, and teams from your Linear workspace.",
+  "auth": "oauth",
+  "tools": [
+    "list_issues",
+    "get_issue",
+    "create_issue",
+    "update_issue",
+    "list_projects",
+    "list_teams",
+    "list_users",
+    "search_documentation"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://mcp.linear.app/sse",
+    "transport": "sse"
+  },
+  "oauth": {
+    "provider": "linear",
+    "scopes": ["read", "write"],
+    "header": {"name": "Authorization", "scheme": "Bearer"}
+  }
+}

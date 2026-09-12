@@ -1,0 +1,27 @@
+{
+  "id": "mercadopago",
+  "name": "Mercado Pago",
+  "vendor": "Mercado Libre",
+  "category": "finance",
+  "color": "#009ee3",
+  "description": "Payments and documentation for Mercado Pago.",
+  "auth": "header",
+  "tools": [
+    "search_documentation",
+    "get_payment",
+    "search_payments"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://mcp.mercadopago.com/mcp",
+    "transport": "http"
+  },
+  "setup": [
+    {
+      "key": "Authorization",
+      "where": "header",
+      "hint": "Bearer <access token>",
+      "required": true
+    }
+  ]
+}

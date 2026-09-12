@@ -1,0 +1,31 @@
+{
+  "id": "airtable",
+  "name": "Airtable",
+  "vendor": "Airtable",
+  "category": "projects",
+  "color": "#fcb400",
+  "description": "Bases, tables, and records in Airtable.",
+  "auth": "env",
+  "tools": [
+    "list_bases",
+    "list_tables",
+    "list_records",
+    "search_records",
+    "get_record",
+    "create_record",
+    "update_records",
+    "delete_records"
+  ],
+  "spec": {
+    "kind": "npm",
+    "package": "airtable-mcp-server"
+  },
+  "setup": [
+    {
+      "key": "AIRTABLE_API_KEY",
+      "where": "env",
+      "hint": "pat... personal access token",
+      "required": true
+    }
+  ]
+}

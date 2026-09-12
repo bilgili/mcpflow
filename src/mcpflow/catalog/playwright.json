@@ -1,0 +1,25 @@
+{
+  "id": "playwright",
+  "name": "Playwright",
+  "vendor": "Microsoft",
+  "category": "dev",
+  "color": "#2ead33",
+  "description": "Drive a headless browser: navigate, click, type, snapshot.",
+  "auth": "none",
+  "tools": [
+    "browser_navigate",
+    "browser_click",
+    "browser_type",
+    "browser_fill_form",
+    "browser_snapshot",
+    "browser_take_screenshot"
+  ],
+  "spec": {
+    "kind": "npm",
+    "package": "@playwright/mcp",
+    "args": [
+      "--headless"
+    ]
+  },
+  "setup": []
+}

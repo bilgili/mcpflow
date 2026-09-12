@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="404" height="184" viewBox="0 0 404 184" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">MCP Flow</title>
+  <desc id="desc">Custom violet MCP lettering with three connections entering the M and one outgoing arrow leaving the P.</desc>
+  <g stroke="#635BFF" stroke-width="9" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Three incoming connections terminate in the left stem of M. -->
+    <path d="M24 40H44Q56 40 56 52V60Q56 72 72 72H84"/>
+    <path d="M24 96H84"/>
+    <path d="M24 152H44Q56 152 56 140V132Q56 120 72 120H84"/>
+    <!-- Custom monoline MCP letterforms. -->
+    <path d="M84 136V56L124 104L164 56V136"/>
+    <path d="M248 66C239 57 231 54 220 54C198 54 188 70 188 96C188 122 198 138 220 138C231 138 239 135 248 126"/>
+    <path d="M276 136V56H308C329 56 340 66 340 82C340 98 329 108 308 108H276"/>
+    <!-- The bowl of P extends into one outgoing connection. -->
+    <path d="M340 82H380"/>
+    <path d="M368 70L380 82L368 94"/>
+  </g>
+  <g fill="#635BFF">
+    <circle cx="24" cy="40" r="7"/>
+    <circle cx="24" cy="96" r="7"/>
+    <circle cx="24" cy="152" r="7"/>
+  </g>
+</svg>

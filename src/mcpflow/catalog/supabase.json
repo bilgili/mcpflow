@@ -1,0 +1,32 @@
+{
+  "id": "supabase",
+  "name": "Supabase",
+  "vendor": "Supabase",
+  "category": "dev",
+  "color": "#3ecf8e",
+  "description": "Projects, tables, SQL, migrations, and logs in Supabase.",
+  "auth": "env",
+  "tools": [
+    "list_projects",
+    "list_tables",
+    "execute_sql",
+    "apply_migration",
+    "get_logs",
+    "generate_typescript_types"
+  ],
+  "spec": {
+    "kind": "npm",
+    "package": "@supabase/mcp-server-supabase",
+    "args": [
+      "--read-only"
+    ]
+  },
+  "setup": [
+    {
+      "key": "SUPABASE_ACCESS_TOKEN",
+      "where": "env",
+      "hint": "sbp_... personal access token",
+      "required": true
+    }
+  ]
+}

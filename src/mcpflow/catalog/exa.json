@@ -1,0 +1,22 @@
+{
+  "id": "exa",
+  "name": "Exa",
+  "vendor": "Exa",
+  "category": "research",
+  "color": "#1d4ed8",
+  "description": "Web search, crawling, and deep research built for agents.",
+  "auth": "none",
+  "tools": [
+    "web_search_exa",
+    "get_code_context_exa",
+    "crawling_exa",
+    "deep_researcher_start",
+    "deep_researcher_check"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://mcp.exa.ai/mcp",
+    "transport": "http"
+  },
+  "setup": []
+}

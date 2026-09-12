@@ -1,0 +1,29 @@
+{
+  "id": "ramp",
+  "name": "Ramp",
+  "vendor": "Ramp",
+  "category": "finance",
+  "color": "#e4ff5c",
+  "description": "Transactions, cards, users, and reimbursements in Ramp.",
+  "auth": "oauth",
+  "tools": [
+    "list_transactions",
+    "get_transaction",
+    "list_cards",
+    "list_users",
+    "list_reimbursements"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://ramp-mcp-remote.ramp.com/mcp",
+    "transport": "http"
+  },
+  "setup": [
+    {
+      "key": "Authorization",
+      "where": "header",
+      "hint": "Bearer <token>, when the vendor issues one",
+      "required": false
+    }
+  ]
+}

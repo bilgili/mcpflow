@@ -1,0 +1,27 @@
+{
+  "id": "plaid",
+  "name": "Plaid",
+  "vendor": "Plaid",
+  "category": "finance",
+  "color": "#111111",
+  "description": "Items, accounts, and transactions from your Plaid dashboard.",
+  "auth": "oauth",
+  "tools": [
+    "search_documentation",
+    "get_item_details",
+    "list_transactions"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://api.dashboard.plaid.com/mcp/sse",
+    "transport": "sse"
+  },
+  "setup": [
+    {
+      "key": "Authorization",
+      "where": "header",
+      "hint": "Bearer <token>, when the vendor issues one",
+      "required": false
+    }
+  ]
+}

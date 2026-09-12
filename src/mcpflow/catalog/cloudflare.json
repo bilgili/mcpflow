@@ -1,0 +1,30 @@
+{
+  "id": "cloudflare",
+  "name": "Cloudflare",
+  "vendor": "Cloudflare",
+  "category": "dev",
+  "color": "#f38020",
+  "description": "Workers, KV, R2, and D1 in your Cloudflare account.",
+  "auth": "oauth",
+  "tools": [
+    "accounts_list",
+    "workers_list",
+    "workers_get_worker",
+    "kv_namespaces_list",
+    "r2_buckets_list",
+    "d1_databases_list"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://bindings.mcp.cloudflare.com/sse",
+    "transport": "sse"
+  },
+  "setup": [
+    {
+      "key": "Authorization",
+      "where": "header",
+      "hint": "Bearer <token>, when the vendor issues one",
+      "required": false
+    }
+  ]
+}

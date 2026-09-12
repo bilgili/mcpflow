@@ -1,0 +1,27 @@
+<p class="count muted">{{ shown | length }} of {{ total }} servers</p>
+<div class="grid">
+  {% for e in shown %}
+  {% set ns = connected.get(e.id) %}
+  <a class="card" href="/marketplace/{{ e.id }}" hx-get="/marketplace/{{ e.id }}" hx-target="#detail" hx-swap="innerHTML">
+    <span class="top">
+      <span class="icon" style="background:{{ e.color }}">{{ e.monogram }}</span>
+      <span><span class="name">{{ e.name }}</span><span class="vendor">{{ e.vendor }}</span></span>
+    </span>
+    <span class="desc">{{ e.description }}</span>
+    <span class="foot">
+      <span class="kind">{{ e.spec.kind }}</span>
+      <span class="small muted">{{ e.tools | length }} tools</span>
+      {% if e.origin == 'local' %}<span class="kind">local</span>{% endif %}
+      {% if ns %}
+      <span class="state connected">Connected <small>{{ ns | join(', ') }}</small></span>
+      {% else %}
+      <span class="btn connect">Connect</span>
+      {% endif %}
+    </span>
+  </a>
+  {% endfor %}
+  <a class="card custom" href="/servers/new">
+    <span class="icon">+</span>
+    <span>Not here?<br><span class="muted">Add a server by package, URL, or JSON</span></span>
+  </a>
+</div>

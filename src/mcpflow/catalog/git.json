@@ -1,0 +1,28 @@
+{
+  "id": "git",
+  "name": "Git",
+  "vendor": "Anthropic",
+  "category": "dev",
+  "color": "#f05032",
+  "description": "Status, diff, log, commit, and branches of one local repository.",
+  "auth": "none",
+  "tools": [
+    "git_status",
+    "git_diff",
+    "git_log",
+    "git_add",
+    "git_commit",
+    "git_branch",
+    "git_checkout",
+    "git_show"
+  ],
+  "spec": {
+    "kind": "python",
+    "package": "mcp-server-git",
+    "args": [
+      "--repository",
+      "/data/repo"
+    ]
+  },
+  "setup": []
+}

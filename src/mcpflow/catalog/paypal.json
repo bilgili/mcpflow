@@ -1,0 +1,30 @@
+{
+  "id": "paypal",
+  "name": "PayPal",
+  "vendor": "PayPal",
+  "category": "finance",
+  "color": "#003087",
+  "description": "Invoices, orders, and transactions in PayPal.",
+  "auth": "oauth",
+  "tools": [
+    "create_invoice",
+    "list_invoices",
+    "get_invoice",
+    "create_order",
+    "get_order",
+    "list_transactions"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://mcp.paypal.com/sse",
+    "transport": "sse"
+  },
+  "setup": [
+    {
+      "key": "Authorization",
+      "where": "header",
+      "hint": "Bearer <token>, when the vendor issues one",
+      "required": false
+    }
+  ]
+}

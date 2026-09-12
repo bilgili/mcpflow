@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ 'Edit server' if editing else 'Add server' }}</h1>
+{% if not editing %}
+<div class="tabs">
+  <a href="/servers/new?tab=python" class="{{ 'active' if tab == 'python' }}">Python</a>
+  <a href="/servers/new?tab=npm" class="{{ 'active' if tab == 'npm' }}">npm</a>
+  <a href="/servers/new?tab=json" class="{{ 'active' if tab == 'json' }}">JSON</a>
+</div>
+{% endif %}
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+{% if tab == 'json' and not values %}
+  <form hx-post="/import/json" hx-target="#import-result">
+    <label>Paste JSON config</label>
+    <textarea name="config" rows="8" placeholder='{"mcpServers": {...}}'></textarea>
+    <p><button type="submit">Parse</button></p>
+  </form>
+  <div id="import-result"></div>
+{% else %}
+  {% include "_server_form_fields.html" %}
+{% endif %}
+{% endblock %}

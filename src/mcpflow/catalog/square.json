@@ -1,0 +1,29 @@
+{
+  "id": "square",
+  "name": "Square",
+  "vendor": "Square",
+  "category": "finance",
+  "color": "#006aff",
+  "description": "Customers, orders, payments, and catalog in Square.",
+  "auth": "oauth",
+  "tools": [
+    "list_customers",
+    "list_orders",
+    "list_payments",
+    "list_catalog",
+    "get_location"
+  ],
+  "spec": {
+    "kind": "remote",
+    "url": "https://mcp.squareup.com/sse",
+    "transport": "sse"
+  },
+  "setup": [
+    {
+      "key": "Authorization",
+      "where": "header",
+      "hint": "Bearer <token>, when the vendor issues one",
+      "required": false
+    }
+  ]
+}
