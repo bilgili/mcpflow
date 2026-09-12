@@ -22,7 +22,7 @@ a child takes effect without a process restart.
   agent ──┼── Bearer token ──► /mcp ─┼── npx  <npm package>      (namespace b)
   agent ──┘        MCP Flow          ├── https://remote/mcp      (namespace c)
                       │              └── mcpflow_*  built-in admin tools
-             /login  /servers  /tokens  /api
+             /login  /  /marketplace  /tokens  /api
 ```
 
 - An agent connects to `/mcp` with one bearer token. The gateway publishes every visible
@@ -130,11 +130,11 @@ The process keeps all state under one data directory.
 
 ## Add a server
 
-Open `/servers` and select **Add server**. The add form has four tabs.
+Open `/` and select **Add server**. The add window opens over the dashboard
+and has three tabs.
 
 - **Python**: run a Python MCP server with `uvx <package>`. Enter the package and arguments.
 - **npm**: run a Node MCP server with `npx -y <package>`. Enter the package and arguments.
-- **mcpmarket**: import a server from an mcpmarket listing URL. See the next section.
 - **JSON**: paste a raw MCP config block. The form reads a `mcpServers` object or a bare name map.
 
 The add form supports two more kinds through import. A `remote` server proxies

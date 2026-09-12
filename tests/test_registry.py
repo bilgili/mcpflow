@@ -107,6 +107,47 @@ def test_source_secrets():
     assert source_secrets(None) == []
 
 
+# --- spec_command (unify-dashboard-servers) ----------------------------------
+
+
+def test_spec_command():
+    from mcpflow.registry import spec_command
+
+    python = ServerSpec(
+        namespace="time",
+        kind="python",
+        package="mcp-server-time",
+        args=["--local-timezone", "UTC"],
+    )
+    assert spec_command(python) == "uvx mcp-server-time --local-timezone UTC"
+
+    npm = ServerSpec(
+        namespace="fs", kind="npm", package="my-bin", source="github:o/r"
+    )
+    assert spec_command(npm) == "npx -y --package=github:o/r my-bin"
+
+    remote = ServerSpec(
+        namespace="r", kind="remote", url="https://host/mcp", transport="sse"
+    )
+    assert spec_command(remote) == "SSE https://host/mcp"
+
+    # `args` overrides the spec's own list, so the preview and the command
+    # line show the same arguments.
+    assert spec_command(python, ["--tz", "CET"]) == "uvx mcp-server-time --tz CET"
+    assert spec_command(python, []) == "uvx mcp-server-time"
+
+    # The source is redacted, so a credential never reaches a page.
+    secret = ServerSpec(
+        namespace="tool",
+        kind="python",
+        package="my-tool",
+        source="git+https://oauth2:TOKEN@host/o/r",
+    )
+    out = spec_command(secret)
+    assert out == "uvx --from git+https://***@host/o/r my-tool"
+    assert "TOKEN" not in out
+
+
 def test_update_keeps_source_on_redacted_echo(tmp_path):
     from mcpflow.registry import redact_source
 

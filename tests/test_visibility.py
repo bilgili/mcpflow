@@ -492,9 +492,10 @@ def test_dashboard_keeps_the_row_of_a_muted_tool(server_factory):
     assert "1 of 2 tools" in body
 
 
-def test_a_control_reopens_the_group_it_acted_in(server_factory):
-    """The swap replaces the whole tree, so the acted-on group must come back
-    open. Otherwise every toggle collapses the group under the cursor."""
+def test_a_control_answer_renders_every_group_collapsed(server_factory):
+    """The server renders no open state. The browser records the open groups
+    before the swap and restores them after, so a group the admin collapsed
+    during the round trip stays collapsed."""
     holder: dict = {}
     server = server_factory(
         _seed(
@@ -507,14 +508,13 @@ def test_a_control_reopens_the_group_it_acted_in(server_factory):
 
     with admin(server) as client:
         # The page itself opens nothing.
-        assert "<details class=\"ns-group\" >" in client.get("/").text
+        assert "open>" not in client.get("/").text
         body = client.post(
             tool_path("time"), data={"tool": "get_current_time"}
         ).text
 
-    # Only the group the control acted in comes back open.
-    assert '<details class="ns-group" open>' in body
-    assert body.count("open>") == 1
+    # Neither does the control answer.
+    assert "open>" not in body
 
 
 def test_a_form_edit_does_not_republish_a_muted_tool(server_factory):

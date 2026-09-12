@@ -158,7 +158,7 @@ def test_dashboard_without_tools_shows_the_empty_message(server_factory):
     resp = client.get("/")
     client.close()
     body = resp.text
-    assert "No child tool runs." in body
+    assert "No servers yet." in body
     # The built-in `mcpflow` group always renders; no child group does.
     groups = re.findall(r"<details[^>]*class=\"ns-group\"[^>]*>", body)
     assert len(groups) == 1
@@ -290,7 +290,7 @@ def test_python_tab(server_factory):
         },
     )
     assert resp.status_code == 303
-    assert resp.headers["location"] == "/servers"
+    assert resp.headers["location"] == "/"
     client.close()
     # The registry contains a child of kind python.
     reg = Registry(server.data_dir / "servers.json")
@@ -300,7 +300,7 @@ def test_python_tab(server_factory):
     assert spec.package == "mcp-server-time"
 
 
-def test_source_persists_redacted_in_table_raw_in_edit(server_factory):
+def test_source_persists_redacted_in_row_raw_in_window(server_factory):
     server = server_factory(CHILD_START_TIMEOUT="2")
     client = server.login()
     raw = "git+https://oauth2:SEKRETTOKEN@host/o/r"
@@ -314,14 +314,15 @@ def test_source_persists_redacted_in_table_raw_in_edit(server_factory):
     reg = Registry(server.data_dir / "servers.json")
     reg.load()
     assert reg.get("tool").source == raw
-    # The servers table shows the redacted value, never the token.
-    table = client.get("/servers").text
-    assert "git+https://***@host/o/r" in table
-    assert "SEKRETTOKEN" not in table
-    # The edit form shows the raw value, the same rule as raw env.
-    edit = client.get("/servers/tool/edit").text
+    # The server row on the dashboard shows the command with the source
+    # redacted, never the token.
+    row = client.get("/").text
+    assert "uvx --from git+https://***@host/o/r my-tool" in row
+    assert "SEKRETTOKEN" not in row
+    # The window's form input holds the raw value, the same rule as raw env.
+    window = client.get("/servers/tool").text
     client.close()
-    assert raw in edit
+    assert raw in window
 
 
 def test_checkbox_disabled_persists(server_factory):

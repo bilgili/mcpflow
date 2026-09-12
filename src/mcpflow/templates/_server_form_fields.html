@@ -1,5 +1,10 @@
 {% set k = values.get('kind') or tab %}
-<form method="post" action="{{ '/servers/' ~ values.get('namespace') if editing else '/servers' }}">
+{# The id is stable across every swap of a window: the footer button outside
+   this form submits it through the native `form=` attribute, so the window
+   frame can stay a plain `<div>` and the action forms never nest inside the
+   edit form. #}
+<form id="server-form" method="post"
+      action="{{ '/servers/' ~ values.get('namespace') if editing else '/servers' }}">
   <input type="hidden" name="kind" value="{{ k }}">
   <label>Namespace</label>
   <input name="namespace" value="{{ values.get('namespace', '') }}" {{ 'readonly' if editing }}>
@@ -35,5 +40,4 @@
   <label>Description</label>
   <input name="description" value="{{ values.get('description', '') }}">
   <label><input type="checkbox" name="enabled" value="on" {{ 'checked' if values.get('enabled', True) }}> Enabled</label>
-  <p><button type="submit">Save</button></p>
 </form>

@@ -154,6 +154,34 @@ def build_command(
     raise ValueError(f"build_command does not build a command for kind {kind}")
 
 
+def spec_command(spec, args: list[str] | None = None) -> str:
+    """The one-line command a spec runs as, with the source redacted.
+
+    The view adapter over `build_command`: that function owns the rule, this
+    joins the result for a page and hides the credential a source may carry.
+    A `remote` spec has no argument list, so it never reaches `build_command`.
+
+    `spec` is duck-typed over the command fields `kind`, `package`, `args`,
+    `command`, `source`, `url`, and `transport`: a `ServerSpec` or the
+    catalog's `SpecTemplate`. The registry cannot import the catalog, so the
+    parameter carries no annotation.
+
+    `args` overrides `spec.args` when given, so the marketplace preview and the
+    command line show the same arguments.
+    """
+    shown = list(spec.args) if args is None else list(args)
+    if spec.kind == "remote":
+        return f"{spec.transport.upper()} {spec.url}"
+    command, argv = build_command(
+        kind=spec.kind,
+        package=spec.package or "",
+        args=shown,
+        command=spec.command or "",
+        source=redact_source(spec.source),
+    )
+    return " ".join([command, *argv]).strip()
+
+
 class RegistryError(ValueError):
     """Raised on a duplicate namespace or an invalid spec. Names the field."""
 

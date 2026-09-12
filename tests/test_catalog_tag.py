@@ -100,8 +100,10 @@ def test_edit_form_save_keeps_tag(server_factory):
     tagged = _npm("gmail", enabled=False, catalog="gmail")
     server = server_factory(seed_registry(tagged), CHILD_START_TIMEOUT="2")
     client = server.login()
-    edit = client.get("/servers/gmail/edit").text
-    assert 'name="catalog"' not in edit
+    # The edit form lives in the server window now; `/edit` redirects to it.
+    assert client.get("/servers/gmail/edit").status_code == 303
+    window = client.get("/servers/gmail").text
+    assert 'name="catalog"' not in window
     resp = client.post(
         "/servers/gmail",
         data={"kind": "npm", "package": "@scope/pkg", "description": "changed"},
