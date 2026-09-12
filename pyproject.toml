@@ -8,6 +8,9 @@ version = "0.1.0"
 description = "MCP Flow: one-process MCP gateway with an admin web UI for the homelab."
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Ahmet Bilgili", email = "ahmetbilgili@gmail.com" }]
 dependencies = [
     "fastmcp>=4.0.2,<5",
     "jinja2>=3.1",

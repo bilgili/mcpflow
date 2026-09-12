@@ -97,6 +97,7 @@ Select a picture to open it at full size.
 - [Admin MCP tools](#admin-mcp-tools)
 - [Inline source servers](#inline-source-servers)
 - [Development](#development)
+- [License](#license)
 
 ## Install
 
@@ -461,3 +462,10 @@ before you archive a change.
 
 The logo lives at `src/mcpflow/static/logo.svg`. The web UI serves the same
 file at `/static/logo.svg`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+MCP Flow runs third-party MCP servers as child processes and proxies remote
+ones. Each of those carries its own license; this one covers MCP Flow itself.
