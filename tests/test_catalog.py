@@ -321,6 +321,17 @@ def test_run_command_and_preview_redact_the_source():
     assert "TOKEN" not in str(e.preview("ns"))
 
 
+def test_preview_redacts_a_remote_url():
+    """A local catalog entry can carry a credential in its URL; the preview
+    shows it through `redact_url`, like every other outward view."""
+    raw = "https://u:pw-secret@host/mcp?api_key=k-secret-1&r=eu"
+    e = _entry(spec={"kind": "remote", "url": raw})
+    shown = e.preview("ns")["url"]
+    assert shown == "https://•••@host/mcp?api_key=•••&r=•••"
+    assert "pw-secret" not in str(e.preview("ns"))
+    assert "k-secret-1" not in e.run_command()
+
+
 def test_run_command_keeps_its_remote_branch():
     e = _entry(spec={"kind": "remote", "url": "https://example.test/mcp"})
     assert e.run_command() == "HTTP https://example.test/mcp"
@@ -380,7 +391,8 @@ def test_every_builtin_git_source_is_pinned():
     for e in cat.entries():
         src = e.spec.source
         if src and src.startswith(("github:", "git+https://")):
-            assert _re.search(r"#[0-9a-f]{40}$", src), f"{e.id} is not pinned: {src}"
+            separator = "@" if e.spec.kind == "python" else "#"
+            assert _re.search(separator + r"[0-9a-f]{40}$", src), f"{e.id} is not pinned: {src}"
 
 
 def test_gdrive_is_an_oauth_entry_with_a_pinned_source():

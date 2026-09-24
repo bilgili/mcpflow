@@ -8,12 +8,16 @@ public operation owns the status transition; `_teardown` owns the mechanics.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import itertools
+import logging
 import os
-from collections.abc import Iterable
-from dataclasses import dataclass
+import threading
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Any, Literal, TextIO
 
 from fastmcp import Client, FastMCP
 from fastmcp.client.transports import (
@@ -22,21 +26,42 @@ from fastmcp.client.transports import (
     StdioTransport,
     StreamableHttpTransport,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Callable
+    from typing import Unpack
+
+    from fastmcp.client.transports.base import SessionKwargs, TransportOptions
+    from mcp import ClientSession
 from fastmcp.server.providers import AggregateProvider, FastMCPProvider, Provider
 from fastmcp.server.providers.proxy import ProxyProvider
 from fastmcp.server.transforms import Namespace, Visibility
+from mcp.types import CallToolResult, TextResourceContents
 
-from .catalog import SECRET_MASK
+from .actions import (
+    ActionScopeFilter,
+    ActionView,
+    AuthorizedHashProvider,
+    _coerced_secret_literals,
+    action_enabled,
+    clause_violation,
+    coerce_form,
+    is_tagged,
+    secret_keys,
+    secret_literals,
+)
 from .config import Settings
 from .oauth import ClientCreds, CredStore, HeaderSpec, PendingFlow, PendingFlows
 from .registry import (
     PINNED_ADMIN_TOOLS,
     RESERVED_NAMESPACE,
+    SECRET_MASK,
     Registry,
     RegistryError,
     ServerSpec,
     build_command,
     source_secrets,
+    url_secrets,
 )
 from .sources import SourceStore, total_bytes
 
@@ -62,6 +87,26 @@ MIN_SCRUB_LEN = 4
 # the prefix is registered as its own secret, so it masks even when a child
 # error echoes it without the scheme. Compared against a lower-cased value.
 _AUTH_SCHEMES = ("bearer ", "basic ", "token ")
+
+logger = logging.getLogger(__name__)
+
+# A child that publishes a concrete resource at this URI contributes a block to
+# the gateway's `instructions`. The contract is the URI only.
+INSTRUCTIONS_URI: str = "instructions://self"
+INSTRUCTIONS_READ_TIMEOUT: float = 2.0  # seconds, per child
+
+# The bound `_teardown` waits for in-flight leases to drain before it exits the
+# owned client and closes the transport. A healthy lease holds one `list_tools`
+# or one `read_resource`; a hold past this is a hung request, so the close fails
+# it and its caller runs its own failure path. Not `child_start_timeout`: the
+# lifecycle mutators hold `child.lock` across `_teardown`, so a 60 s default
+# would block every operation of that child behind one hung read.
+LEASE_DRAIN_TIMEOUT: float = 5.0  # seconds, per teardown
+
+# The four states of one `ChildSession`. `_run_start` owns `starting -> open`;
+# `_teardown` owns `open -> closing -> closed`. `acquire` and the proxy factory
+# grant only while the state is `open`.
+SessionState = Literal["starting", "open", "closing", "closed"]
 
 
 def scrub_secrets(text: str, secrets: Iterable[str]) -> str:
@@ -109,6 +154,293 @@ def scrub_secrets(text: str, secrets: Iterable[str]) -> str:
     return "".join(out)
 
 
+# The process log is process-wide, so its secret set is too. `_run_start`
+# pushes each generation's secrets here before it builds the transport; a
+# secret stays until the process exits, because a removed or replaced
+# generation's transport can still log after it left the child table (see the
+# redact-process-log design, D4). Readers take one reference read; the lock
+# only serialises writers' read-then-replace.
+_LOG_SECRETS: frozenset[str] = frozenset()
+_LOG_SECRETS_LOCK = threading.Lock()
+REDACTION_FAILED = "log record suppressed: secret redaction failed"
+
+
+def remember_log_secrets(values: Iterable[str]) -> None:
+    """Add secrets the process log must mask from now until exit."""
+    global _LOG_SECRETS
+    new = frozenset(v for v in values if len(v) >= MIN_SCRUB_LEN)
+    with _LOG_SECRETS_LOCK:
+        if not new <= _LOG_SECRETS:
+            _LOG_SECRETS = _LOG_SECRETS | new
+
+
+def _redact_record(record: logging.LogRecord, extra_keys: Iterable[str] = ()) -> None:
+    """Scrub one record in place against the remembered secrets.
+
+    Keeps `msg`/`args`/`exc_info` when nothing matches, so structured
+    formatters (`uvicorn.access` reads the `args` tuple) keep working. A
+    scrubbed template is applied only once it renders to the scrubbed text;
+    otherwise the record flattens to that text. `extra_keys` are the fields
+    `makeRecord` merged from `extra` (a child's log notification forwards its
+    own `extra`); a matching value is replaced by its scrubbed text. Any failure
+    fails closed, because `handleError` would print the raw message and args
+    to stderr.
+    """
+    secrets = _LOG_SECRETS
+    if not secrets:
+        return
+    try:
+        text = record.getMessage()
+        clean = scrub_secrets(text, secrets)
+        if clean != text:
+            msg, args = clean, None
+            if isinstance(record.msg, str) and isinstance(record.args, tuple):
+                cand_msg = scrub_secrets(record.msg, secrets)
+                cand_args = tuple(
+                    scrub_secrets(a, secrets) if isinstance(a, str) else a
+                    for a in record.args
+                )
+                with contextlib.suppress(Exception):
+                    # Render as `getMessage` does: no `%` step without args.
+                    if (cand_msg % cand_args if cand_args else cand_msg) == clean:
+                        msg, args = cand_msg, cand_args
+            record.msg, record.args = msg, args
+        # An argument the message never renders (an unused mapping key, an
+        # extra tuple item) still reaches stderr through `handleError` when a
+        # formatter fails; flatten when the arguments hold a secret at all.
+        if record.args and scrub_secrets(repr(record.args), secrets) != repr(record.args):
+            record.msg, record.args = clean, None
+        if record.exc_info:
+            trace = logging.Formatter().formatException(record.exc_info)
+            clean_trace = scrub_secrets(trace, secrets)
+            if clean_trace != trace:
+                record.exc_text, record.exc_info = clean_trace, None
+        if record.stack_info:
+            record.stack_info = scrub_secrets(record.stack_info, secrets)
+        for key in extra_keys:
+            value = record.__dict__[key]
+            value_text = value if isinstance(value, str) else str(value)
+            clean_value = scrub_secrets(value_text, secrets)
+            if clean_value != value_text:
+                record.__dict__[key] = clean_value
+    except Exception:  # noqa: BLE001 - fail closed on any scrub fault
+        record.msg, record.args = REDACTION_FAILED, None
+        record.exc_info = record.exc_text = record.stack_info = None
+        for key in extra_keys:
+            record.__dict__[key] = REDACTION_FAILED
+
+
+def install_log_redaction() -> None:
+    """Wrap `logging.Logger.makeRecord` with the redactor, once per process.
+
+    `makeRecord` is the one seam every record of every logger crosses before
+    any handler, after `extra` is merged, including handlers added later and
+    loggers that do not propagate (`uvicorn`). A record factory runs before the
+    `extra` merge, so it cannot see those fields. Never restored: shutdown does
+    not stop every transport, so a restore would let a late record through.
+    """
+    make = logging.Logger.makeRecord
+    if getattr(make, "_mcpflow_redactor", False):
+        return
+
+    def makeRecord(self, *args, **kwargs):
+        record = make(self, *args, **kwargs)
+        extra = kwargs.get("extra", args[8] if len(args) > 8 else None)
+        _redact_record(record, extra or ())
+        return record
+
+    makeRecord._mcpflow_redactor = True  # type: ignore[attr-defined]
+    logging.Logger.makeRecord = makeRecord  # type: ignore[method-assign]
+
+
+def _set_event() -> asyncio.Event:
+    """A fresh, already-set `asyncio.Event`. `ChildSession.idle` starts set,
+    because a new generation holds no lease."""
+    event = asyncio.Event()
+    event.set()
+    return event
+
+
+class LeaseRefused(RuntimeError):
+    """A child generation refused a lease or a connect.
+
+    `reason` is one of "no generation", "starting", "closing", "closed",
+    "second connect". `generation` is 0 for "no generation". The message is
+    `f"{namespace}: generation {generation} refused: {reason}"`, and it carries
+    no secret: only the namespace, the generation number, and the reason word.
+    """
+
+    def __init__(self, namespace: str, generation: int, reason: str) -> None:
+        super().__init__(f"{namespace}: generation {generation} refused: {reason}")
+        self.namespace = namespace
+        self.generation = generation
+        self.reason = reason
+
+
+class ActionUnavailable(RuntimeError):
+    """The leased generation cannot run the named action.
+
+    `reason` is one of: "unknown" (no such tool, or a tagged tool that
+    violates the clause), "muted" (the visibility transform hides it).
+    `str(exc)` carries no secret: only the action name and the reason word.
+    """
+
+    def __init__(self, name: str, reason: str) -> None:
+        super().__init__(f"action {name} is unavailable: {reason}")
+        self.reason = reason
+
+
+@dataclass(frozen=True)
+class ActionRun:
+    """Execution outcome and accumulated secrecy for one submit.
+
+    `Supervisor.run_action` classifies, coerces, and calls under one lease and
+    one execution listing. Every outcome preserves rendered secrecy metadata
+    and any declarations learned during execution. The web boundary combines
+    this context with the page metadata before masking presentation values.
+
+    `kind` is one of:
+      "ran"           a tool ran; `result` is its `CallToolResult` (may be
+                      is_error).
+      "muted"         the execution listing hides the tool; no tool ran.
+      "coerce_error"  the posted form failed coercion; `detail` names the
+                      property; no tool ran.
+      "unknown"       no such conforming action on the execution generation.
+      "lease_refused" the generation refused the lease; no tool ran.
+      "transport"     a transport or validation failure; no tool ran.
+
+    `detail` is RAW (unredacted): the coercion property message, or the
+    transport/lease text; "" for "ran" and "muted". `run_action` does not scrub
+    `detail` and does not log it. The web boundary scrubs it once with the
+    complete page secret union.
+    """
+
+    kind: str
+    secrets: frozenset[str]
+    password_keys: frozenset[str]
+    result: CallToolResult | None
+    detail: str
+
+
+async def _drop_notification(*_args: Any, **_kwargs: Any) -> None:
+    """Drop a child log or progress notification (F2, codex review 3).
+
+    A child log notification and a progress notification are payload-bearing,
+    and mcpflow surfaces neither. A child can echo a submitted secret in a log
+    notification, so the supervisor's child `Client` construction drops both.
+    One handler serves `log_handler` and `progress_handler`, which FastMCP
+    calls positionally (`fastmcp/client/client.py:430-432`).
+    """
+    return
+
+
+# The one child-`Client` logging policy. Threaded through every child
+# `Client(...)` site so the policy has one owner, not a guard per site.
+_CHILD_CLIENT_KW: dict[str, Any] = {
+    "log_handler": _drop_notification,
+    "progress_handler": _drop_notification,
+}
+
+
+class SingleConnectTransport(ClientTransport):
+    """A stdio transport that admits one connect per generation.
+
+    Leases keep a caller cancel off the shared transport, but a race still
+    leaves a gap: after `_teardown` exits the owned client, a proxy borrower
+    that got the client earlier can exit last, drop `nesting_counter` to zero,
+    and stop the session task. A later `async with client` is then a first
+    enter that reaches `StdioTransport.connect` and respawns the process. This
+    wrapper closes that gap. It admits the one connect of the owned enter and
+    refuses every later connect, so the process count per generation is
+    structural rather than a timing argument.
+    """
+
+    def __init__(
+        self,
+        inner: StdioTransport,
+        namespace: str,
+        generation: int,
+        log: TextIO | None = None,
+    ) -> None:
+        self.inner = inner
+        self.namespace = namespace
+        self.generation = generation
+        # The open log handle of this generation, owned here: its lifetime is
+        # the transport's, and `_teardown` already closes the transport.
+        self.log = log
+        self._admitted = False
+
+    @property
+    def legacy_only(self) -> bool:
+        return self.inner.legacy_only
+
+    @contextlib.asynccontextmanager
+    async def connect_session(
+        self,
+        *,
+        transport_options: TransportOptions | None = None,
+        **session_kwargs: Unpack[SessionKwargs],
+    ) -> AsyncIterator[ClientSession]:
+        # Refuse a second connect before any await, so the failure lands in the
+        # caller's session task and no process starts. Set the flag before any
+        # await, so a concurrent second connect cannot slip past the check.
+        if self._admitted:
+            raise LeaseRefused(self.namespace, self.generation, "second connect")
+        self._admitted = True
+        # Forward `transport_options` only when it is set: passing `None` would
+        # be equivalent, but the inner transport reads its own default and the
+        # invariant is that this wrapper adds no option of its own.
+        if transport_options is not None:
+            async with self.inner.connect_session(
+                transport_options=transport_options, **session_kwargs
+            ) as session:
+                yield session
+        else:
+            async with self.inner.connect_session(**session_kwargs) as session:
+                yield session
+
+    async def close(self) -> None:
+        try:
+            await self.inner.close()
+        finally:
+            if self.log is not None:
+                self.log.close()
+
+
+@dataclass(eq=False)
+class ChildSession:
+    """One generation of a child: its transport, its owned client, and its lease
+    count. `_run_start` builds it in `starting`; the commit moves it to `open`;
+    `_teardown` moves it through `closing` to `closed`. `eq=False`, because the
+    identity of a generation, not its field values, is what a `child.session is
+    session` check compares.
+    """
+
+    namespace: str
+    generation: int
+    transport: ClientTransport
+    client: Client | None  # stdio: the owned client; remote: None
+    state: SessionState = "starting"
+    leases: int = 0
+    idle: asyncio.Event = field(default_factory=_set_event)  # set iff leases == 0
+
+    def acquire(self) -> None:
+        """Grant one lease. Synchronous, so `_lease` reads `child.session` and
+        acquires with no await between the two. Raises `LeaseRefused` unless the
+        generation is `open`."""
+        if self.state != "open":
+            raise LeaseRefused(self.namespace, self.generation, self.state)
+        self.leases += 1
+        self.idle.clear()
+
+    def release(self) -> None:
+        """Drop one lease. Synchronous. Sets `idle` when the last lease goes, so
+        `_teardown` wakes."""
+        self.leases -= 1
+        if self.leases == 0:
+            self.idle.set()
+
+
 @dataclass
 class Child:
     spec: ServerSpec
@@ -121,6 +453,7 @@ class Child:
     visibility: Visibility | None
     lock: asyncio.Lock
     task: asyncio.Task | None
+    session: ChildSession | None
 
 
 @dataclass(frozen=True)
@@ -160,6 +493,7 @@ def _new_child(spec: ServerSpec) -> Child:
         visibility=None,
         lock=asyncio.Lock(),
         task=None,
+        session=None,
     )
 
 
@@ -222,6 +556,10 @@ class Supervisor:
         self._children: dict[str, Child] = {
             spec.namespace: _new_child(spec) for spec in registry.list()
         }
+        # One generation number per start, so a `ChildSession` and its refusals
+        # name the generation that produced them. Starts at 1; 0 is the "no
+        # generation" sentinel of `LeaseRefused`.
+        self._generations = itertools.count(1)
         # Namespaces a `remove` holds until its teardown returns. Separate from
         # `_children`, which `remove` empties before the await so `children()`
         # never lists a half torn down child. A reclaim inside that window
@@ -250,7 +588,9 @@ class Supervisor:
     def _log_path(self, namespace: str):
         return self.settings.data_dir / "logs" / f"{namespace}.log"
 
-    def _build_transport(self, spec: ServerSpec) -> ClientTransport:
+    def _build_transport(
+        self, spec: ServerSpec, generation: int = 0
+    ) -> ClientTransport:
         if spec.kind == "remote":
             if spec.transport == "sse":
                 return SSETransport(spec.url, headers=spec.headers)
@@ -268,12 +608,29 @@ class Supervisor:
         )
         log_path = self._log_path(spec.namespace)
         log_path.write_text("")  # truncate on each start
-        return StdioTransport(
-            command=command,
-            args=args,
-            env=self._build_env(spec),
-            keep_alive=True,
-            log_file=log_path,
+        # Open the log here, in the same synchronous step as the truncate and
+        # the `child.spec` read of `_run_start`, and hand fastmcp the handle.
+        # Given a `Path`, fastmcp opens it by name later, in its connect task,
+        # which `child.task.cancel()` does not cancel: after an `update`
+        # unlinked the log for a secret change, that open would recreate the
+        # file under the old generation's env. With the handle, nothing opens
+        # the log by name after this step, so an unlink is final. Append mode,
+        # so writers that share the inode never overwrite each other.
+        log = log_path.open("a")
+        # `SingleConnectTransport` admits the one owned enter of `_run_start`
+        # and refuses every later connect, so a borrower that outlives teardown
+        # cannot respawn the process (D3). It owns and closes the handle.
+        return SingleConnectTransport(
+            StdioTransport(
+                command=command,
+                args=args,
+                env=self._build_env(spec),
+                keep_alive=True,
+                log_file=log,
+            ),
+            spec.namespace,
+            generation,
+            log,
         )
 
     def _build_provider(self, child: Child) -> Provider:
@@ -290,11 +647,41 @@ class Supervisor:
         hide_all, hidden = self.registry.visibility(child.spec)
         visibility = Visibility(False, match_all=hide_all, names=hidden)
         child.visibility = visibility
-        return (
-            ProxyProvider(self._make_factory(child.transport))
-            .wrap_transform(visibility)
-            .wrap_transform(Namespace(child.spec.namespace))
+        spec = child.spec
+        if not spec.actions:
+            # F2 revised: a non-capable child has no action, so no tool of it is
+            # ever hidden from an mcp session or reached by hash. Keep the
+            # pre-amendment chain (visibility, then namespace) and the
+            # `child-catalog-freshness` cache_ttl. NO ActionScopeFilter, NO
+            # AuthorizedHashProvider: the classification path is not built, so a
+            # stale cache cannot cross into an admin-only boundary.
+            ttl = (
+                spec.cache_ttl
+                if spec.cache_ttl is not None
+                else self.settings.child_cache_ttl
+            )
+            provider = ProxyProvider(self._make_factory(child.session), cache_ttl=ttl)
+            return provider.wrap_transform(visibility).wrap_transform(
+                Namespace(spec.namespace)
+            )
+        # F2 revised: an action-capable child. cache_ttl=0, so every
+        # list_tools/get_tool/get_tool_by_hash re-lists the live generation. The
+        # filter and the hashed-path authorizer then classify the metadata the
+        # tool executes with, not a stale cache. `spec.cache_ttl` is inert here:
+        # a mutable cache must not gate an admin-only boundary.
+        provider = ProxyProvider(self._make_factory(child.session), cache_ttl=0)
+        # Innermost, for the reason `register_builtin` gives: the filter
+        # removes an action, a visibility mark must never resurrect it, and it
+        # reads the bare name and the bare `_meta`. `add_transform` returns
+        # None, so this is its own statement.
+        provider.add_transform(ActionScopeFilter())
+        chain = provider.wrap_transform(visibility).wrap_transform(
+            Namespace(spec.namespace)
         )
+        # F1: outermost, so `AggregateProvider.get_tool_by_hash` and the app
+        # path resolve through it. It re-applies the named-path decision to the
+        # hashed and app paths, which bypass every transform otherwise.
+        return AuthorizedHashProvider(chain, spec.namespace)
 
     def register_builtin(self, server: FastMCP) -> Provider:
         """Build the provider chain of the built-in admin server.
@@ -347,11 +734,57 @@ class Supervisor:
         self._builtin_visibility.match_all = hide_all
         self._builtin_visibility.names = hidden
 
-    def _make_factory(self, transport: ClientTransport):
-        timeout = self.settings.child_start_timeout
+    @contextlib.asynccontextmanager
+    async def _lease(self, child: Child) -> AsyncIterator[Client]:
+        """Lease the current generation of `child` and yield a usable client.
+
+        Reads `child.session` and calls `acquire()` with no await between, so
+        no teardown can move the generation out of `open` between the two. A
+        stdio generation yields the owned client and enters nothing; a remote
+        generation enters a fresh client, because F7 makes each remote connect
+        independent. `release()` runs in `finally`, so return, raise, and cancel
+        all release the lease.
+
+        Rule L1: a holder must never await `child.lock` while it holds the
+        lease. `_teardown` holds the lock and waits for the drain, so a holder
+        that waited for the lock would deadlock until the bound expires.
+        """
+        session = child.session
+        if session is None:
+            raise LeaseRefused(child.spec.namespace, 0, "no generation")
+        session.acquire()
+        try:
+            if session.client is not None:
+                yield session.client
+            else:
+                async with Client(
+                    session.transport,
+                    timeout=self.settings.child_start_timeout,
+                    **_CHILD_CLIENT_KW,
+                ) as client:
+                    yield client
+        finally:
+            session.release()
+
+    def _make_factory(self, session: ChildSession) -> Callable[[], Client]:
+        """The proxy factory of one generation. It refuses unless the generation
+        is `open`, so a proxy call during or after teardown fails with a typed
+        error rather than reaching a torn-down transport. It changes no lease
+        count: `nesting_counter` counts proxy borrowers, and D2/D3 make that
+        count safe, so teardown does not wait for proxy calls."""
 
         def factory() -> Client:
-            return Client(transport, timeout=timeout)
+            if session.state != "open":
+                raise LeaseRefused(
+                    session.namespace, session.generation, session.state
+                )
+            if session.client is not None:
+                return session.client
+            return Client(
+                session.transport,
+                timeout=self.settings.child_start_timeout,
+                **_CHILD_CLIENT_KW,
+            )
 
         return factory
 
@@ -382,15 +815,48 @@ class Supervisor:
         # concurrent `update` cancels this task, so its error is normally never
         # stored; the capture keeps the scrub correct even so.
         secrets = self._secrets_of(spec)
+        # Before the transport exists, so it can never log an unmasked secret.
+        remember_log_secrets(secrets)
+        # Allocate the generation and build its session before the first await.
+        # A stdio child owns one client; a remote child owns none and borrows a
+        # fresh client per read (D2). The transport and the session are assigned
+        # together, so `_teardown` sees a matched pair.
+        generation = next(self._generations)
+        transport = self._build_transport(spec, generation)
+        child.transport = transport
+        owned = (
+            None
+            if spec.kind == "remote"
+            else Client(
+                transport,
+                timeout=self.settings.child_start_timeout,
+                **_CHILD_CLIENT_KW,
+            )
+        )
+        session = ChildSession(
+            namespace=spec.namespace,
+            generation=generation,
+            transport=transport,
+            client=owned,
+        )
+        child.session = session
         try:
             try:
-                transport = self._build_transport(spec)
-                child.transport = transport
                 async with asyncio.timeout(self.settings.child_start_timeout):
-                    async with Client(
-                        transport, timeout=self.settings.child_start_timeout
-                    ) as c:
-                        tools = await c.list_tools()
+                    if owned is not None:
+                        # Enter the owned client once and keep it entered: it is
+                        # the one admitted connect of this generation. `_teardown`
+                        # exits it. A probe failure leaves it entered and the
+                        # session `starting`; the next teardown closes it.
+                        await owned.__aenter__()
+                        tools = await owned.list_tools()
+                    else:
+                        async with Client(
+                            transport,
+                            timeout=self.settings.child_start_timeout,
+                            **_CHILD_CLIENT_KW,
+                        ) as c:
+                            tools = await c.list_tools()
             except asyncio.CancelledError:
                 raise
             except TimeoutError:
@@ -419,6 +885,10 @@ class Supervisor:
                 child.started_at = datetime.now(UTC)
                 child.last_error = None
                 child.status = "running"
+                # Open the generation in the same locked block that publishes
+                # the provider and sets `running`, so a lease or a proxy call is
+                # granted exactly when the tools become reachable.
+                session.state = "open"
         finally:
             # Clear the in-flight task, but only when it is still this task.
             # A concurrent teardown/restart may have installed a newer task.
@@ -458,30 +928,82 @@ class Supervisor:
         close escape. `remove` relies on that, having already written the
         registry by the time it calls here.
 
-        It is not total against `BaseException`, and it does not promise the
-        subprocess died. A close that raises `Exception` or `CancelledError`
-        is swallowed and the transport handle dropped anyway, so a wedged
-        child can outlive the gateway's record of it; another `BaseException`
-        escapes before the handle is dropped. Both gaps predate the caller
-        ordering and neither is addressed here.
+        Another `BaseException` is not swallowed, but it does not skip a
+        release either: each later step runs in a `finally`, so the provider
+        is unpublished, the transport closed (with the log handle it owns),
+        and the generation closed before the exception leaves. The one step
+        it can still interrupt is the close itself: a `BaseException` from
+        `transport.close()` escapes before the handle is dropped, and
+        `SingleConnectTransport.close` has already closed the log handle in
+        its own `finally`. The step order is the same on every path. A
+        `BaseException` from the lease drain is the one path that closes the
+        transport while a lease is still held, before `LEASE_DRAIN_TIMEOUT`.
+
+        It does not promise the subprocess died. A close that raises
+        `Exception` or `CancelledError` is swallowed and the transport handle
+        dropped anyway, so a wedged child can outlive the gateway's record of
+        it.
         """
-        if child.task is not None:
-            child.task.cancel()
+        try:
+            if child.task is not None:
+                child.task.cancel()
+                try:
+                    await child.task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001, S110 -- best-effort teardown
+                    pass
+                finally:
+                    # The task is done either way; a kept reference would make
+                    # the next teardown await it and re-raise its exception.
+                    child.task = None
+        finally:
+            if child.provider is not None and child.provider in self.table.providers:
+                self.table.providers.remove(child.provider)
+            child.provider = None
+            child.visibility = None
+            # No await separates the provider removal from `closing`: from here
+            # `acquire` and the factory refuse, so no new lease enters the drain.
+            session = child.session
             try:
-                await child.task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001, S110 -- best-effort teardown
-                pass
-            child.task = None
-        if child.provider is not None and child.provider in self.table.providers:
-            self.table.providers.remove(child.provider)
-        child.provider = None
-        child.visibility = None
-        if child.transport is not None:
-            try:
-                await child.transport.close()
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001, S110 -- see the docstring
-                pass
-            child.transport = None
+                if session is not None:
+                    session.state = "closing"
+                    # Wait for the in-flight leases to drain, but only for the
+                    # bound. A hold past it is a hung request; the close below
+                    # fails it.
+                    try:
+                        async with asyncio.timeout(LEASE_DRAIN_TIMEOUT):
+                            await session.idle.wait()
+                    except TimeoutError:
+                        logger.warning(
+                            "lease drain timed out for %s generation %d with %d "
+                            "leases after %.1fs",
+                            session.namespace,
+                            session.generation,
+                            session.leases,
+                            LEASE_DRAIN_TIMEOUT,
+                        )
+                    except asyncio.CancelledError:
+                        # Continue, as the task await and the close already do.
+                        pass
+                    finally:
+                        # Exit the owned client, so its session task can stop.
+                        # It stops now, or when the last proxy borrower exits
+                        # (F3). Remote leaves it None. In a `finally`, so a
+                        # `BaseException` from the drain does not skip it.
+                        if session.client is not None:
+                            try:
+                                await session.client.__aexit__(None, None, None)
+                            except (asyncio.CancelledError, Exception):  # noqa: BLE001, S110 -- see the docstring
+                                pass
+            finally:
+                if child.transport is not None:
+                    try:
+                        await child.transport.close()
+                    except (asyncio.CancelledError, Exception):  # noqa: BLE001, S110 -- see the docstring
+                        pass
+                    child.transport = None
+                if session is not None:
+                    session.state = "closed"
+                    child.session = None
 
     # --- public operations ----------------------------------------------
 
@@ -548,6 +1070,16 @@ class Supervisor:
             raise RegistryError(f"namespace {ns} is being removed")
         self._check_source(spec)
         self._check_creds(ns, spec.enabled, spec.oauth_pending)
+        # A log under a free namespace is residue (a remove that a restart
+        # interrupted, or one from before the log delete) and holds an old
+        # child's output, which this child cannot scrub. Discard it BEFORE the
+        # registry write, for the reason `update` discards first: a crash or
+        # an `OSError` after the write would leave the new record beside the
+        # old log. Only when the registry does not list the namespace, so a
+        # duplicate `add` (which `registry.add` refuses below) never deletes
+        # the log of a live child.
+        if ns not in self._children:
+            self._log_path(ns).unlink(missing_ok=True)
         self.registry.add(spec)
         # `registry.add` raises on a duplicate, so reaching here proves the
         # namespace was free, so any credential directory under it is residue
@@ -588,7 +1120,24 @@ class Supervisor:
             self._check_creds(
                 spec.namespace, spec.enabled, child.spec.oauth_pending
             )
+            # When the secret set changes, the retained log holds a secret that
+            # `_scrub` cannot mask once `child.spec` holds the new record, so
+            # discard the log BEFORE the record is persisted. `merge` validates
+            # and returns the record `update` stores, writing nothing, so a
+            # rejected edit keeps the log. Discard-then-persist, not the other
+            # way round: a crash or an `OSError` from the unlink after the write
+            # would leave the new record beside the old log, and the next
+            # lock-free mute (or the restart) would copy the new record into
+            # `child.spec` and `log_tail` would show the old secret. A failed
+            # write after the discard costs diagnostics only: the old process
+            # keeps its descriptor and writes to the unlinked inode, which no
+            # reader can open. In BOTH enabled branches: a restart truncates
+            # the log only for a local transport, so a child switched to
+            # `remote` (or disabled) would keep the old output. No `await`
+            # from here to the write, so `merge` and `update` agree.
             old_secrets = set(self._secrets_of(child.spec))
+            if set(self._secrets_of(self.registry.merge(spec))) != old_secrets:
+                self._log_path(spec.namespace).unlink(missing_ok=True)
             self.registry.update(spec)
             await self._teardown(child)
             # `registry.update` merges the visibility state and `created_at`
@@ -600,15 +1149,7 @@ class Supervisor:
                 child.status = "starting"
                 child.task = asyncio.create_task(self._run_start(spec.namespace))
             else:
-                # A restart truncates the log in `_build_transport`, so the
-                # enabled branch drops prior-generation output. The disabled
-                # branch does not restart. When the secret set changed, the
-                # retained log holds a secret that `_scrub` can no longer mask
-                # (it is no longer in `child.spec`), so discard the log. Only
-                # local children have one; `missing_ok` covers a remote child.
                 child.status = "stopped"
-                if set(self._secrets_of(child.spec)) != old_secrets:
-                    self._log_path(spec.namespace).unlink(missing_ok=True)
         return child
 
     async def remove(self, namespace: str) -> None:
@@ -656,6 +1197,10 @@ class Supervisor:
                 # nothing. No child-table guard: the reservation admits no
                 # replacement, so there is nothing here to protect.
                 self.creds.remove(namespace)
+                # And the log: it holds this child's raw output, which a later
+                # child under the same namespace could not scrub (its secret
+                # set is different), so `server_log` would show the old secret.
+                self._log_path(namespace).unlink(missing_ok=True)
                 # Same for the source directory, and for the same reason it
                 # waits for the teardown: no delete pulls files out from under
                 # a live process. `owns` answers whether the directory is ours
@@ -908,6 +1453,183 @@ class Supervisor:
             *(view for sub in results for view in sub),
         ]
 
+    async def actions(self, namespace: str) -> list[ActionView]:
+        """Raw admitted metadata; the web boundary owns presentation masking."""
+        child = self.get(namespace)
+        if not child.spec.actions or child.status != "running":
+            return []
+        try:
+            async with self._lease(child) as client:
+                tools = await client.list_tools()
+        except LeaseRefused:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- the page renders the reason
+            raise RuntimeError(str(exc) or repr(exc)) from None
+        hide_all, hidden = self.registry.visibility(child.spec)
+        views: list[ActionView] = []
+        for tool in tools:
+            if not is_tagged(tool):
+                continue
+            term = clause_violation(tool)
+            if term is not None:
+                logger.warning(
+                    "%s: tool %s is not an action: %s", namespace, tool.name, term
+                )
+                continue
+            disabled = not action_enabled(
+                tool, _visible(False, hide_all, hidden, tool.name)
+            )
+            views.append(
+                ActionView(
+                    name=tool.name,
+                    title=tool.title or "",
+                    description=tool.description or "",
+                    schema=tool.input_schema,
+                    disabled=disabled,
+                    reason="muted" if disabled else "",
+                )
+            )
+        return views
+
+    async def run_action(
+        self,
+        namespace: str,
+        name: str,
+        form: Mapping[str, Any],
+        *,
+        rendered_password_keys: frozenset[str] = frozenset(),
+        rendered_secrets: frozenset[str] = frozenset(),
+    ) -> ActionRun:
+        """Classify, coerce, and call under one lease and one current listing.
+
+        Rendered metadata adds secrecy, never execution authority. Accumulators
+        survive failures at any await; only the web boundary masks their detail.
+        """
+        child = self.get(namespace)
+        password_keys = frozenset(rendered_password_keys)
+        full = (
+            frozenset(self._secrets_of(child.spec))
+            | rendered_secrets
+            | frozenset(
+                value
+                for key in password_keys
+                if isinstance(value := form.get(key), str) and value
+            )
+        )
+        if not child.spec.actions:
+            return ActionRun("unknown", full, password_keys, None, "")
+        if child.status != "running":
+            return ActionRun(
+                "transport", full, password_keys, None, f"{namespace} is not running"
+            )
+        try:
+            async with self._lease(child) as client:
+                tools = await client.list_tools()
+                admitted = [
+                    tool
+                    for tool in tools
+                    if is_tagged(tool) and clause_violation(tool) is None
+                ]
+                full |= frozenset(
+                    value
+                    for tool in admitted
+                    for value in secret_literals(tool.input_schema)
+                )
+                tool = next((t for t in admitted if t.name == name), None)
+                if tool is None:
+                    return ActionRun("unknown", full, password_keys, None, "")
+                schema = tool.input_schema
+                password_keys |= secret_keys(schema)
+                full |= frozenset(
+                    value
+                    for key in password_keys
+                    if isinstance(value := form.get(key), str) and value
+                )
+                hide_all, hidden = self.registry.visibility(child.spec)
+                if not action_enabled(tool, _visible(False, hide_all, hidden, name)):
+                    return ActionRun("muted", full, password_keys, None, "")
+                try:
+                    arguments = coerce_form(schema, form)
+                    full |= _coerced_secret_literals(arguments, password_keys)
+                except ValueError as exc:
+                    return ActionRun(
+                        "coerce_error", full, password_keys, None, str(exc)
+                    )
+                result = await client.call_tool_mcp(name, arguments)
+                return ActionRun("ran", full, password_keys, result, "")
+        except LeaseRefused as exc:
+            return ActionRun("lease_refused", full, password_keys, None, str(exc))
+        except Exception as exc:  # noqa: BLE001 -- the handler renders the reason
+            return ActionRun(
+                "transport", full, password_keys, None, str(exc) or repr(exc)
+            )
+
+    async def instructions_blocks(self) -> list[tuple[str, str]]:
+        """Read `instructions://self` from every running, unmuted child.
+
+        Returns `(namespace, text)` pairs in registry order, one per child
+        whose read returned non-blank text within `INSTRUCTIONS_READ_TIMEOUT`.
+        The text is raw: no header, no cap. Never raises. Never changes a
+        child's status.
+        """
+        # The gate resolves before the read: it decides whether to read at
+        # all. `hidden` is not consulted, so a tool mute has no effect here.
+        candidates = [
+            c
+            for c in self.children()
+            if c.status == "running" and not self.registry.visibility(c.spec)[0]
+        ]
+        results = await asyncio.gather(
+            *(self._read_instructions(c) for c in candidates),
+            return_exceptions=True,
+        )
+        return [
+            (c.spec.namespace, text)
+            for c, text in zip(candidates, results, strict=True)
+            if isinstance(text, str)
+        ]
+
+    async def _read_instructions(self, child: Child) -> str | None:
+        """One child's instructions read. Logs and swallows every failure.
+
+        Unlike `_probe_child`, a failure here takes no lock and changes no
+        status, `last_error`, or provider: a hung resource read is not proof
+        of a dead child.
+        """
+        namespace = child.spec.namespace
+        # Captured before the await, the same rule as `_probe_child`.
+        secrets = self._secrets_of(child.spec)
+        try:
+            # The bound wraps the read only, never the lease acquire. Borrow the
+            # generation's client and read on it. A refused lease raises
+            # `LeaseRefused`, which the `except Exception` below logs and
+            # swallows like any other read failure.
+            async with self._lease(child) as client:
+                contents = await asyncio.wait_for(
+                    client.read_resource(INSTRUCTIONS_URI), INSTRUCTIONS_READ_TIMEOUT
+                )
+        except TimeoutError:
+            logger.warning(
+                "instructions://self read timed out for %s after %.1fs",
+                namespace,
+                INSTRUCTIONS_READ_TIMEOUT,
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001 -- a read failure never fails initialize
+            logger.warning(
+                "instructions://self read failed for %s: %s",
+                namespace,
+                scrub_secrets(str(exc) or repr(exc), secrets),
+            )
+            return None
+        text = next(
+            (i.text for i in contents if isinstance(i, TextResourceContents)), None
+        )
+        if text is None:
+            logger.warning("instructions://self returned no text for %s", namespace)
+            return None
+        return text if text.strip() else None
+
     async def _builtin_views(self) -> list[ToolView]:
         """Build the rows of the built-in admin server.
 
@@ -948,15 +1670,17 @@ class Supervisor:
         # a post-await read would scrub the failure text with the wrong
         # generation's secrets and leak this one's.
         secrets = self._secrets_of(child.spec)
+        # Read the generation in the same synchronous step as the lease, so the
+        # failure path below can check identity (D7): a probe of generation g
+        # that fails after a restart must never mark generation g+1.
+        session = child.session
         # This client talks to the child, not through the mount table, so the
         # visibility transform does not apply here. That is load-bearing: the
         # dashboard must list a muted tool to offer the control that unmutes
         # it. Do not route this read through the table.
         try:
-            async with Client(
-                child.transport, timeout=self.settings.child_start_timeout
-            ) as c:
-                tools = await c.list_tools()
+            async with self._lease(child) as client:
+                tools = await client.list_tools()
             # Resolve the policy after the await, so one rendered tree never
             # mixes a pre-await policy with a post-await tool inventory.
             hide_all, hidden = self.registry.visibility(child.spec)
@@ -977,11 +1701,18 @@ class Supervisor:
                     )
                 )
             return views
+        except LeaseRefused:
+            # A refusal is not proof of a dead child: the generation is starting
+            # or tearing down. Take no lock, log nothing, change no status.
+            return []
         except Exception as exc:  # noqa: BLE001 -- one child's error must not stop the others
+            # The lease released as the exception left its `async with` block,
+            # so this lock is taken only after the lease block exits (L1).
             async with child.lock:
                 # Re-check under the lock: a concurrent disable/stop may have
-                # left "running". Do not clobber that transition.
-                if child.status != "running":
+                # left "running", and a restart may have installed generation
+                # g+1. Mark `failed` only for the generation that failed (D7).
+                if child.status != "running" or child.session is not session:
                     return []
                 child.status = "failed"
                 self._record_error(child, str(exc) or repr(exc), secrets)
@@ -993,6 +1724,15 @@ class Supervisor:
                 child.provider = None
                 child.visibility = None
             return []
+
+    def child_secrets(self, namespace: str) -> list[str]:
+        """The configured secret strings of one child, for the web redactor.
+
+        A public accessor over `_secrets_of(child.spec)`, so the actions page
+        can union the configured secrets with the request-local posted ones.
+        `get` raises `KeyError` for an unknown namespace.
+        """
+        return self._secrets_of(self.get(namespace).spec)
 
     def _secrets_of(self, spec: ServerSpec) -> list[str]:
         """The secret strings of one spec generation: every non-empty `env`
@@ -1015,6 +1755,8 @@ class Supervisor:
                 if low.startswith(scheme):
                     values.append(value[len(scheme) :].strip())
         values.extend(source_secrets(spec.source))
+        # A remote child's HTTP error echoes its URL; mask the URL credential.
+        values.extend(url_secrets(spec.url))
         return values
 
     def _scrub(self, child: Child, text: str) -> str:

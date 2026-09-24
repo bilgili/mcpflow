@@ -1,0 +1,123 @@
+{# The actions page of one child. One partial, two frames, like the server
+   window: `page` picks the close control.
+
+   One card per action, in the child's order. Every form posts without htmx,
+   so a submit answers the full page with the submitted card (`active`) open.
+   A `format: password` control never carries a `value` attribute, in any
+   render; the handler has already masked every rendered string. #}
+<div class="dhead">
+  <span class="icon plain">{{ ns[0] | upper }}</span>
+  <div>
+    <h2>{{ ns }} · actions</h2>
+    <div class="vendor">
+      <span class="status status-{{ c.status }}">{{ c.status }}</span>
+      · <span class="kind">{{ c.spec.kind }}</span>
+      {% if not error %} · {{ actions | length }} actions · admin only{% endif %}
+    </div>
+  </div>
+  {% if page %}
+  <a class="btn close" href="/servers/{{ ns }}">Back to server</a>
+  {% else %}
+  <form method="dialog" class="inline close"><button type="submit">Close</button></form>
+  {% endif %}
+</div>
+
+<div class="dbody">
+  {% if error %}
+  <div>
+    <p class="error">Could not read actions from {{ ns }}: {{ error }}</p>
+    <p class="muted">The child is running but did not answer <code>tools/list</code>. Restart it from the server window, then reload.</p>
+  </div>
+  <div class="side">
+    <h3>Actions</h3>
+    <div class="actions"><a class="btn" href="/servers/{{ ns }}">server window</a></div>
+  </div>
+  {% else %}
+  <div>
+    <h3>Actions</h3>
+    {% if not actions %}
+    <p class="muted">no actions</p>
+    {% endif %}
+    <div class="action-list">
+      {% for a in actions %}
+      {% set on = a.active %}
+      <details class="action{{ ' muted' if a.disabled }}"{{ ' open' if on }}>
+        <summary>
+          {% if a.title %}<span class="title">{{ a.title }}</span>{% endif %}
+          <span class="name">{{ a.name }}</span>
+          <span class="desc">{{ a.description }}</span>
+          {% if a.disabled %}<span class="badge">{{ a.reason }}</span>{% endif %}
+          <span class="kind">action</span>
+        </summary>
+        <div class="body">
+          <form method="post" action="/servers/{{ ns }}/actions/{{ a.alias }}?form_token={{ form_token }}" autocomplete="off">
+            {% for f in a.fields %}
+            {% set fid = f.id %}
+            {% set val = f.value %}
+            {% set dis = ' disabled' if a.disabled else '' %}
+            {% set req = ' required' if f.required else '' %}
+            <label for="{{ fid }}">{{ f.label }}{% if f.required %} <span class="req">required</span>{% endif %}</label>
+            {% if f.control == 'password' %}
+            <input id="{{ fid }}" name="{{ f.alias }}" type="password" autocomplete="new-password" placeholder="never re-filled"{{ req }}{{ dis }}>
+            <p class="secret-note">format: password — masked on input, never echoed back, replaced by <code>***</code> in results and errors.</p>
+            {% elif f.control == 'enum' %}
+            <select id="{{ fid }}" name="{{ f.alias }}"{{ req }}{{ dis }}>
+              {% if not f.required %}<option value=""></option>{% endif %}
+              {% for o in f.options %}<option value="{{ o.alias }}"{{ ' selected' if o.selected }}>{{ o.label }}</option>{% endfor %}
+            </select>
+            {% elif f.control in ['integer', 'number'] %}
+            <input id="{{ fid }}" name="{{ f.alias }}" type="number" step="{{ '1' if f.control == 'integer' else 'any' }}" value="{{ val }}"{{ req }}{{ dis }}>
+            {% elif f.control == 'boolean' %}
+            <input id="{{ fid }}" name="{{ f.alias }}" type="checkbox"{{ ' checked' if f.checked }}{{ dis }}>
+            {% elif f.control == 'array' %}
+            <textarea id="{{ fid }}" name="{{ f.alias }}" rows="3" placeholder="one item per line"{{ req }}{{ dis }}>{{ val }}</textarea>
+            {% elif f.control == 'json' %}
+            <textarea id="{{ fid }}" name="{{ f.alias }}" rows="3" placeholder="JSON"{{ req }}{{ dis }}>{{ val }}</textarea>
+            {% else %}
+            <input id="{{ fid }}" name="{{ f.alias }}" type="text" value="{{ val }}"{{ req }}{{ dis }}>
+            {% endif %}
+            {% endfor %}
+            {% if on and form_error %}<p class="error">{{ form_error }}</p>{% endif %}
+            <details>
+              <summary class="muted">schema</summary>
+              <pre class="code">{{ a.schema | tojson(indent=2) }}</pre>
+            </details>
+            <div class="row">
+              {% if a.disabled %}
+              <button type="submit" disabled>Run {{ a.name }}</button>
+              <span class="hint">This action is muted on the dashboard. Submit is disabled; a POST returns 400 and makes no call.</span>
+              {% else %}
+              <button class="primary" type="submit">Run {{ a.name }}</button>
+              <span class="hint">Runs <code>{{ a.name }}</code> on the <code>{{ ns }}</code> server.</span>
+              {% endif %}
+            </div>
+          </form>
+        </div>
+      </details>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="side">
+    {% if result %}
+    <h3>Last result · <code>{{ active }}</code></h3>
+    <div class="result">
+      {# The handler already dropped the JSON mirror of `structured` from `text`. #}
+      {% if result.structured is not none %}<pre>{{ result.structured }}</pre>{% endif %}
+      {% for t in result.text %}<pre>{{ t }}</pre>{% endfor %}
+    </div>
+    {% endif %}
+    <h3>Rules</h3>
+    <p class="muted" style="font-size:.85rem;margin:0">
+      Only <code>running</code> children. Only tools tagged <code>_meta.mcpflow.action</code> that satisfy the contract clause.
+      Forms come from the tool's input schema: string, enum → select, number, boolean, array of string → textarea, no type → JSON textarea.
+      A clause violator is not listed.
+    </p>
+    <h3>Errors</h3>
+    <p class="muted" style="font-size:.85rem;margin:0">
+      Probe failure → page-level <span class="error" style="display:inline;margin:0">error</span>, no forms.
+      Tool error → <code>form_error</code> on the card, after masking.
+    </p>
+  </div>
+  {% endif %}
+</div>

@@ -95,13 +95,15 @@ Select a picture to open it at full size.
 - [Connect an agent](#connect-an-agent)
 - [Admin API](#admin-api)
 - [Admin MCP tools](#admin-mcp-tools)
+- [Secrets](#secrets)
 - [Inline source servers](#inline-source-servers)
 - [Development](#development)
 - [License](#license)
 
 ## Install
 
-Install the package with pip. The package needs Python 3.12 or newer.
+Install the package with pip. The package needs Python 3.12 or newer. The source
+is at `https://github.com/bilgili/mcpflow`.
 
 ```sh
 pip install mcpflow
@@ -161,10 +163,13 @@ command builds the wheel and passes it to Docker through a named build context.
 | `COOKIE_SECURE` | `0` | set `1` behind HTTPS |
 | `SESSION_TTL_SECONDS` | `604800` | session lifetime |
 | `CHILD_START_TIMEOUT` | `60` | probe timeout in seconds |
+| `CHILD_CACHE_TTL` | `300` | seconds a child component list serves lookups by name |
 | `LOG_LEVEL` | `INFO` | process log level |
 | `PUBLIC_URL` | unset | externally reachable base URL; else the request host |
 | `UV_CACHE_DIR` | Docker: `/data/cache/uv` | uvx cache |
 | `npm_config_cache` | Docker: `/data/cache/npm` | npx cache |
+
+A child's `cache_ttl` in `servers.json` or the form overrides it; `0` disables the cache for that child.
 
 ## Files under `DATA_DIR`
 
@@ -173,7 +178,7 @@ The process keeps all state under one data directory.
 - `servers.json`: the persisted list of child servers.
 - `tokens.json`: the API tokens. The file holds only the SHA-256 digest of each token.
 - `secret_key`: the cookie signing key. The process creates it on first start with mode `0600`.
-- `logs/{namespace}.log`: the stderr of one child. The process truncates it on each start.
+- `logs/{namespace}.log`: the stderr of one child. The process truncates it on each start. The process deletes it when the secrets of the child change and when the child is removed.
 - `servers/{namespace}/`: the inline source files of one child (see Inline source servers). Directories are mode `0700`, files `0600`.
 - `creds/{namespace}/`: `client.json` and `token.json` for an OAuth child. Files are mode `0600`.
 - `cache/uv` and `cache/npm`: the package caches in Docker.
@@ -213,9 +218,9 @@ package: my-bin
 
 A source may embed a credential for a private repo, for example
 `git+https://oauth2:<token>@gitlab.example/owner/repo`. The gateway stores the
-raw URL in `servers.json` (mode `0600`) and shows the redacted form
-`git+https://***@gitlab.example/owner/repo` in the servers table and in every
-REST API response. The edit form shows the raw value.
+raw URL in `servers.json` (mode `0600`). The dashboard, the server window,
+every REST API response, and every admin MCP tool result show the redacted form
+`git+https://***@gitlab.example/owner/repo`. See Secrets.
 
 ## Import from mcpmarket
 
@@ -417,6 +422,63 @@ async with Client(transport) as c:
     servers = await c.call_tool("mcpflow_list_servers", {})
 ```
 
+## Secrets
+
+A child can hold a secret in four fields: `env`, `headers`, `url`, and
+`source`. The gateway keeps the raw values in `servers.json` (mode `0600`) and
+starts each child with the raw values. No read surface shows a raw value.
+
+### What a read shows
+
+The dashboard, the server window, the REST API, and the admin MCP tools show a
+masked copy of each child.
+
+| Field | Masked form |
+|---|---|
+| `env`, `headers` | Each key stays. Each non-empty value becomes `•••`. An empty value stays empty. |
+| `url` | The user information and each non-empty query value become `•••`. The scheme, host, path, query keys, and fragment stay. |
+| `source` | The user information becomes `***`. |
+
+The gateway masks every value, not only the values of keys that look secret.
+Thus `LOG_LEVEL=debug` also reads as `LOG_LEVEL=•••`. Read a non-secret value
+in `servers.json`, or write a new value.
+
+The JSON import preview shows the pasted values unchanged, because they are not
+stored yet.
+
+### Write a masked record back
+
+A client can read a child, change one field, and send the whole record back.
+
+- Send `•••` for a key that the child already has. The gateway keeps the stored value.
+- Send a new value. The gateway replaces the stored value.
+- Send the `url` exactly as a read shows it. The gateway keeps the stored `url`.
+- Send the `source` exactly as a read shows it. The gateway keeps the stored `source`.
+
+The gateway refuses a write that still holds a mask after this merge. The
+answer is `400` on `/api` and a tool error on `/mcp`. The message names the
+field and the key, never a value. These writes are refused:
+
+- `•••` under a key that the child does not have, for example after a rename.
+- A value that contains the mask, for example `Bearer •••`.
+- A `url` with a changed host that keeps a masked query value.
+- A new child copied from a read record (`mcpflow_add_server` or `POST /api/servers`).
+- A percent-encoded mask in a `url` or a `source`.
+
+Send the real value in each of these cases.
+
+### Logs and errors
+
+- `last_error` and the child log (`/servers/{ns}/log`, `/api/servers/{ns}/log`, `mcpflow_server_log`) mask every secret of the child with `•••`. This includes the decoded forms of a `url` or `source` credential.
+- The process log masks the secrets of every child that the process started.
+- The access log masks the `code` and `state` query values of the OAuth callback.
+
+### Limits
+
+- `args` is not masked. Put a secret in `env` or `headers`, not in `args`.
+- The path of a `url` is not masked. Put a credential in a header when the provider accepts one.
+- A secret shorter than 4 characters is not masked in logs and errors.
+
 ## Inline source servers
 
 An agent can write a small MCP server as source files and run it, with no git
@@ -456,9 +518,9 @@ uv sync --extra dev
 make test
 ```
 
-The project uses OpenSpec. The published specs live in `openspec/specs/`. An
-in-flight change lives in `openspec/changes/<change>/`. Run `openspec validate`
-before you archive a change.
+The project designs each change with OpenSpec. The development branch `ci`
+holds the specs under `openspec/`; the `main` branch holds the code and the
+documentation only.
 
 The logo lives at `src/mcpflow/static/logo.svg`. The web UI serves the same
 file at `/static/logo.svg`.

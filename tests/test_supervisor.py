@@ -10,6 +10,7 @@ A `custom` child that speaks MCP over stdio stands in for a real child.
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 
 import pytest
@@ -19,7 +20,7 @@ from fastmcp.client.transports import StdioTransport, StreamableHttpTransport
 
 from mcpflow.oauth import ClientCreds, CredStore, HeaderSpec, PendingFlows
 from mcpflow.registry import Registry, RegistryError, ServerSpec
-from mcpflow.supervisor import Supervisor
+from mcpflow.supervisor import SingleConnectTransport, Supervisor
 
 _CREDS = ClientCreds("abc", "secret")
 _TOKENS = {
@@ -64,9 +65,13 @@ def test_python_child_command(make_supervisor):
         args=["--local-timezone", "UTC"],
     )
     transport = sup._build_transport(spec)
-    assert isinstance(transport, StdioTransport)
-    assert transport.command == "uvx"
-    assert transport.args == ["mcp-server-time", "--local-timezone", "UTC"]
+    # The stdio transport is now wrapped so it admits one connect per
+    # generation; the command/args live on the wrapped `.inner` StdioTransport.
+    assert isinstance(transport, SingleConnectTransport)
+    assert isinstance(transport.inner, StdioTransport)
+    assert transport.inner.command == "uvx"
+    assert transport.inner.args == ["mcp-server-time", "--local-timezone", "UTC"]
+    transport.log.close()  # the transport owns the log handle; nothing connected
 
 
 def test_npm_child_command(make_supervisor):
@@ -78,13 +83,15 @@ def test_npm_child_command(make_supervisor):
         args=["/data"],
     )
     transport = sup._build_transport(spec)
-    assert isinstance(transport, StdioTransport)
-    assert transport.command == "npx"
-    assert transport.args == [
+    assert isinstance(transport, SingleConnectTransport)
+    assert isinstance(transport.inner, StdioTransport)
+    assert transport.inner.command == "npx"
+    assert transport.inner.args == [
         "-y",
         "@modelcontextprotocol/server-filesystem",
         "/data",
     ]
+    transport.log.close()
 
 
 def test_python_child_command_with_source():
@@ -149,7 +156,8 @@ def test_the_supervisor_starts_a_child_from_the_raw_source(make_supervisor):
         source="git+https://oauth2:TOKEN@host/o/r",
     )
     transport = sup._build_transport(spec)
-    assert "git+https://oauth2:TOKEN@host/o/r" in transport.args
+    assert "git+https://oauth2:TOKEN@host/o/r" in transport.inner.args
+    transport.log.close()
 
 
 @pytest.mark.asyncio
@@ -191,8 +199,9 @@ def test_secret_reaches_the_child(make_supervisor, monkeypatch):
         namespace="k", kind="python", package="pkg", env={"API_KEY": "abc"}
     )
     transport = sup._build_transport(spec)
-    assert transport.env["API_KEY"] == "abc"
-    assert transport.env["PATH"] == "/usr/bin:/bin"
+    assert transport.inner.env["API_KEY"] == "abc"
+    assert transport.inner.env["PATH"] == "/usr/bin:/bin"
+    transport.log.close()
 
 
 def test_gateway_secrets_do_not_reach_the_child(make_supervisor, monkeypatch):
@@ -211,7 +220,8 @@ def test_gateway_secrets_do_not_reach_the_child(make_supervisor, monkeypatch):
         "SECRET_KEY",
         "UV_PUBLISH_TOKEN",
     ):
-        assert name not in transport.env
+        assert name not in transport.inner.env
+    transport.log.close()
 
 
 # --- Child lifecycle probes (12.7) -------------------------------------------
@@ -383,6 +393,241 @@ async def test_update_that_changes_secret_discards_stale_disabled_log(make_super
 
 
 @pytest.mark.asyncio
+async def test_update_to_enabled_remote_discards_stale_log(make_supervisor):
+    # Codex round 5 (redact-registry-secrets): a remote transport never
+    # truncates the log, so an ENABLED switch from local to remote kept the old
+    # output, and the new-config scrub could not mask the old env secret.
+    old = "old-secret-value-xyz"
+    spec = fake_child_spec("svc", env={"API_KEY": old}, enabled=False)
+    child = await sup_add_disabled(make_supervisor, spec)
+    sup = child["sup"]
+    path = sup._log_path("svc")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"boom with {old}\n")
+
+    remote = ServerSpec(namespace="svc", kind="remote", url="http://127.0.0.1:9/mcp")
+    await sup.update(remote)
+
+    assert old not in sup.log_tail("svc")
+
+
+@pytest.mark.asyncio
+async def test_remove_then_readd_does_not_expose_the_old_log(make_supervisor):
+    # Codex round 6 (redact-registry-secrets): `remove` kept logs/<ns>.log, so a
+    # new child under the same namespace read the old output through
+    # `log_tail`, scrubbed with its own (different) secret set.
+    old = "old-secret-value-xyz"
+    spec = fake_child_spec("svc", env={"API_KEY": old}, enabled=False)
+    child = await sup_add_disabled(make_supervisor, spec)
+    sup = child["sup"]
+    path = sup._log_path("svc")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"boom with {old}\n")
+
+    await sup.remove("svc")
+    await sup.add(fake_child_spec("svc", enabled=False))
+
+    assert old not in sup.log_tail("svc")
+
+
+@pytest.mark.asyncio
+async def test_mute_during_update_teardown_does_not_expose_the_old_log(
+    make_supervisor, monkeypatch
+):
+    # Codex round 6 (redact-registry-secrets), deferred to stale-log-discard-
+    # order: `set_namespace_muted` replaces `child.spec` from the registry
+    # without the child lock. During the teardown await of an update, the
+    # registry already holds the new secret set, so a mute there made
+    # `log_tail` scrub the retained old log with the new set only.
+    old = "old-secret-value-xyz"
+    spec = fake_child_spec("svc", env={"API_KEY": old}, enabled=False)
+    child = await sup_add_disabled(make_supervisor, spec)
+    sup = child["sup"]
+    path = sup._log_path("svc")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"boom with {old}\n")
+
+    paused, release = asyncio.Event(), asyncio.Event()
+    real_teardown = sup._teardown
+
+    async def slow_teardown(c):
+        paused.set()
+        await release.wait()
+        await real_teardown(c)
+
+    monkeypatch.setattr(sup, "_teardown", slow_teardown)
+    new_spec = fake_child_spec("svc", env={"API_KEY": "new-secret-value-xyz"}, enabled=False)
+    task = asyncio.create_task(sup.update(new_spec))
+    await paused.wait()
+
+    sup.set_namespace_muted("svc", True)
+    assert old not in sup.log_tail("svc")
+    sup.set_tool_muted("svc", "echo", True)
+    assert old not in sup.log_tail("svc")
+
+    release.set()
+    await task
+    assert old not in sup.log_tail("svc")
+
+
+@pytest.mark.asyncio
+async def test_update_during_start_does_not_let_the_old_child_recreate_the_log(
+    make_supervisor,
+):
+    # Design gate F1 (stale-log-discard-order): fastmcp opens a `Path` log by
+    # name in its own connect task, which `child.task.cancel()` does not
+    # cancel. An update that lands between the first step of `_run_start` and
+    # that open would unlink the log, and the open would then recreate it for
+    # a process that runs with the old env. The supervisor opens the log
+    # itself in the start step, so the unlink is final.
+    old = "old-secret-value-xyz"
+    script = (
+        "import os, sys, time; "
+        "sys.stderr.write(os.environ['API_KEY'] + '\\n'); sys.stderr.flush(); "
+        "time.sleep(30)"
+    )
+    spec = ServerSpec(
+        namespace="svc",
+        kind="custom",
+        command=sys.executable,
+        args=["-c", script],
+        env={"API_KEY": old},
+    )
+    new = spec.model_copy(
+        update={"env": {"API_KEY": "new-secret-value-xyz"}, "enabled": False}
+    )
+    # The window is a few event-loop iterations wide and its exact position
+    # depends on fastmcp internals (a `Path` log recreated the file at 3 and 4
+    # yields on fastmcp 4.0.2), so sweep the update across the start.
+    for yields in range(8):
+        sup = make_supervisor()
+        await sup.add(spec)
+        for _ in range(yields):
+            await asyncio.sleep(0)
+        path = sup._log_path("svc")
+        await sup.update(new)
+        await asyncio.sleep(0.3)  # give a stray open or a late write the chance
+
+        assert not path.exists(), f"recreated after {yields} yields"
+        assert old not in sup.log_tail("svc")
+
+
+def _log_gone_at_write(sup, path):
+    """Record, at each registry write, whether the log still exists.
+
+    A crash right after the write leaves the file as the registry of the
+    restart, so the old log must already be gone when the write happens.
+    """
+    seen: list[bool] = []
+    real_write = sup.registry._write
+
+    def spy(*args, **kwargs):
+        seen.append(path.exists())
+        return real_write(*args, **kwargs)
+
+    sup.registry._write = spy
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_update_discards_the_log_before_it_persists(make_supervisor):
+    # Codex gate (stale-log-discard-order): a crash between the registry
+    # write and the log delete left the new record beside the old log; the
+    # restart then scrubbed that log with the new secret set only.
+    old = "old-secret-value-xyz"
+    spec = fake_child_spec("svc", env={"API_KEY": old}, enabled=False)
+    sup = (await sup_add_disabled(make_supervisor, spec))["sup"]
+    path = sup._log_path("svc")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"boom with {old}\n")
+    seen = _log_gone_at_write(sup, path)
+
+    await sup.update(fake_child_spec("svc", env={"API_KEY": "new-secret-value-xyz"}, enabled=False))
+
+    assert seen == [False]
+
+
+@pytest.mark.asyncio
+async def test_update_keeps_the_old_record_when_the_log_delete_fails(
+    make_supervisor, monkeypatch
+):
+    # Codex gate: with the delete after the write, an `OSError` from the
+    # unlink aborted `update` with the new record persisted and the old log
+    # kept, and the next mute exposed the old secret. The delete now runs
+    # first, so its failure persists nothing.
+    import pathlib
+
+    old = "old-secret-value-xyz"
+    spec = fake_child_spec("svc", env={"API_KEY": old}, enabled=False)
+    sup = (await sup_add_disabled(make_supervisor, spec))["sup"]
+    path = sup._log_path("svc")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"boom with {old}\n")
+    real_unlink = pathlib.Path.unlink
+
+    def refuse(self, missing_ok=False):
+        if self == path:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", refuse)
+    with pytest.raises(PermissionError):
+        await sup.update(
+            fake_child_spec("svc", env={"API_KEY": "new-secret-value-xyz"}, enabled=False)
+        )
+
+    assert sup.registry.get("svc").env == {"API_KEY": old}
+    sup.set_namespace_muted("svc", True)
+    assert old not in sup.log_tail("svc")
+
+
+@pytest.mark.asyncio
+async def test_add_discards_a_residue_log_before_it_persists(make_supervisor):
+    old = "old-secret-value-xyz"
+    sup = make_supervisor()
+    path = sup._log_path("svc")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"boom with {old}\n")
+    seen = _log_gone_at_write(sup, path)
+
+    await sup.add(fake_child_spec("svc", enabled=False))
+
+    assert seen == [False]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_add_keeps_the_live_log(make_supervisor):
+    spec = fake_child_spec("svc", enabled=False)
+    sup = (await sup_add_disabled(make_supervisor, spec))["sup"]
+    path = sup._log_path("svc")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("live output\n")
+
+    with pytest.raises(RegistryError):
+        await sup.add(spec)
+
+    assert path.read_text() == "live output\n"
+
+
+@pytest.mark.asyncio
+async def test_add_discards_a_residue_log(make_supervisor):
+    # A log under a namespace the registry does not list is residue: a remove
+    # that a restart interrupted, or a remove from before the log delete. The
+    # new child cannot scrub it (its secret set is different), so `add`
+    # discards it, next to the credential residue purge.
+    old = "old-secret-value-xyz"
+    sup = make_supervisor()
+    path = sup._log_path("svc")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"boom with {old}\n")
+
+    await sup.add(fake_child_spec("svc", enabled=False))
+
+    assert old not in sup.log_tail("svc")
+    assert not path.exists()
+
+
+@pytest.mark.asyncio
 async def test_log_tail_with_no_secrets_is_unchanged(make_supervisor):
     spec = fake_child_spec("time", enabled=False)
     child = await sup_add_disabled(make_supervisor, spec)
@@ -526,9 +771,13 @@ async def test_restart_of_a_disabled_child(make_supervisor):
 
 
 @pytest.mark.asyncio
-async def test_one_of_two_children_fails(make_supervisor):
+async def test_one_of_two_children_fails(make_supervisor, tmp_path):
+    brk = tmp_path / "a_break"
     sup = make_supervisor()
-    a = await sup.add(fake_child_spec("a", "good"))
+    # Child `a` runs the real transport; while `brk` exists its `tools/list`
+    # raises, so the probe fails through the owned client (no transport swap:
+    # the read borrows `session.client`, not `child.transport`).
+    a = await sup.add(fake_child_spec("a", "action", env={"MCPFLOW_BREAK": str(brk)}))
     b = await sup.add(fake_child_spec("b", "good"))
     # Capture the task refs before awaiting: a finished start clears child.task
     # to None (the in-flight task, else None).
@@ -538,7 +787,7 @@ async def test_one_of_two_children_fails(make_supervisor):
     assert a.status == "running" and b.status == "running"
     assert len(sup.table.providers) == 2
     # Child a's connection breaks: any list_tools on it now raises.
-    a.transport = sup._build_transport(fake_child_spec("a", "fail"))
+    brk.write_text("")
     views = await sup.tools()
     assert a.status == "failed"
     assert b.status == "running"
@@ -597,6 +846,69 @@ class _RaisingTransport:
         raise self._exc()
 
 
+class _Boom(BaseException):
+    """A `BaseException` that is neither `Exception` nor `CancelledError`."""
+
+
+async def _raise_boom(*_args):
+    raise _Boom
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("where", ["task", "drain", "client_exit", "client_exit_early"])
+async def test_teardown_releases_everything_when_a_base_exception_escapes(
+    make_supervisor, where
+):
+    """teardown-release-on-base-exception: a `BaseException` raised before the
+    close still propagates, but only after the teardown unpublished the
+    provider, exited the owned client, closed the transport (and the log
+    handle it owns), and closed the generation. Before, it escaped with the
+    transport, the process, and the log handle still held."""
+    sup = make_supervisor()
+    child = await sup.add(fake_child_spec("time", "good"))
+    await child.task
+    assert child.status == "running"
+    transport, session, provider = child.transport, child.session, child.provider
+    client = session.client
+    real_exit = type(client).__aexit__
+    exited: list[bool] = []
+
+    async def spy_exit(*args):
+        exited.append(True)
+        if where == "client_exit":
+            await real_exit(client, None, None, None)  # stop the session task
+            raise _Boom
+        if where == "client_exit_early":
+            raise _Boom  # before the exit released anything (codex round 3)
+        return await real_exit(client, *args)
+
+    client.__aexit__ = spy_exit
+    if where == "task":
+        child.task = asyncio.create_task(_raise_boom())
+        await asyncio.sleep(0)  # let it raise; a cancel before its first step would win
+    elif where == "drain":
+        # One lease held: the drain is waiting when it raises, so the close
+        # runs with the lease still held, before the bound (design gate F1).
+        session.acquire()
+        session.idle.wait = _raise_boom
+
+    with pytest.raises(_Boom):
+        await sup._teardown(child)
+
+    assert provider not in sup.table.providers
+    assert exited == [True]  # the owned client exited on every path (gate F2)
+    assert child.transport is None
+    assert transport.log.closed
+    assert session.state == "closed"
+    assert child.session is None
+    assert child.task is None
+    if where == "client_exit_early":
+        # The transport close ran anyway; now run the skipped exit so the
+        # owned client's session task stops before the fixture's loop closes.
+        del client.__aexit__
+        await client.__aexit__(None, None, None)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("exc", [RuntimeError, asyncio.CancelledError])
 async def test_disable_completes_when_close_raises_ordinary_or_cancelled(
@@ -607,6 +919,7 @@ async def test_disable_completes_when_close_raises_ordinary_or_cancelled(
     sup = make_supervisor()
     child = await sup.add(fake_child_spec("time", "good"))
     await child.task
+    child.transport.log.close()  # the stub below drops the real transport
     child.transport = _RaisingTransport(exc)
 
     await sup.disable("time")
@@ -632,6 +945,7 @@ async def test_disable_leaves_the_handle_when_close_raises_baseexception(
     sup = make_supervisor()
     child = await sup.add(fake_child_spec("time", "good"))
     await child.task
+    child.transport.log.close()  # the stub below drops the real transport
     child.transport = _RaisingTransport(Boom)
 
     with pytest.raises(Boom):
@@ -880,3 +1194,41 @@ async def test_finish_oauth_header_atomic_with_remove(make_supervisor):
     )
     assert ok is False
     assert "linear" not in [s.namespace for s in sup.registry.list()]
+
+
+# --- Child catalog freshness (child-catalog-freshness) -----------------------
+
+
+def _proxy_cache_ttl(child) -> float:
+    # Reads the private `ProxyProvider._cache_ttl` of FastMCP 4.0.x, under the
+    # visibility and namespace wrappers. A FastMCP upgrade that renames either
+    # attribute breaks this helper only; the `grow` tests in test_gateway.py
+    # stay the behavioral proof.
+    return child.provider._inner._inner._cache_ttl
+
+
+@pytest.mark.asyncio
+async def test_provider_takes_the_gateway_default(make_supervisor):
+    sup = make_supervisor()
+    child = await sup.add(fake_child_spec("time", "good"))
+    await child.task
+    assert child.status == "running"
+    assert _proxy_cache_ttl(child) == 300.0
+
+
+@pytest.mark.asyncio
+async def test_provider_takes_the_configured_gateway_default(make_supervisor):
+    sup = make_supervisor(CHILD_CACHE_TTL="2")
+    child = await sup.add(fake_child_spec("time", "good"))
+    await child.task
+    assert child.status == "running"
+    assert _proxy_cache_ttl(child) == 2.0
+
+
+@pytest.mark.asyncio
+async def test_provider_takes_the_per_child_override(make_supervisor):
+    sup = make_supervisor()
+    child = await sup.add(fake_child_spec("skills", "good", cache_ttl=0))
+    await child.task
+    assert child.status == "running"
+    assert _proxy_cache_ttl(child) == 0.0

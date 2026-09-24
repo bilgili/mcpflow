@@ -85,7 +85,7 @@ def test_window_renders_as_a_page_without_htmx(server_factory):
     assert 'action="/servers/time/restart"' in body
 
 
-def test_window_shows_the_raw_source_in_the_input_only(server_factory):
+def test_window_never_shows_the_raw_source(server_factory):
     raw = "git+https://oauth2:SEKRETTOKEN@host/o/r"
     spec = ServerSpec(
         namespace="tool", kind="python", package="my-tool", source=raw, enabled=False
@@ -94,10 +94,10 @@ def test_window_shows_the_raw_source_in_the_input_only(server_factory):
     client = server.login()
     body = client.get("/servers/tool").text
     client.close()
-    # The command is redacted; the token appears in the form input alone.
+    # The command and the form input are both redacted.
     assert "uvx --from git+https://***@host/o/r my-tool" in body
-    assert body.count("SEKRETTOKEN") == 1
-    assert f'name="source" value="{raw}"' in body
+    assert "SEKRETTOKEN" not in body
+    assert 'name="source" value="git+https://***@host/o/r"' in body
 
 
 def test_save_redirects_to_the_dashboard(server_factory):
@@ -123,15 +123,17 @@ def test_save_keeps_the_authorization_header_of_a_header_sink_child(server_facto
     )
     client = server.login()
     body = client.get("/servers/linear").text
-    # The textarea holds the raw header, so the save posts it back unchanged.
-    assert "Authorization=Bearer SEKRETTOKEN" in body
+    # The textarea holds the mask, never the token; the save posts the mask
+    # back and `Registry.update` keeps the stored token.
+    assert "Authorization=•••" in body
+    assert "SEKRETTOKEN" not in body
     resp = client.post(
         "/servers/linear",
         data={
             "kind": "remote",
             "url": "https://linear.test/mcp",
             "transport": "http",
-            "headers": "Authorization=Bearer SEKRETTOKEN",
+            "headers": "Authorization=•••",
             "description": "changed",
         },
     )

@@ -30,9 +30,11 @@ from pydantic import (
 )
 
 from .registry import (
+    SECRET_MASK,
     RegistryError,
     ServerSpec,
     redact_source,
+    redact_url,
     spec_command,
     validate_namespace,
     validate_source,
@@ -80,7 +82,6 @@ Auth = Literal["none", "env", "header", "oauth"]
 Origin = Literal["builtin", "local"]
 
 _COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
-SECRET_MASK = "•••"
 
 
 class _Strict(BaseModel):
@@ -153,6 +154,16 @@ class SpecTemplate(_Strict):
     transport: Literal["http", "sse"] = "http"
     command: str | None = None
     source: str | None = None  # validated by `registry.validate_source`
+    # The catalog file fixes action-capability. `build_spec` copies it into the
+    # `ServerSpec` it registers. The store entry sets `actions: true`; every
+    # other entry leaves the default (child-actions-page F2 revised).
+    actions: bool = False
+    cache_ttl: float | None = None
+
+    @field_validator("cache_ttl")
+    @classmethod
+    def _check_cache_ttl(cls, value: float | None) -> float | None:
+        return ServerSpec._check_cache_ttl(value)
 
     @model_validator(mode="after")
     def _check_kind_fields(self) -> SpecTemplate:
@@ -254,7 +265,7 @@ class CatalogEntry(CatalogFile):
             # value; only the page sees this one.
             data["source"] = redact_source(self.spec.source)
         if self.spec.url:
-            data["url"] = self.spec.url
+            data["url"] = redact_url(self.spec.url)
             data["transport"] = self.spec.transport
         if self.spec.command:
             data["command"] = self.spec.command
@@ -432,6 +443,8 @@ def build_spec(
             "transport": entry.spec.transport,
             "command": entry.spec.command,
             "source": entry.spec.source,
+            "actions": entry.spec.actions,
+            "cache_ttl": entry.spec.cache_ttl,
             "env": env,
             "headers": {},
             "enabled": False,
@@ -461,6 +474,8 @@ def build_spec(
         "transport": entry.spec.transport,
         "command": entry.spec.command,
         "source": entry.spec.source,
+        "actions": entry.spec.actions,
+        "cache_ttl": entry.spec.cache_ttl,
         "env": env,
         "headers": headers,
         "description": entry.description,

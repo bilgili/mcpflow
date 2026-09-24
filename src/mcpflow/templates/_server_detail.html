@@ -60,6 +60,10 @@
       {% endif %}
       <form method="post" action="/servers/{{ ns }}/delete"><button class="danger">remove</button></form>
       <a class="btn" href="/servers/{{ ns }}/log" target="_blank" rel="noopener">log</a>
+      {# A link only: the window never probes the child, so it shows no count. #}
+      {% if c.status == "running" and c.spec.actions %}
+      <a class="btn" href="/servers/{{ ns }}/actions">Actions</a>
+      {% endif %}
       {% if ns in reauthable %}
       <a class="btn" href="/servers/{{ ns }}/reauthorize">re-authorize</a>
       {% endif %}

@@ -39,5 +39,17 @@
   {% endif %}
   <label>Description</label>
   <input name="description" value="{{ values.get('description', '') }}">
+  <label>Cache TTL (seconds, blank = gateway default)</label>
+  {# F2 revised: an action-capable child classifies live, so `_build_provider`
+     forces cache_ttl=0 and the stored value is inert. Disable the field on the
+     edit form and say why. The add-by-hand form has no `c`, so it stays live. #}
+  {% if c is defined and c.spec.actions %}
+  <input name="cache_ttl" type="number" min="0" step="any"
+         value="{{ values.get('cache_ttl', '') }}" disabled>
+  <p class="note">This server classifies actions live; the cache stays off.</p>
+  {% else %}
+  <input name="cache_ttl" type="number" min="0" step="any"
+         value="{{ values.get('cache_ttl', '') }}">
+  {% endif %}
   <label><input type="checkbox" name="enabled" value="on" {{ 'checked' if values.get('enabled', True) }}> Enabled</label>
 </form>

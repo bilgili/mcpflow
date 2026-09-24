@@ -69,3 +69,25 @@ def test_real_hash_accepted(tmp_path):
     hashed = hash_password("pw")
     settings = load_settings({"DATA_DIR": str(tmp_path), "ADMIN_PASSWORD_HASH": hashed})
     assert settings.admin_password_hash == hashed
+
+
+# --- Child catalog freshness (child-catalog-freshness) -----------------------
+
+
+def test_child_cache_ttl_default(tmp_path):
+    settings = load_settings({"DATA_DIR": str(tmp_path), "ADMIN_PASSWORD": "x"})
+    assert settings.child_cache_ttl == 300.0
+
+
+def test_child_cache_ttl_parses(tmp_path):
+    settings = load_settings(
+        {"DATA_DIR": str(tmp_path), "ADMIN_PASSWORD": "x", "CHILD_CACHE_TTL": "2"}
+    )
+    assert settings.child_cache_ttl == 2.0
+
+
+def test_negative_child_cache_ttl_rejected(tmp_path):
+    with pytest.raises(ConfigError, match="CHILD_CACHE_TTL"):
+        load_settings(
+            {"DATA_DIR": str(tmp_path), "ADMIN_PASSWORD": "x", "CHILD_CACHE_TTL": "-1"}
+        )

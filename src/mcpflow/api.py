@@ -17,7 +17,7 @@ from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import BaseRoute, Route
 
 from .auth import TokenRecord, TokenStore
-from .registry import redact_source, spec_from_dict
+from .registry import redact_spec, spec_from_dict
 from .supervisor import Child, Supervisor, ToolView
 
 # --- body reading and serialization ------------------------------------------
@@ -60,10 +60,11 @@ def child_json(child: Child) -> dict:
     the API never dumps it directly; it copies the spec plus the live status.
     `mode="json"` turns `created_at` into a string that `json.dumps` accepts.
     """
-    data = child.spec.model_dump(mode="json")
-    # Never return the raw credential of a source URL; the API is the one
-    # surface a remote client reads.
-    data["source"] = redact_source(child.spec.source)
+    # Never return a raw credential: `redact_spec` is the one outward view of a
+    # stored record (source and url credentials, every env/header value). REST
+    # and every admin MCP tool that returns a child go through here.
+    # `Registry.update` keeps the stored value when a write echoes the mask.
+    data = redact_spec(child.spec).model_dump(mode="json")
     data["status"] = child.status
     data["last_error"] = child.last_error
     data["tool_count"] = child.tool_count

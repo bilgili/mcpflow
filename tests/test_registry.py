@@ -7,6 +7,8 @@ Persisted and in-memory registries agree) and `specs/mcp-gateway/spec.md`
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -323,3 +325,50 @@ def test_atomic_write_on_every_mutator(tmp_path):
 
     reg.remove("time")
     assert on_disk() == ["fs"]
+
+
+# --- Per-child cache TTL (child-catalog-freshness) ---------------------------
+
+
+def test_cache_ttl_default_inherits():
+    assert _npm("time").cache_ttl is None
+
+
+def test_cache_ttl_zero_persists(tmp_path):
+    path = tmp_path / "servers.json"
+    reg = Registry(path)
+    reg.load()
+    reg.add(_npm("skills", cache_ttl=0))
+    assert '"cache_ttl": 0.0' in path.read_text()
+    reloaded = Registry(path)
+    reloaded.load()
+    assert reloaded.get("skills").cache_ttl == 0.0
+
+
+def test_negative_cache_ttl_rejected():
+    with pytest.raises(RegistryError, match="cache_ttl"):
+        spec_from_dict(
+            {"namespace": "skills", "kind": "npm", "package": "p", "cache_ttl": -1}
+        )
+
+
+def test_file_without_cache_ttl_loads_none(tmp_path):
+    path = tmp_path / "servers.json"
+    reg = Registry(path)
+    reg.load()
+    reg.add(_npm("time"))
+    data = json.loads(path.read_text())
+    for server in data["servers"]:
+        del server["cache_ttl"]
+    path.write_text(json.dumps(data))
+    reloaded = Registry(path)
+    reloaded.load()
+    assert reloaded.get("time").cache_ttl is None
+
+
+def test_update_takes_the_caller_cache_ttl(tmp_path):
+    reg = Registry(tmp_path / "servers.json")
+    reg.load()
+    reg.add(_npm("skills", cache_ttl=0))
+    reg.update(_npm("skills"))
+    assert reg.get("skills").cache_ttl is None

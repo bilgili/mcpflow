@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import secrets
@@ -34,6 +35,7 @@ class Settings:
     cookie_secure: bool
     session_ttl: int
     child_start_timeout: float
+    child_cache_ttl: float
     log_level: str
     public_url: str | None = None
 
@@ -87,6 +89,9 @@ def load_settings(overrides: dict[str, str] | None = None) -> Settings:
     cookie_secure = _get(overrides, "COOKIE_SECURE", "0") in ("1", "true", "True")
     session_ttl = int(_get(overrides, "SESSION_TTL_SECONDS", "604800"))
     child_start_timeout = float(_get(overrides, "CHILD_START_TIMEOUT", "60"))
+    child_cache_ttl = float(_get(overrides, "CHILD_CACHE_TTL", "300"))
+    if not (math.isfinite(child_cache_ttl) and child_cache_ttl >= 0):
+        raise ConfigError("CHILD_CACHE_TTL must be a finite number >= 0")
     log_level = _get(overrides, "LOG_LEVEL", "INFO")
     public_url = _get(overrides, "PUBLIC_URL", None)
     public_url = public_url.rstrip("/") if public_url else None
@@ -100,6 +105,7 @@ def load_settings(overrides: dict[str, str] | None = None) -> Settings:
         cookie_secure=cookie_secure,
         session_ttl=session_ttl,
         child_start_timeout=child_start_timeout,
+        child_cache_ttl=child_cache_ttl,
         log_level=log_level,
         public_url=public_url,
     )

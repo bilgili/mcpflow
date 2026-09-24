@@ -42,6 +42,7 @@ def test_settings_fields_frozen():
         "cookie_secure",
         "session_ttl",
         "child_start_timeout",
+        "child_cache_ttl",
         "log_level",
         "public_url",
     ]
@@ -71,12 +72,16 @@ def test_serverspec_fields():
         "muted",
         "disabled_tools",
         "description",
+        "cache_ttl",
         "source",
         "catalog",
         "oauth_pending",
         "created_at",
+        "actions",
     }
     assert set(registry.ServerSpec.model_fields) == expected
+    # F2 revised: the action-capability trust grant, opt-in per child.
+    assert registry.ServerSpec.model_fields["actions"].default is False
     # A child added by hand has no catalog provenance.
     assert registry.ServerSpec.model_fields["catalog"].default is None
     # A header-sink child awaiting its token; default off for every other child.
@@ -123,6 +128,7 @@ def test_child_fields():
         "visibility",
         "lock",
         "task",
+        "session",
     ]
 
 

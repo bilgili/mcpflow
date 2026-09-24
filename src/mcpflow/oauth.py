@@ -384,6 +384,12 @@ def _pkce_challenge(code_verifier: str) -> str:
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
 
+# The callback query parameters that carry a credential: the one-shot
+# authorization code, and the `state` that names the open flow. The gateway's
+# access-log filter masks their values (`gateway._AccessQueryMask`).
+CALLBACK_SECRET_PARAMS = frozenset({"code", "state"})
+
+
 def authorize_url(
     provider: Provider, block: OAuthBlock, redirect_uri: str, flow: PendingFlow
 ) -> str:

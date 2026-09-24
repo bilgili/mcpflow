@@ -237,3 +237,27 @@ dialog.detail::backdrop { background: rgba(0, 0, 0, .6); }
 
 /* A child with no catalog entry shows a plain monogram, not a brand colour. */
 .icon.plain { background: var(--border); color: var(--muted); }
+
+/* The actions page: one card per action, forms built from the schema. */
+.action-list { display: flex; flex-direction: column; gap: .8rem; }
+.action { border: 1px solid var(--border); border-radius: 8px; background: var(--bg); }
+.action > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: .6rem; padding: .6rem .9rem; }
+.action > summary::-webkit-details-marker { display: none; }
+.action > summary .name { font-family: ui-monospace, monospace; }
+.action > summary .title { font-weight: 600; }
+.action > summary .desc { color: var(--muted); font-size: .9rem; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.action > summary .kind { margin-left: auto; }
+.action[open] > summary { border-bottom: 1px solid var(--border); }
+.action .body { padding: .2rem .9rem .9rem; }
+.action .body label:first-child { margin-top: .4rem; }
+.action .row { display: flex; gap: .6rem; align-items: center; margin-top: .8rem; }
+.action .row button { white-space: nowrap; flex: none; }
+.action .row .hint { color: var(--muted); font-size: .85rem; }
+.action.muted > summary { opacity: .55; }
+.action.muted .body button { pointer-events: none; opacity: .5; }
+.action .badge { font-size: .75rem; color: var(--warn); border: 1px solid var(--warn); border-radius: 3px; padding: 0 .3rem; }
+.action .badge.err { color: var(--err); border-color: var(--err); }
+.result { border: 1px solid var(--ok); border-radius: 8px; background: #121a16; padding: .8rem .9rem; }
+.result h3 { margin-top: 0; }
+.result pre { margin: 0; white-space: pre-wrap; word-break: break-all; font-size: .82rem; line-height: 1.45; }
+.secret-note { color: var(--muted); font-size: .8rem; margin: .25rem 0 0; }

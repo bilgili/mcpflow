@@ -451,3 +451,33 @@ def test_revoke_self(api):
     assert resp.status_code == 204
     after = a.client.get("/api/tokens", headers=a.headers)
     assert after.status_code == 401
+
+
+# --- Cache TTL round-trip (child-catalog-freshness) --------------------------
+
+
+def test_cache_ttl_round_trip(api):
+    a = api()
+    body = {**_custom_body("skills"), "cache_ttl": 0}
+    resp = a.client.post("/api/servers", json=body, headers=a.headers)
+    assert resp.status_code == 201
+    assert resp.json()["cache_ttl"] == 0.0
+    listed = a.client.get("/api/servers", headers=a.headers).json()
+    assert [c["cache_ttl"] for c in listed if c["namespace"] == "skills"] == [0.0]
+    stored = json.loads((a.data / "servers.json").read_text())["servers"]
+    assert stored[0]["cache_ttl"] == 0.0
+
+
+def test_cache_ttl_omitted_is_null(api):
+    a = api()
+    resp = a.client.post("/api/servers", json=_custom_body("time"), headers=a.headers)
+    assert resp.status_code == 201
+    assert resp.json()["cache_ttl"] is None
+
+
+def test_negative_cache_ttl_400(api):
+    a = api()
+    body = {**_custom_body("skills"), "cache_ttl": -5}
+    resp = a.client.post("/api/servers", json=body, headers=a.headers)
+    assert resp.status_code == 400
+    assert "cache_ttl" in resp.text

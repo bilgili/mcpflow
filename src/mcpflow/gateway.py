@@ -7,7 +7,9 @@ gateway, and the UI routes into one Starlette app on one port.
 from __future__ import annotations
 
 import contextlib
+import logging
 from pathlib import Path
+from urllib.parse import unquote_plus
 
 from fastmcp import FastMCP
 from starlette.applications import Starlette
@@ -20,16 +22,85 @@ from starlette.staticfiles import StaticFiles
 from .admin_mcp import build_admin_server
 from .api import API_EXCEPTION_HANDLERS, build_api_routes
 from .auth import AdminTokenGate, HashedTokenVerifier, SessionGate, TokenStore
+from .catalog import SECRET_MASK
 from .config import Settings
-from .oauth import CredStore, PendingFlows
+from .instructions import ChildInstructionsMiddleware
+from .oauth import CALLBACK_SECRET_PARAMS, CredStore, PendingFlows
 from .registry import Registry
-from .supervisor import Supervisor
+from .supervisor import Supervisor, install_log_redaction
 from .web import build_routes
 
 _PUBLIC_PREFIXES = ("/health", "/login", "/static/", "/mcp", "/api/", "/.well-known/")
 
+# The SDK client transports log the outgoing `tools/call` request, arguments
+# included, at DEBUG. The gateway is the only in-process user of those
+# transports, so it owns the one floor: raise each below INFO to INFO, so an
+# app-wide DEBUG never traces a posted secret (F2, codex review 3).
+_TRANSPORT_LOGGERS = ("mcp.client.sse", "mcp.client.stdio", "mcp.client.streamable_http")
+
+
+def _pin_transport_log_floor() -> None:
+    for name in _TRANSPORT_LOGGERS:
+        lg = logging.getLogger(name)
+        if lg.level == logging.NOTSET or lg.level < logging.INFO:
+            lg.setLevel(logging.INFO)
+
+
+def _mask_query(target: str) -> str:
+    """Mask the value of each credential parameter in a request target.
+
+    Splits like Starlette's `parse_qsl` (`&` only, `unquote_plus` names), so
+    every value the callback route reads as `code` or `state` is masked. The
+    path, the other parameters, and their order stay as logged.
+    """
+    path, sep, query = target.partition("?")
+    if not sep:
+        return target
+    pieces = []
+    for piece in query.split("&"):
+        name = piece.partition("=")[0]
+        if unquote_plus(name) in CALLBACK_SECRET_PARAMS:
+            piece = f"{name}={SECRET_MASK}"
+        pieces.append(piece)
+    return f"{path}?{'&'.join(pieces)}"
+
+
+# The loggers that write an inbound request target, query included:
+# `uvicorn.access` (the HTTP request line) and `uvicorn.error` (the WebSocket
+# handshake line at INFO, and the websockets `< GET` request line at DEBUG).
+_REQUEST_TARGET_LOGGERS = ("uvicorn.access", "uvicorn.error")
+
+
+class _AccessQueryMask(logging.Filter):
+    """Keep the OAuth callback `code`/`state` out of the request-target loggers.
+
+    uvicorn logs the request target, query included, as one item of
+    `record.args`. Rewrite every str item rather than a tuple position, so a
+    change of uvicorn's argument order opens no gap. Never drops a record.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                _mask_query(a) if isinstance(a, str) and "?" in a else a
+                for a in record.args
+            )
+        return True
+
+
+def _mask_access_log() -> None:
+    # Installed before uvicorn applies its logging config: dictConfig replaces
+    # a logger's handlers but never removes its filters. Once per process.
+    for name in _REQUEST_TARGET_LOGGERS:
+        lg = logging.getLogger(name)
+        if not any(isinstance(f, _AccessQueryMask) for f in lg.filters):
+            lg.addFilter(_AccessQueryMask())
+
 
 def build_app(settings: Settings) -> Starlette:
+    _pin_transport_log_floor()
+    _mask_access_log()
+    install_log_redaction()
     registry = Registry(settings.data_dir / "servers.json")
     registry.load()
 
@@ -50,6 +121,8 @@ def build_app(settings: Settings) -> Starlette:
         mask_error_details=True,
     )
     gateway.add_provider(supervisor.table)
+    # Each new session carries the live instructions of the running children.
+    gateway.add_middleware(ChildInstructionsMiddleware(supervisor))
 
     # Mount the built-in admin server beside the aggregate table. The
     # supervisor owns the whole provider chain, the namespace `mcpflow` included,

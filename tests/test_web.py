@@ -188,16 +188,20 @@ async def test_dashboard_marks_a_failed_child(tmp_path):
     tokens = TokenStore(data_dir / "tokens.json")
     tokens.load()
 
+    brk = data_dir / "broken_break"
     good = await sup.add(fake_child_spec("time", "good"))
-    broken = await sup.add(fake_child_spec("broken", "good"))
+    broken = await sup.add(
+        fake_child_spec("broken", "action", env={"MCPFLOW_BREAK": str(brk)})
+    )
     # Capture the task refs before awaiting: a finished start clears child.task
     # to None (the in-flight task, else None).
     good_task, broken_task = good.task, broken.task
     await good_task
     await broken_task
     assert good.status == "running" and broken.status == "running"
-    # Break broken's connection: list_tools on it now raises.
-    broken.transport = sup._build_transport(fake_child_spec("broken", "fail"))
+    # Break broken's connection through its real transport: while the flag
+    # exists, its `tools/list` raises, so the dashboard probe marks it failed.
+    brk.write_text("")
 
     routes = build_routes(sup, tokens, settings, sup.creds, sup.flows)
     app = Starlette(
@@ -300,7 +304,7 @@ def test_python_tab(server_factory):
     assert spec.package == "mcp-server-time"
 
 
-def test_source_persists_redacted_in_row_raw_in_window(server_factory):
+def test_source_persists_raw_redacted_in_row_and_window(server_factory):
     server = server_factory(CHILD_START_TIMEOUT="2")
     client = server.login()
     raw = "git+https://oauth2:SEKRETTOKEN@host/o/r"
@@ -319,10 +323,12 @@ def test_source_persists_redacted_in_row_raw_in_window(server_factory):
     row = client.get("/").text
     assert "uvx --from git+https://***@host/o/r my-tool" in row
     assert "SEKRETTOKEN" not in row
-    # The window's form input holds the raw value, the same rule as raw env.
+    # The window's form input holds the redacted form too; a save echoes it and
+    # `Registry.update` keeps the stored credential.
     window = client.get("/servers/tool").text
     client.close()
-    assert raw in window
+    assert "SEKRETTOKEN" not in window
+    assert 'name="source" value="git+https://***@host/o/r"' in window
 
 
 def test_checkbox_disabled_persists(server_factory):
@@ -572,3 +578,50 @@ def test_public_url_override_in_mcp_config(server_factory):
     assert resp.status_code == 200
     assert "https://mcp.example.com/mcp" in resp.text
     assert "https://mcp.example.com//mcp" not in resp.text
+
+
+# --- Cache TTL form field (child-catalog-freshness) --------------------------
+
+
+def test_add_form_cache_ttl_blank_and_zero(server_factory):
+    server = server_factory(CHILD_START_TIMEOUT="2")
+    client = server.login()
+    # `enabled` omitted -> disabled, so no child starts.
+    blank = client.post(
+        "/servers",
+        data={"kind": "python", "namespace": "time", "package": "p", "cache_ttl": ""},
+    )
+    zero = client.post(
+        "/servers",
+        data={"kind": "python", "namespace": "skills", "package": "p", "cache_ttl": "0"},
+    )
+    client.close()
+    assert blank.status_code == 303
+    assert zero.status_code == 303 and zero.headers["location"] == "/"
+    reg = Registry(server.data_dir / "servers.json")
+    reg.load()
+    assert reg.get("time").cache_ttl is None
+    assert reg.get("skills").cache_ttl == 0.0
+
+
+def test_edit_form_keeps_cache_ttl(server_factory):
+    server = server_factory(
+        seed_registry(fake_child_spec("skills", "good", enabled=False, cache_ttl=0))
+    )
+    client = server.login()
+    window = client.get("/servers/skills").text
+    field = re.search(r'<input name="cache_ttl"[^>]*>', window).group(0)
+    assert 'value="0"' in field
+    # Save the form as the browser would: every field as shown, one changed.
+    form = dict(re.findall(r'<input name="(\w+)"[^>]*value="([^"]*)"', window))
+    form.update(kind="custom", description="changed")
+    resp = client.post("/servers/skills", data=form)
+    assert resp.status_code == 303, resp.text
+    bad = client.post("/servers/skills", data={**form, "cache_ttl": "abc"})
+    client.close()
+    assert bad.status_code == 400
+    assert "cache_ttl" in bad.text
+    reg = Registry(server.data_dir / "servers.json")
+    reg.load()
+    assert reg.get("skills").description == "changed"
+    assert reg.get("skills").cache_ttl == 0.0

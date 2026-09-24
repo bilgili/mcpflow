@@ -9,13 +9,15 @@ equal, so no caller can act on a state that was never persisted.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import unquote, unquote_plus, urlsplit, urlunsplit
 
+import httpx
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 Kind = Literal["python", "npm", "remote", "custom"]
@@ -52,6 +54,40 @@ def redact_source(source: str | None) -> str | None:
     return _USERINFO_RE.sub(r"\1***@", source, count=1)
 
 
+def _with_decoded(values: list[str], *decoders) -> list[str]:
+    """Each value, followed by every decoded form of it that differs."""
+    out: list[str] = []
+    for value in values:
+        out.append(value)
+        for decode in decoders:
+            decoded = decode(value)
+            if decoded not in out:
+                out.append(decoded)
+    return out
+
+
+def _unparsed_secrets(url: str) -> list[str]:
+    """The secrets of a URL that `urlsplit` rejects, cut by hand.
+
+    Best effort, for a legacy record only: `_refuse_unparseable` keeps a new
+    one out of the registry, since no hand cut tracks every shape `urlsplit`
+    normalizes (a scheme-relative URL, a deleted newline).
+
+    `urlsplit` raises on some netlocs (NFKC normalization) and its error text
+    echoes the netloc, not the whole URL, so the whole string alone does not
+    mask it. Register the whole string, the authority (scheme to the first
+    `/`, `?`, or `#`), and its user information and password.
+    """
+    authority = re.split(r"[/?#]", url.partition("://")[2] or url, maxsplit=1)[0]
+    out = [url, authority]
+    if "@" in authority:
+        userinfo = authority.rsplit("@", 1)[0]
+        out.append(userinfo)
+        if ":" in userinfo:
+            out.append(userinfo.split(":", 1)[1])
+    return [v for v in out if v]
+
+
 def source_secrets(source: str | None) -> list[str]:
     """The credential strings to mask from diagnostics for a source URL.
 
@@ -75,7 +111,10 @@ def source_secrets(source: str | None) -> list[str]:
     """
     if source is None:
         return []
-    netloc = urlsplit(source).netloc
+    try:
+        netloc = urlsplit(source).netloc
+    except ValueError:
+        return _unparsed_secrets(source)
     if "@" not in netloc:
         return []
     userinfo = netloc.rsplit("@", 1)[0]
@@ -84,7 +123,212 @@ def source_secrets(source: str | None) -> list[str]:
     secrets = [userinfo]
     if ":" in userinfo:
         secrets.append(userinfo.split(":", 1)[1])
-    return secrets
+    # A diagnostic can echo the credential percent-decoded
+    # (`pass%40word` -> `pass@word`); register that form too.
+    return _with_decoded(secrets, unquote)
+
+
+# The mask every admin-facing view shows in place of a secret value. `catalog`
+# (the marketplace preview) and `supervisor` (the diagnostic scrub) import it,
+# so one string means "hidden" on every surface and `Registry.update` can
+# recognise an echo of it.
+SECRET_MASK = "•••"
+
+
+def redact_secrets(mapping: dict[str, str]) -> dict[str, str]:
+    """Hide every non-empty value of an `env`/`headers` map behind the mask.
+
+    Every value, not only keys that look secret: a name heuristic misses a real
+    credential name, and a miss is a leak. An empty value holds nothing and
+    stays, so a reader can still tell "set" from "unset".
+    """
+    return {k: (SECRET_MASK if v else v) for k, v in mapping.items()}
+
+
+def _query_values(query: str) -> list[str]:
+    """Every non-empty query value, under both parsings a server may use.
+
+    `&` separates pairs, and a value runs to the next `&` (so
+    `api_key=;tok` has the value `;tok`, which `redact_url` masks whole). A
+    legacy parser also splits on `;`, so each `;` piece of a value is
+    registered too: `region=eu;api_key=tok` yields `eu;api_key=tok`, `eu`, and
+    `tok`.
+    """
+    values = []
+    for pair in query.split("&"):
+        _, sep, value = pair.partition("=")
+        if not (sep and value):
+            continue
+        values.append(value)
+        if ";" in value:
+            # The first piece is already a value (it can end in `=` base64
+            # padding); each later piece is a `key=value` pair of its own.
+            first, *rest = value.split(";")
+            pieces = [first] + [p.partition("=")[2] if "=" in p else p for p in rest]
+            values.extend(p for p in pieces if p)
+    return values
+
+
+def _mask_query_pair(pair: str) -> str:
+    key, sep, value = pair.partition("=")
+    return f"{key}={SECRET_MASK}" if sep and value else pair
+
+
+def redact_url(url: str | None) -> str | None:
+    """Mask the user information and every non-empty query value of a URL.
+
+    `https://u:pw@host/mcp?api_key=k&flag` becomes
+    `https://•••@host/mcp?api_key=•••&flag`. Scheme, host, path, query keys,
+    and fragment stay, so the endpoint is readable. The query is rebuilt by
+    hand, not with `urlencode`, so the mask stays literal and `_refuse_mask`
+    finds it in an echo. A URL with nothing to mask comes back unchanged. The
+    path is not masked (a known limit, see the redact-registry-secrets design).
+
+    A URL `urlsplit` rejects comes back as the bare mask. An outward view must
+    never raise: the `urlsplit` error echoes the netloc, credential included,
+    and an error page that renders a refused URL would log it (codex round 4).
+    """
+    if url is None:
+        return None
+    if not _parses(url):
+        return SECRET_MASK
+    parts = urlsplit(url)
+    netloc = parts.netloc
+    if "@" in netloc:
+        netloc = f"{SECRET_MASK}@{netloc.rsplit('@', 1)[1]}"
+    # Split on `&` only and mask each whole value, `;` tail included: the
+    # conservative reading, so no parser sees an unmasked credential.
+    query = "&".join(_mask_query_pair(p) for p in parts.query.split("&"))
+    if netloc == parts.netloc and query == parts.query:
+        return url
+    return urlunsplit(parts._replace(netloc=netloc, query=query))
+
+
+def url_secrets(url: str | None) -> list[str]:
+    """The credential strings of a URL, for the diagnostic scrub.
+
+    The user information via `source_secrets` (which owns that shape and its
+    decoded forms) plus each non-empty query value raw, percent-decoded, and
+    form-decoded (`+` as a space), because an HTTP error can echo any of them.
+    The same parts `redact_url` masks. Both again from the URL as `httpx`
+    normalizes it (a space is `%20`, `ä` is `%C3%A4`), because `httpx` and the
+    SDK transports log that form. A URL `urlsplit` rejects goes through
+    `_unparsed_secrets`, and still gets its `httpx` form, which can parse.
+    """
+    if url is None:
+        return []
+    try:
+        values = _query_values(urlsplit(url).query)
+        out = [*source_secrets(url), *_with_decoded(values, unquote, unquote_plus)]
+    except ValueError:
+        out = _unparsed_secrets(url)
+    try:
+        sent = str(httpx.URL(url))
+    except httpx.InvalidURL:
+        # httpx cannot send to this URL, so it never logs it.
+        return out
+    if sent != url:
+        out += [*source_secrets(sent), *_query_values(urlsplit(sent).query)]
+    return out
+
+
+def redact_spec(spec: ServerSpec) -> ServerSpec:
+    """The outward view of a stored record: a copy with every credential masked.
+
+    The single owner of what an admin-facing surface may show. `api.child_json`
+    (REST and every admin MCP tool) and the web server window build from it;
+    only `Registry.get` hands the raw record to the supervisor, which launches
+    the child. `Registry.update` reverses the mask on an echo.
+    """
+    return spec.model_copy(
+        update={
+            "source": redact_source(spec.source),
+            "url": redact_url(spec.url),
+            "env": redact_secrets(spec.env),
+            "headers": redact_secrets(spec.headers),
+        }
+    )
+
+
+def _keep_echoed(incoming: dict[str, str], stored: dict[str, str]) -> dict[str, str]:
+    """Merge one secret map for `update`: an incoming mask for a stored key keeps
+    the stored value; anything else is adopted. A key absent from `incoming` is
+    dropped, the full-replacement rule `update` uses for every field.
+    """
+    return {
+        k: (stored[k] if v == SECRET_MASK and k in stored else v)
+        for k, v in incoming.items()
+    }
+
+
+def _parses(url: str) -> bool:
+    """`urlsplit` takes it whole: no control character (which `urlsplit`
+    silently deletes, so the parsed form no longer matches the raw one) and no
+    netloc it rejects (NFKC normalization)."""
+    if any(ord(c) < 32 or ord(c) == 127 for c in url):
+        return False
+    try:
+        urlsplit(url)
+    except ValueError:
+        return False
+    return True
+
+
+def _refuse_unparseable(spec: ServerSpec) -> None:
+    """Refuse a `url` or `source` the secret extractors cannot cut.
+
+    `url_secrets` and `source_secrets` find a credential by parsing. A URL that
+    `urlsplit` rejects raises an error that echoes the netloc, and a hand-cut
+    fallback cannot track every shape `urlsplit` normalizes (codex rounds 2 and
+    3). Refusing at the write boundary keeps such a record out of the registry,
+    so it never starts and never logs. The message names the field only, never
+    the value. `load` does not call this, so a legacy record still loads.
+    """
+    if spec.url is not None:
+        parts = urlsplit(spec.url) if _parses(spec.url) else None
+        # `hostname`, not `netloc`: user information alone makes the netloc
+        # of `https://u:pw@/mcp` non-empty.
+        ok = parts is not None and parts.scheme in ("http", "https") and parts.hostname
+        if ok:
+            try:
+                httpx.URL(spec.url)
+            except httpx.InvalidURL:
+                ok = False
+        if not ok:
+            raise RegistryError("url: not a valid http(s) URL")
+    if spec.source is not None and not _parses(spec.source):
+        raise RegistryError("source: not a valid URL")
+
+
+def _refuse_mask(spec: ServerSpec) -> None:
+    """Refuse a record that still holds a mask after the merge.
+
+    An echo the merge could not resolve (a masked value under a new key, a
+    clone of a read record, `Bearer •••`, a URL edit that kept a masked query)
+    would persist the mask as the credential and lose the real one. "Contains",
+    not "equals", so a prefixed mask is caught too. The message names the field
+    and key, never a value. An unparseable `url` or `source` is refused first:
+    the `urlsplit` below would otherwise raise with the netloc in its text.
+    """
+    _refuse_unparseable(spec)
+    for field in ("env", "headers"):
+        for key, value in getattr(spec, field).items():
+            if SECRET_MASK in value:
+                raise RegistryError(
+                    f"{field}: {key} holds the mask {SECRET_MASK}; "
+                    "send the real value"
+                )
+    # Decode first: a client may percent-encode the mask in any letter case.
+    if spec.url is not None and SECRET_MASK in unquote(spec.url):
+        raise RegistryError(
+            f"url: holds the mask {SECRET_MASK}; send the full url"
+        )
+    if spec.source is not None:
+        netloc = urlsplit(spec.source).netloc
+        if "@" in netloc and unquote(netloc.rsplit("@", 1)[0]) == "***":
+            raise RegistryError(
+                "source: holds the redacted credential ***; send the full source"
+            )
 
 
 _SOURCE_PREFIXES = ("git+https://", "https://", "github:", "/")
@@ -171,7 +415,7 @@ def spec_command(spec, args: list[str] | None = None) -> str:
     """
     shown = list(spec.args) if args is None else list(args)
     if spec.kind == "remote":
-        return f"{spec.transport.upper()} {spec.url}"
+        return f"{spec.transport.upper()} {redact_url(spec.url)}"
     command, argv = build_command(
         kind=spec.kind,
         package=spec.package or "",
@@ -216,6 +460,16 @@ class ServerSpec(BaseModel):
     muted: bool = False
     disabled_tools: list[str] = Field(default_factory=list)
     description: str = ""
+    # Seconds the proxy serves lookups by name from its cached component
+    # lists. `None` inherits `Settings.child_cache_ttl`. `0` disables the
+    # cache. Caller-owned: `Registry.update` does not re-merge it.
+    cache_ttl: float | None = None
+    # True marks this child action-capable: mcpflow honors its
+    # `_meta["mcpflow"]["action"]` tags. Default False, so actions are opt-in
+    # per child. Registry-owned, NOT caller-owned: `Registry.update` re-merges
+    # it, so an edit save that omits it keeps the grant and a caller partial
+    # dict cannot self-grant capability (child-actions-page F2 revised).
+    actions: bool = False
     source: str | None = None
     # The marketplace entry id this child came from. Free text: the registry
     # never checks it against the catalog, so a deleted local entry leaves a
@@ -232,6 +486,13 @@ class ServerSpec(BaseModel):
     @classmethod
     def _check_namespace(cls, value: str) -> str:
         return validate_namespace(value)
+
+    @field_validator("cache_ttl")
+    @classmethod
+    def _check_cache_ttl(cls, value: float | None) -> float | None:
+        if value is not None and not (math.isfinite(value) and value >= 0):
+            raise ValueError("cache_ttl must be a finite number >= 0")
+        return value
 
     @model_validator(mode="after")
     def _check_kind_fields(self) -> ServerSpec:
@@ -318,11 +579,25 @@ class Registry:
     def add(self, spec: ServerSpec) -> None:
         if any(s.namespace == spec.namespace for s in self._specs):
             raise RegistryError(f"namespace {spec.namespace} already exists")
+        # A new record has no stored value to echo against, so any mask here
+        # is a clone of a read record and would persist as the credential.
+        _refuse_mask(spec)
         self._commit([*self._specs, spec])
 
     def update(self, spec: ServerSpec) -> None:
+        merged = self.merge(spec)
         i = self._index(spec.namespace)
-        existing = self._specs[i]
+        self._commit([*self._specs[:i], merged, *self._specs[i + 1 :]])
+
+    def merge(self, spec: ServerSpec) -> ServerSpec:
+        """The record `update(spec)` would store, validated, without storing it.
+
+        Pure: raises exactly what `update` raises before its write, and writes
+        nothing. The supervisor reads the merged secret set here, so it can
+        discard derived state that the new record cannot scrub (the child log)
+        BEFORE the record is persisted.
+        """
+        existing = self._specs[self._index(spec.namespace)]
         # The web form builds a fresh spec and carries neither the visibility
         # state nor the creation time. Merge here, in the one owner, so no
         # caller has to remember to preserve them.
@@ -335,6 +610,12 @@ class Registry:
         source = spec.source
         if source is not None and source == redact_source(existing.source):
             source = existing.source
+        # `env`, `headers`, and `url` follow the same echo rule: a read returns
+        # `redact_spec`, so an incoming mask means the client never saw the
+        # secret and the stored value is kept. `env`/`headers` merge per key.
+        url = spec.url
+        if url is not None and url == redact_url(existing.url):
+            url = existing.url
         # `catalog` is provenance, the same as `created_at`: the marketplace
         # sets it once at connect and no caller may change or drop it.
         # `oauth_pending` is registry-owned, the same as visibility: a form or
@@ -348,9 +629,20 @@ class Registry:
                 "source": source,
                 "catalog": existing.catalog,
                 "oauth_pending": existing.oauth_pending,
+                # `actions` is a trust grant, registry-owned like `catalog` and
+                # `oauth_pending`. An edit save that omits it keeps the grant,
+                # and a caller partial dict cannot self-grant it. Only a
+                # create-time write or a catalog connect sets it (F2 revised).
+                "actions": existing.actions,
+                "url": url,
+                "env": _keep_echoed(spec.env, existing.env),
+                "headers": _keep_echoed(spec.headers, existing.headers),
             }
         )
-        self._commit([*self._specs[:i], merged, *self._specs[i + 1 :]])
+        # After the merge, no mask may remain: it would persist as the
+        # credential and lose the real one.
+        _refuse_mask(merged)
+        return merged
 
     def set_oauth_header(self, namespace: str, name: str, value: str) -> None:
         """Set the child's `name` header to `value` and clear `oauth_pending`
@@ -368,6 +660,9 @@ class Registry:
         updated = existing.model_copy(
             update={"headers": headers, "oauth_pending": False}
         )
+        # A token response that carries the mask would persist it as the
+        # credential; the no-mask rule holds for this writer too.
+        _refuse_mask(updated)
         self._commit([*self._specs[:i], updated, *self._specs[i + 1 :]])
 
     def remove(self, namespace: str) -> None:

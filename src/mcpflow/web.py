@@ -9,12 +9,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 import shlex
 import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import httpx
 from jinja2 import Environment, FileSystemLoader, select_autoescape
+from mcp.types import TextContent
 from starlette.requests import Request
 from starlette.responses import (
     HTMLResponse,
@@ -24,24 +27,39 @@ from starlette.responses import (
 )
 from starlette.routing import BaseRoute, Route
 
+from . import oauth as _oauth
+from .actions import (
+    ActionView,
+    FormField,
+    form_fields,
+    redact,
+    redact_schema,
+    secret_keys,
+    secret_literals,
+)
 from .auth import COOKIE_NAME, TokenStore, sign_session, verify_password
 from .catalog import BUILTIN_DIR, CATEGORIES, Catalog, CatalogEntry, build_spec
 from .config import Settings
 from .importer import parse_config_block
-from . import oauth as _oauth
 from .oauth import (
     CLIENT_FORMATS,
     TOKEN_FORMATS,
     ClientCreds,
-    HeaderSpec,
     CredStore,
+    HeaderSpec,
     PendingFlows,
     ProviderRegistry,
     authorize_url,
     token_request,
 )
-from .registry import RegistryError, ServerSpec, spec_command, spec_from_dict
-from .supervisor import Supervisor
+from .registry import (
+    RegistryError,
+    ServerSpec,
+    redact_spec,
+    spec_command,
+    spec_from_dict,
+)
+from .supervisor import LeaseRefused, Supervisor
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +94,7 @@ def _spec_from_form(form, *, namespace: str | None = None) -> ServerSpec:
         "env": _kv_lines(form.get("env", "")),
         "enabled": enabled,
         "description": (form.get("description") or "").strip(),
+        "cache_ttl": (form.get("cache_ttl") or "").strip() or None,
     }
     return spec_from_dict(data)
 
@@ -95,6 +114,7 @@ def _form_values(spec: ServerSpec | None) -> dict:
         "command": spec.command or "",
         "env": "\n".join(f"{k}={v}" for k, v in spec.env.items()),
         "description": spec.description,
+        "cache_ttl": "" if spec.cache_ttl is None else f"{spec.cache_ttl:g}",
         "enabled": spec.enabled,
     }
 
@@ -150,6 +170,49 @@ def _admin_curl(settings: Settings, request: Request, token: str) -> str:
     return f"curl -H {shlex.quote(header)} {shlex.quote(url)}"
 
 
+def _canonical(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _same_json(text: str, value: object) -> bool:
+    """`text` parses to `value`. Canonical form, so `true` never equals `1`."""
+    try:
+        return _canonical(json.loads(text)) == _canonical(value)
+    except (ValueError, RecursionError):
+        return False
+
+
+def _is_mirror(text: str, structured: object) -> bool:
+    """A text block FastMCP derived from the structured content (design.md).
+
+    (a) the JSON of the whole structured content; (b) for a non-object return
+    wrapped as `{"result": v}`, `v` itself: a `str` as is, any other as JSON.
+    """
+    if structured is None:
+        return False
+    if _same_json(text, structured):
+        return True
+    if isinstance(structured, dict) and list(structured) == ["result"]:
+        v = structured["result"]
+        return text == v if isinstance(v, str) else _same_json(text, v)
+    return False
+
+
+@dataclass(frozen=True)
+class _ActionSnapshot:
+    name: str
+    fields: tuple[FormField, ...]
+    password_keys: frozenset[str]
+
+
+@dataclass(frozen=True)
+class _PageSnapshot:
+    namespace: str
+    expires: float
+    actions: dict[str, _ActionSnapshot]
+    secrets: frozenset[str]
+
+
 def build_routes(
     supervisor: Supervisor,
     tokens: TokenStore,
@@ -161,6 +224,7 @@ def build_routes(
         loader=FileSystemLoader(str(_TEMPLATES)),
         autoescape=select_autoescape(),
     )
+    action_snapshots: dict[str, _PageSnapshot] = {}
 
     def render(
         name: str, request: Request, *, status_code: int = 200, **ctx
@@ -373,11 +437,11 @@ def build_routes(
         one `failed` when its probe raises, so filling a one-child page from it
         could change an unrelated child's status.
 
-        The raw `source`, `env`, and `headers` reach the form inputs alone, the
-        same rule as the edit form before: `Registry.update` rebuilds `headers`
-        from the form, so a masked value would replace the `Authorization`
-        token of a header sink child on the next save. The row and the command
-        show the source through `redact_source`.
+        The form shows `redact_spec(child.spec)`, the same outward view as the
+        API: every `env`/`headers` value and the `source`/`url` credentials are
+        masked. A save echoes the masks and `Registry.update` keeps the stored
+        secrets. `_form_values` stays a plain formatter because the JSON import
+        preview formats a fresh paste that must stay raw.
 
         `values` carries the typed values back on a 400; `None` reads them from
         the stored spec.
@@ -390,7 +454,9 @@ def build_routes(
         return {
             "ns": ns,
             "c": child,
-            "values": _form_values(child.spec) if values is None else values,
+            "values": (
+                _form_values(redact_spec(child.spec)) if values is None else values
+            ),
             "tab": child.spec.kind,
             "editing": True,
             "command": spec_command(child.spec),
@@ -466,6 +532,307 @@ def build_routes(
         except KeyError:
             return PlainTextResponse("not found", status_code=404)
         return PlainTextResponse(text, media_type="text/plain")
+
+    # --- actions ---------------------------------------------------------
+
+    def _prune_action_snapshots() -> None:
+        now = time.monotonic()
+        for token, snapshot in list(action_snapshots.items()):
+            if snapshot.expires <= now:
+                del action_snapshots[token]
+
+    def _actions_page(
+        request: Request,
+        ns: str,
+        child,
+        *,
+        configured: frozenset[str],
+        inherited_metadata: frozenset[str] = frozenset(),
+        request_secrets: frozenset[str] = frozenset(),
+        password_keys: frozenset[str] = frozenset(),
+        status_code: int = 200,
+        page: bool = True,
+        actions: list[ActionView] | None = None,
+        error: str | None = None,
+        active: str | None = None,
+        values: dict[str, str] | None = None,
+        form_error: str | None = None,
+        result: dict | None = None,
+    ) -> Response:
+        views = actions or []
+        # Metadata secrets alone may persist. The complete request union is used
+        # once on each original presentation value, never saved in a snapshot.
+        metadata_secrets = (
+            inherited_metadata
+            | configured
+            | frozenset(
+                value for view in views for value in secret_literals(view.schema)
+            )
+        )
+        full = metadata_secrets | request_secrets
+        cards = []
+        snapshots = {}
+        values = values or {}
+        for card_index, view in enumerate(views):
+            alias = f"a{card_index}"
+            on = view.name == active
+            effective_keys = secret_keys(view.schema) | (
+                password_keys if on else frozenset()
+            )
+            fields = tuple(
+                replace(
+                    field, control="password", enum=(), default="", default_on=False
+                )
+                if field.name in effective_keys
+                else field
+                for field in form_fields(view.schema)
+            )
+            # FormField contains only immutable scalar/tuple metadata, detached
+            # from the child's mutable schema. It holds no request values.
+            snapshots[alias] = _ActionSnapshot(view.name, fields, effective_keys)
+            controls = []
+            for field_index, field in enumerate(fields):
+                raw_value = values.get(field.name, "") if on else field.default
+                value = redact(raw_value, full)
+                if not on and value != raw_value:
+                    value = ""
+                controls.append(
+                    {
+                        "alias": f"f{field_index}",
+                        "id": f"a-{card_index}-f-{field_index}",
+                        "label": redact(field.name, full),
+                        "control": field.control,
+                        "required": field.required,
+                        "value": "" if field.control == "password" else value,
+                        "checked": field.name in values if on else field.default_on,
+                        "options": [
+                            {
+                                "alias": f"o{i}",
+                                "label": redact(option, full),
+                                "selected": option == raw_value,
+                            }
+                            for i, option in enumerate(field.enum)
+                        ],
+                    }
+                )
+            cards.append(
+                {
+                    "alias": alias,
+                    "active": on,
+                    "name": redact(view.name, full),
+                    "title": redact(view.title, full),
+                    "description": redact(view.description, full),
+                    "schema": redact(redact_schema(view.schema), full),
+                    "disabled": view.disabled,
+                    "reason": redact(view.reason, full),
+                    "fields": controls,
+                }
+            )
+        token = None
+        if cards and not error:
+            _prune_action_snapshots()
+            while len(action_snapshots) >= 256:
+                del action_snapshots[next(iter(action_snapshots))]
+            token = secrets.token_urlsafe(32)
+            action_snapshots[token] = _PageSnapshot(
+                ns, time.monotonic() + settings.session_ttl, snapshots, metadata_secrets
+            )
+        shown_result = None
+        if result is not None:
+            structured = result["structured"]
+            shown_result = {
+                "text": [redact(text, full) for text in result["text"]],
+                "structured": None
+                if structured is None
+                else json.dumps(redact(structured, full), indent=2, ensure_ascii=False),
+            }
+        return render(
+            "server_actions.html" if page else "_server_actions.html",
+            request,
+            status_code=status_code,
+            ns=ns,
+            c=child,
+            actions=cards,
+            form_token=token,
+            error=None if error is None else redact(error, full),
+            active=None if active is None else redact(active, full),
+            form_error=None if form_error is None else redact(form_error, full),
+            result=shown_result,
+            page=page,
+        )
+
+    async def server_actions(request: Request) -> Response:
+        ns = request.path_params["ns"]
+        try:
+            child = supervisor.get(ns)
+            configured = frozenset(supervisor.child_secrets(ns))
+            views = await supervisor.actions(ns)
+        except KeyError:
+            return PlainTextResponse("not found", status_code=404)
+        except RuntimeError as exc:
+            return _actions_page(
+                request,
+                ns,
+                child,
+                configured=configured,
+                page=not is_htmx(request),
+                error=str(exc),
+            )
+        return _actions_page(
+            request,
+            ns,
+            child,
+            configured=configured,
+            page=not is_htmx(request),
+            actions=views,
+        )
+
+    async def server_action_submit(request: Request) -> Response:
+        """Restore identities, check current membership, then execute once."""
+        ns = request.path_params["ns"]
+        action = request.path_params["action"]
+        posted = await request.form()
+        legacy = "form_token" not in request.query_params
+        if legacy:
+            form = dict(posted)
+            password_keys = frozenset(form)
+            rendered_secrets = frozenset()
+        else:
+            _prune_action_snapshots()
+            snapshot = action_snapshots.get(request.query_params["form_token"])
+            card = None if snapshot is None else snapshot.actions.get(action)
+            if snapshot is None or snapshot.namespace != ns or card is None:
+                return PlainTextResponse(
+                    "Invalid form. Reload the actions page.", status_code=400
+                )
+            fields = {f"f{i}": field for i, field in enumerate(card.fields)}
+            form = {}
+            for alias, value in posted.multi_items():
+                field = fields.get(alias)
+                if field is None or not isinstance(value, str):
+                    return PlainTextResponse(
+                        "Invalid form. Reload the actions page.", status_code=400
+                    )
+                if field.control == "enum":
+                    options = {f"o{i}": option for i, option in enumerate(field.enum)}
+                    if value == "" and not field.required:
+                        value = ""
+                    elif value in options:
+                        value = options[value]
+                    else:
+                        return PlainTextResponse(
+                            "Invalid form. Reload the actions page.", status_code=400
+                        )
+                form[field.name] = value
+            action = card.name
+            password_keys = card.password_keys
+            rendered_secrets = snapshot.secrets
+        request_secrets = rendered_secrets | frozenset(
+            value
+            for key in password_keys
+            if isinstance(value := form.get(key), str) and value
+        )
+        try:
+            child = supervisor.get(ns)
+            configured = frozenset(supervisor.child_secrets(ns))
+            views = await supervisor.actions(ns)
+        except KeyError:
+            return PlainTextResponse("not found", status_code=404)
+        except RuntimeError as exc:
+            return _actions_page(
+                request,
+                ns,
+                child,
+                configured=configured,
+                inherited_metadata=rendered_secrets,
+                request_secrets=request_secrets,
+                status_code=503 if isinstance(exc, LeaseRefused) else 400,
+                error=str(exc),
+            )
+        view = next((v for v in views if v.name == action), None)
+        if view is None:
+            return PlainTextResponse("not found", status_code=404)
+        request_secrets |= frozenset(
+            value
+            for key in secret_keys(view.schema)
+            if isinstance(value := form.get(key), str) and value
+        )
+        try:
+            run = await supervisor.run_action(
+                ns,
+                action,
+                form,
+                rendered_password_keys=password_keys,
+                rendered_secrets=rendered_secrets,
+            )
+        except KeyError:
+            return PlainTextResponse("not found", status_code=404)
+        if run.kind == "unknown":
+            return PlainTextResponse("not found", status_code=404)
+
+        logger.info("running action %s of %s", view.name, ns)
+        password_keys |= run.password_keys
+        request_secrets |= run.secrets
+        # Refills remain raw until the complete page union has been assembled.
+        values = (
+            {}
+            if legacy or run.kind in ("transport", "lease_refused")
+            else {
+                key: value
+                for key, value in form.items()
+                if isinstance(value, str) and key not in password_keys
+            }
+        )
+        context = {
+            "configured": configured,
+            "inherited_metadata": rendered_secrets,
+            "request_secrets": request_secrets,
+            # Legacy all-key secrecy describes the request, not past controls.
+            "password_keys": frozenset() if legacy else password_keys,
+            "actions": views,
+            "active": action,
+            "values": values,
+        }
+        if run.kind in ("muted", "coerce_error"):
+            return _actions_page(
+                request,
+                ns,
+                child,
+                **context,
+                status_code=400,
+                form_error="muted" if run.kind == "muted" else run.detail,
+            )
+        if run.kind in ("lease_refused", "transport"):
+            return _actions_page(
+                request,
+                ns,
+                child,
+                **context,
+                status_code=503 if run.kind == "lease_refused" else 400,
+                error=run.detail,
+            )
+        res = run.result
+        texts = [b.text for b in res.content if isinstance(b, TextContent)]
+        if res.is_error:
+            return _actions_page(
+                request,
+                ns,
+                child,
+                **context,
+                status_code=400,
+                form_error="\n".join(texts) or "the action failed",
+            )
+        structured = res.structured_content
+        return _actions_page(
+            request,
+            ns,
+            child,
+            **context,
+            result={
+                "text": [text for text in texts if not _is_mirror(text, structured)],
+                "structured": structured,
+            },
+        )
 
     # --- imports ---------------------------------------------------------
 
@@ -950,8 +1317,12 @@ def build_routes(
         Route("/servers/{ns}/log", server_log, methods=["GET"]),
         Route("/servers/{ns}/reauthorize", reauthorize_get, methods=["GET"]),
         Route("/servers/{ns}/reauthorize", reauthorize_post, methods=["POST"]),
-        # Declared after the literal suffixes above so `/log`, `/edit`, and
-        # `/reauthorize` keep matching their own routes.
+        Route("/servers/{ns}/actions", server_actions, methods=["GET"]),
+        Route(
+            "/servers/{ns}/actions/{action}", server_action_submit, methods=["POST"]
+        ),
+        # Declared after the literal suffixes above so `/log`, `/edit`,
+        # `/reauthorize`, and `/actions` keep matching their own routes.
         Route("/servers/{ns}", server_detail, methods=["GET"]),
         Route("/import/json", import_json, methods=["POST"]),
         Route("/marketplace", marketplace, methods=["GET"]),

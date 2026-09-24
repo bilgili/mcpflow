@@ -1,0 +1,25 @@
+{
+  "id": "skills",
+  "name": "Skill Store",
+  "vendor": "MCP Flow",
+  "category": "dev",
+  "color": "#2d7a64",
+  "description": "Discover and write remote skills across directory, Git, and S3 stores. Manage stores from Actions.",
+  "auth": "none",
+  "tools": ["use_skill", "write_skill", "list_skills"],
+  "spec": {
+    "kind": "python",
+    "package": "skill-store",
+    "source": "git+https://github.com/bilgili/skill-store.git@5e0e4a53b9e0a93f667e37f7cbe2cbcefcfc5b71",
+    "actions": true,
+    "cache_ttl": 0
+  },
+  "setup": [
+    {
+      "key": "SKILLS_STATE_DIR",
+      "where": "env",
+      "hint": "Existing writable state directory on the persistent volume, such as /data/skill-state. Keep skill libraries outside this directory, such as /data/skill-library.",
+      "required": true
+    }
+  ]
+}

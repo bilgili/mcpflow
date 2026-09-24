@@ -171,3 +171,75 @@ def test_all_children_fail_at_startup(server_factory):
     # /mcp serves an empty tool list.
     _name, tools = mcp_session(server.base_url, holder["clear"])
     assert tools == []
+
+
+# --- Child catalog freshness (child-catalog-freshness) -----------------------
+
+
+def _grow(server_factory, tmp_path, cache_ttl: float):
+    """Start child `grow` and return (server, token, grow file)."""
+    from test_visibility import _seed as _seed_logged
+
+    grow = tmp_path / "grow"
+    holder: dict = {}
+    spec = fake_child_spec(
+        "grow", "grow", cache_ttl=cache_ttl, env={"MCPFLOW_GROW": str(grow)}
+    )
+    server = server_factory(_seed_logged(spec, holder=holder))
+    server.wait(running=1)
+    return server, holder["clear"], grow
+
+
+def _get_prompt(base: str, token: str, name: str) -> str:
+    async def run():
+        client = await _connect(base, token)
+        async with client as c:
+            return (await c.get_prompt(name)).messages[0].content.text
+
+    return asyncio.run(run())
+
+
+def test_new_tool_callable_under_ttl_zero(server_factory, tmp_path):
+    server, token, grow = _grow(server_factory, tmp_path, 0)
+    mcp_call(server.base_url, token, "grow_get_current_time", {})
+    grow.touch()
+    assert mcp_call(server.base_url, token, "grow_extra", {}) == "extra"
+
+
+def test_new_prompt_resolvable_under_ttl_zero(server_factory, tmp_path):
+    server, token, grow = _grow(server_factory, tmp_path, 0)
+    assert _get_prompt(server.base_url, token, "grow_get_current_time") == "time"
+    grow.touch()
+    assert _get_prompt(server.base_url, token, "grow_extra") == "extra"
+
+
+def test_new_tool_not_callable_under_long_ttl(server_factory, tmp_path):
+    from test_visibility import call_log
+
+    server, token, grow = _grow(server_factory, tmp_path, 300)
+    mcp_call(server.base_url, token, "grow_get_current_time", {})
+    grow.touch()
+    with pytest.raises(Exception, match="grow_extra"):
+        mcp_call(server.base_url, token, "grow_extra", {})
+    assert "extra" not in call_log(server)
+
+
+def test_list_is_fresh_under_long_ttl(server_factory, tmp_path):
+    server, token, grow = _grow(server_factory, tmp_path, 300)
+    _name, tools = mcp_session(server.base_url, token)
+    assert "grow_extra" not in tools
+    grow.touch()
+    _name, tools = mcp_session(server.base_url, token)
+    assert "grow_extra" in tools
+
+
+def test_dashboard_probe_ignores_the_cache(server_factory, tmp_path):
+    server, token, grow = _grow(server_factory, tmp_path, 300)
+    mcp_call(server.base_url, token, "grow_get_current_time", {})
+    client = server.login()
+    try:
+        assert "grow_extra" not in client.get("/").text
+        grow.touch()
+        assert "grow_extra" in client.get("/").text
+    finally:
+        client.close()
