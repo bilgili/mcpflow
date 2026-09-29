@@ -648,9 +648,11 @@ class Registry:
         """Set the child's `name` header to `value` and clear `oauth_pending`
         in one atomic write.
 
-        The one path that writes a header sink's token: the OAuth callback via
-        `finish_oauth`. It flips the token and the awaiting flag together in one
-        `servers.json` write, so they are never inconsistent. `update` preserves
+        The one path that writes a header sink's token. Three callers in the
+        supervisor: the OAuth callback via `finish_oauth`, the header sink
+        refresh apply, and the `startup` repair from `refresh.json`. It flips
+        the token and the awaiting flag together in one `servers.json` write,
+        so they are never inconsistent. `update` preserves
         `oauth_pending` for every other edit; only this method clears it.
         """
         i = self._index(namespace)

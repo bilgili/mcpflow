@@ -12,7 +12,8 @@ Ownership (see `design.md`):
 - `ProviderRegistry` owns the provider schema, the two directories, and the
   local-wins-on-id merge.
 - `CredStore` is, inside MCP Flow, the only writer and the only deleter of
-  `DATA_DIR/creds/<ns>/client.json` and `token.json`. It is not the only
+  `DATA_DIR/creds/<ns>/client.json`, `token.json`, and `refresh.json`. No
+  child is given the path of `refresh.json`. It is not the only
   writer on the host: a file sink child that refreshes its own access token
   rewrites the `token.json` MCP Flow gave it, so the store never assumes the
   file is unchanged since it wrote it. The supervisor owns the ordering that
@@ -21,7 +22,8 @@ Ownership (see `design.md`):
 - `authorize_url` and `token_request` build the two OAuth messages.
 
 The supervisor is the only caller of `write_client`, `write_token`,
-`CredStore.remove`, and `PendingFlows.discard`. The web layer calls `create`,
+`write_refresh`, `remove_refresh`, `CredStore.remove`, and
+`PendingFlows.discard`. The web layer calls `create`,
 `pop`, `paths`, the read-only `has_token` and `awaiting`, and the URL builders.
 """
 
@@ -40,7 +42,13 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 import httpx
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from .catalog import OAuthBlock
 
@@ -59,6 +67,9 @@ class Provider(_Strict):
     token_url: str  # https only
     authorize_params: dict[str, str] = {}
     pkce: bool = True
+    # A public client has no secret (RFC 8252). The connect and re-authorize
+    # forms then ask for no secret, and PKCE is what binds the code instead.
+    public_client: bool = False
     scope_separator: str = " "  # how the scopes join in the authorize query
     help: str = ""
     help_url: str = ""
@@ -69,6 +80,12 @@ class Provider(_Strict):
         if not value.startswith(_HTTPS):
             raise ValueError("must use the https scheme")
         return value
+
+    @model_validator(mode="after")
+    def _check_public_client(self) -> Provider:
+        if self.public_client and not self.pkce:
+            raise ValueError("public_client requires pkce true")
+        return self
 
 
 def _reason(exc: BaseException) -> str:
@@ -140,6 +157,10 @@ class HeaderSpec:
 
     name: str
     scheme: str
+    # The provider's token URL for a public client, which `finish_oauth` keeps
+    # in `refresh.json` so the supervisor refreshes with no catalog lookup.
+    # None for a confidential client: its header sink is never refreshed.
+    refresh_token_url: str | None = None
 
 
 def _write_private(path: Path, text: str) -> None:
@@ -150,10 +171,25 @@ def _write_private(path: Path, text: str) -> None:
     atomic within one directory.
     """
     tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        # A failed write leaves no stray `.tmp` holding a secret.
+        tmp.unlink(missing_ok=True)
+        raise
+    # Sync the directory too, so the rename itself survives a power loss. The
+    # supervisor orders `refresh.json` before the registry header (design D4);
+    # without this the order would hold only while the host stays up.
+    dfd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
 
 
 class CredStore:
@@ -176,6 +212,42 @@ class CredStore:
     def write_token(self, namespace: str, fmt: str, tokens: dict) -> None:
         self._ensure_dir(namespace)
         _write_private(self.paths(namespace).token, TOKEN_FORMATS[fmt](tokens))
+
+    def refresh_path(self, namespace: str) -> Path:
+        return self.root / namespace / "refresh.json"
+
+    def write_refresh(self, namespace: str, state: dict) -> None:
+        """Write `refresh.json`, the grant of a public client header sink.
+        `state` is built by `refresh_state`."""
+        self._ensure_dir(namespace)
+        _write_private(self.refresh_path(namespace), json.dumps(state))
+
+    def read_refresh(self, namespace: str) -> dict | None:
+        """The refresh state, or None when the file is absent. Raises
+        `ValueError` for a file that is not a JSON object with the refresh
+        fields, or whose `token_url` is not https: the supervisor would POST a
+        refresh token there."""
+        try:
+            text = self.refresh_path(namespace).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        state = json.loads(text)
+        if not isinstance(state, dict) or not all(
+            isinstance(state.get(k), str) for k in _REFRESH_KEYS
+        ):
+            raise ValueError("refresh.json lacks a refresh field")
+        if not state["token_url"].startswith(_HTTPS):
+            raise ValueError("refresh.json token_url must use the https scheme")
+        return state
+
+    def remove_refresh(self, namespace: str) -> None:
+        self.refresh_path(namespace).unlink(missing_ok=True)
+
+    def namespaces(self) -> list[str]:
+        """The namespaces that hold a credential directory."""
+        if not self.root.is_dir():
+            return []
+        return [p.name for p in self.root.iterdir() if p.is_dir()]
 
     def has_client(self, namespace: str) -> bool:
         return self.paths(namespace).client.exists()
@@ -226,6 +298,31 @@ class OAuthTokenError(ValueError):
     callback catches the specific type."""
 
 
+def _expires_in_seconds(tokens: dict) -> int | None:
+    """The one conversion of a token response's `expires_in`.
+
+    Two faults, not one. `expires_in` absent or JSON null means the provider
+    gave no expiry: a non-expiring token is a valid response, so the caller
+    omits its expiry field rather than guess one. A present-but-unparseable
+    value is malformed, so refuse it. The absent test is `is None`, not
+    truthiness, so an integer `0` is a valid zero-second expiry, not an
+    omission. `int` keeps a numeric string like "3600", which some providers
+    send and the child accepts.
+    """
+    raw = tokens.get("expires_in")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (ValueError, TypeError, OverflowError):
+        # OverflowError: JSON `1e400` parses to float inf, and int(inf)
+        # overflows. A non-integer, an infinity, and a mangled string are
+        # all one fault here: a value MCP Flow cannot turn into an expiry.
+        raise OAuthTokenError(
+            "the token response has a non-numeric expires_in"
+        ) from None
+
+
 def _google_credentials(tokens: dict) -> dict:
     # The `google-auth-library` credentials object: `expires_in` becomes
     # `expiry_date`, the epoch time in milliseconds the access token expires.
@@ -238,36 +335,73 @@ def _google_credentials(tokens: dict) -> dict:
         for k in ("access_token", "refresh_token", "scope", "token_type")
         if k in tokens
     }
-    # Two faults, not one. `expires_in` absent or JSON null means the provider
-    # gave no expiry: a non-expiring token is a valid response, so omit the
-    # field rather than guess one. A present-but-unparseable value is malformed,
-    # so refuse it. The absent test is `is None`, not truthiness, so an integer
-    # `0` is a valid zero-second expiry, not an omission. `int` keeps a numeric
-    # string like "3600", which some providers send and the child accepts.
-    raw = tokens.get("expires_in")
-    if raw is not None:
-        try:
-            seconds = int(raw)
-        except (ValueError, TypeError, OverflowError):
-            # OverflowError: JSON `1e400` parses to float inf, and int(inf)
-            # overflows. A non-integer, an infinity, and a mangled string are
-            # all one fault here: a value MCP Flow cannot turn into an expiry.
-            raise OAuthTokenError(
-                "the token response has a non-numeric expires_in"
-            ) from None
+    seconds = _expires_in_seconds(tokens)
+    if seconds is not None:
         out["expiry_date"] = int(time.time() * 1000) + seconds * 1000
     return out
 
 
-def check_token_response(token_fmt: str | None, tokens: dict) -> None:
+def check_token_response(
+    token_fmt: str | None, tokens: dict, *, refresh: bool = False
+) -> None:
     """Raise `OAuthTokenError` when `tokens` cannot become the child's token
     file. A file sink builds the file in `token_fmt` and discards it; a raise
     means the response is unusable. A header sink (`token_fmt` None) builds no
-    file and passes. The callback calls this before it dispatches to
+    file and passes, unless `refresh` is true (a public client header sink):
+    then `finish_oauth` writes `refresh.json`, so its `expires_in` is checked
+    the same way, and a `refresh_token` that is present must be a non-empty
+    string. The callback calls this before it dispatches to
     `finish_oauth`, so a malformed response is refused before any credential is
     written or any child is torn down."""
     if token_fmt is not None:
         TOKEN_FORMATS[token_fmt](tokens)
+    if refresh:
+        _expires_in_seconds(tokens)
+        rt = tokens.get("refresh_token")
+        if rt is not None and (not isinstance(rt, str) or not rt):
+            raise OAuthTokenError("the token response has a malformed refresh_token")
+
+
+# The fields `refresh.json` must hold as strings. `expires_at` is optional: a
+# response without `expires_in` schedules no refresh. `header_name` and
+# `header_scheme` let `startup` and the refresh task rebuild the header with no
+# catalog lookup.
+_REFRESH_KEYS = (
+    "client_id",
+    "token_url",
+    "access_token",
+    "refresh_token",
+    "header_name",
+    "header_scheme",
+)
+
+
+def refresh_state(
+    client_id: str,
+    token_url: str,
+    header: HeaderSpec,
+    tokens: dict,
+    prior_refresh_token: str | None = None,
+) -> dict:
+    """The serializer of `refresh.json`. Not a `TOKEN_FORMATS` entry: no
+    child reads this file. A response without `refresh_token` keeps
+    `prior_refresh_token`. `expires_at` (epoch seconds) comes from the shared
+    `expires_in` conversion and is absent when the response has no expiry."""
+    refresh_token = tokens.get("refresh_token") or prior_refresh_token
+    if not isinstance(refresh_token, str) or not refresh_token:
+        raise OAuthTokenError("the token response has a malformed refresh_token")
+    state = {
+        "client_id": client_id,
+        "token_url": token_url,
+        "access_token": tokens["access_token"],
+        "refresh_token": refresh_token,
+        "header_name": header.name,
+        "header_scheme": header.scheme,
+    }
+    seconds = _expires_in_seconds(tokens)
+    if seconds is not None:
+        state["expires_at"] = int(time.time()) + seconds
+    return state
 
 
 def _google_auth_library(tokens: dict) -> str:
@@ -420,11 +554,23 @@ def token_request(
         "code": code,
         "redirect_uri": redirect_uri,
         "client_id": flow.client.client_id,
-        "client_secret": flow.client.client_secret,
     }
+    # A public client has no secret; an empty field would read as a wrong one.
+    if flow.client.client_secret:
+        body["client_secret"] = flow.client.client_secret
     if provider.pkce:
         body["code_verifier"] = flow.code_verifier
     return provider.token_url, body
+
+
+def refresh_request(state: dict) -> tuple[str, dict[str, str]]:
+    """The refresh POST of a public client, from `refresh.json` alone. No
+    `client_secret`: only a public client has a refresh file."""
+    return state["token_url"], {
+        "grant_type": "refresh_token",
+        "refresh_token": state["refresh_token"],
+        "client_id": state["client_id"],
+    }
 
 
 def http_client() -> httpx.AsyncClient:

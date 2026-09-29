@@ -63,8 +63,8 @@ def test_local_provider_overrides_builtin(tmp_path):
         "help": "local help",
     })
     reg = ProviderRegistry.load(PROVIDERS_DIR, local)
-    # Built-in ships google + linear; the local file overrides google.
-    assert reg.ids() == frozenset({"google", "linear"})
+    # Built-in ships google, linear, and moomoo; the local file overrides google.
+    assert reg.ids() == frozenset({"google", "linear", "moomoo"})
     assert reg.get("google").help == "local help"
 
 

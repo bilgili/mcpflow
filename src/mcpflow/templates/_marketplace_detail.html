@@ -34,8 +34,10 @@
     <p><a href="{{ provider.help_url }}" target="_blank" rel="noopener">How to create the client</a></p>
     <label>Client ID <span class="req">required</span></label>
     <input name="client_id" autocomplete="off" spellcheck="false">
+    {% if not provider.public_client %}
     <label>Client secret <span class="req">required</span></label>
     <input name="client_secret" type="password" autocomplete="off" spellcheck="false">
+    {% endif %}
     {% else %}
     {% if e.auth == 'oauth' %}
     <p class="notice">{{ e.vendor }} signs in with OAuth. MCP Flow cannot complete an OAuth sign-in yet.{% if e.spec.kind == 'remote' %} Enter a bearer token below if {{ e.vendor }} issues one.{% endif %}</p>

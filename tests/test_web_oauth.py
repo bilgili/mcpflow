@@ -703,3 +703,130 @@ def test_pending_header_child_shows_mark(server_factory):
     client.close()
     assert "awaiting authorization" in page
     assert "awaiting authorization" in window
+
+
+# --- header-sink-token-refresh: public client (moomoo) ------------------------
+
+
+def _moomoo_child(**over):
+    # A fake stdio child stands in for the remote moomoo server; its catalog
+    # tag is `moomoo`, so the callback treats it as the header sink entry.
+    fields = {"enabled": False, "catalog": "moomoo", "oauth_pending": True}
+    fields.update(over)
+    return fake_child_spec("moomoo", "good", **fields)
+
+
+def test_public_client_form_has_no_secret_field(server_factory):
+    server = server_factory(PUBLIC_URL=PUBLIC)
+    client = server.login()
+    page = client.get("/marketplace/moomoo").text
+    client.close()
+    assert 'name="client_id"' in page
+    assert 'name="client_secret"' not in page
+    assert "POST https://webapi.moomoo.com/oauth2/register" in page
+    assert f"{PUBLIC}/oauth/callback" in page
+
+
+def test_connect_public_client_without_secret(server_factory):
+    server = server_factory(PUBLIC_URL=PUBLIC)
+    client = server.login()
+    resp = client.post(
+        "/marketplace/moomoo/connect",
+        # A posted secret is ignored for a public client.
+        data={"namespace": "moomoo", "client_id": "pub", "client_secret": "ignored"},
+    )
+    client.close()
+    assert resp.status_code == 303
+    loc = resp.headers["location"]
+    assert loc.startswith("https://webapi.moomoo.com/oauth2/authorize/confirm?")
+    query = parse_qs(urlsplit(loc).query)
+    assert "code_challenge" in query
+    assert query["scope"] == ["quote:read quote:write trade:read trade:write accid:*"]
+    reg = Registry(server.data_dir / "servers.json")
+    reg.load()
+    spec = reg.get("moomoo")
+    assert spec.oauth_pending is True and spec.enabled is False
+    assert spec.url == "https://mcp.moomoo.com/mcp" and spec.transport == "http"
+    flow = server.supervisor.flows.peek(_state_from_location(loc))
+    assert flow.client.client_secret == ""
+
+
+def test_public_client_callback_omits_secret_and_writes_refresh_file(
+    server_factory, mock_token_endpoint
+):
+    server = server_factory(seed_registry(_moomoo_child()), PUBLIC_URL=PUBLIC, CHILD_START_TIMEOUT="2")
+    flow = server.supervisor.flows.create("moomoo", "moomoo", ClientCreds("pub", ""))
+    client = server.login()
+    resp = client.get(f"/oauth/callback?state={flow.state}&code=c")
+    client.close()
+    assert resp.status_code == 303
+    body = mock_token_endpoint["body"]
+    assert set(body) == {"grant_type", "code", "redirect_uri", "client_id", "code_verifier"}
+    path = server.data_dir / "creds" / "moomoo" / "refresh.json"
+    assert path.stat().st_mode & 0o777 == 0o600
+    state = json.loads(path.read_text())
+    assert state["token_url"] == "https://webapi.moomoo.com/oauth2/token"
+    assert state["client_id"] == "pub"
+    assert state["access_token"] == "ACCESStoken123"
+    assert state["refresh_token"] == "REFRESHtoken456"
+    assert "expires_at" in state
+    assert not (server.data_dir / "creds" / "moomoo" / "client.json").exists()
+    assert not (server.data_dir / "creds" / "moomoo" / "token.json").exists()
+    reg = Registry(server.data_dir / "servers.json")
+    reg.load()
+    assert reg.get("moomoo").headers["Authorization"] == "Bearer ACCESStoken123"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [{"expires_in": "later"}, {"refresh_token": 12345}, {"refresh_token": ""}],
+    ids=["expires_in", "refresh_token_not_str", "refresh_token_empty"],
+)
+def test_public_client_malformed_expiry_refused(server_factory, mock_token_endpoint, bad):
+    server = server_factory(seed_registry(_moomoo_child()), PUBLIC_URL=PUBLIC, CHILD_START_TIMEOUT="2")
+    mock_token_endpoint["json"] = {**mock_token_endpoint["json"], **bad}
+    flow = server.supervisor.flows.create("moomoo", "moomoo", ClientCreds("pub", ""))
+    client = server.login()
+    resp = client.get(f"/oauth/callback?state={flow.state}&code=c")
+    client.close()
+    assert resp.status_code == 400
+    assert not (server.data_dir / "creds" / "moomoo" / "refresh.json").exists()
+    reg = Registry(server.data_dir / "servers.json")
+    reg.load()
+    spec = reg.get("moomoo")
+    assert spec.headers == {} and spec.oauth_pending is True
+
+
+def _authorized_moomoo():
+    return _moomoo_child(oauth_pending=False, headers={"Authorization": "Bearer OLDtoken"})
+
+
+def test_reauth_public_client_form_has_no_secret_field(server_factory):
+    server = server_factory(seed_registry(_authorized_moomoo()), PUBLIC_URL=PUBLIC)
+    client = server.login()
+    page = client.get("/servers/moomoo/reauthorize").text
+    client.close()
+    assert 'name="client_id"' in page and 'name="client_secret"' not in page
+
+
+def test_reauth_public_client_without_secret(server_factory):
+    server = server_factory(seed_registry(_authorized_moomoo()), PUBLIC_URL=PUBLIC)
+    client = server.login()
+    resp = client.post("/servers/moomoo/reauthorize", data={"client_id": "pub"})
+    client.close()
+    assert resp.status_code == 303
+    loc = resp.headers["location"]
+    assert loc.startswith("https://webapi.moomoo.com/oauth2/authorize/confirm?")
+    assert "code_challenge" in parse_qs(urlsplit(loc).query)
+
+
+def test_reauth_pending_header_sink_is_not_authorized(server_factory):
+    # "Authorized" for a header sink: the header is set AND not pending.
+    server = server_factory(
+        seed_registry(_moomoo_child(headers={"Authorization": "Bearer OLDtoken"})),
+        PUBLIC_URL=PUBLIC,
+    )
+    client = server.login()
+    resp = client.post("/servers/moomoo/reauthorize", data={"client_id": "pub"})
+    client.close()
+    assert resp.status_code == 400 and "not yet authorized" in resp.text

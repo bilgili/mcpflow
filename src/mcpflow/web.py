@@ -1038,17 +1038,20 @@ def build_routes(
     ) -> Response:
         # A missing field re-renders the detail with 400 and writes nothing.
         # The secret is never placed back into the re-rendered form.
-        client_id = (form.get("client_id") or "").strip()
-        client_secret = (form.get("client_secret") or "").strip()
-        if not client_id:
-            return _connect_error(entry, namespace, None, "client_id is required", request)
-        if not client_secret:
-            return _connect_error(
-                entry, namespace, None, "client_secret is required", request
-            )
         provider = _providers().get(entry.oauth.provider)
         if provider is None:  # pragma: no cover - catalog skips an unknown provider
             return _connect_error(entry, namespace, None, "unknown provider", request)
+        client_id = (form.get("client_id") or "").strip()
+        # A public client has no secret: a posted one is ignored.
+        client_secret = (
+            "" if provider.public_client else (form.get("client_secret") or "").strip()
+        )
+        if not client_id:
+            return _connect_error(entry, namespace, None, "client_id is required", request)
+        if not client_secret and not provider.public_client:
+            return _connect_error(
+                entry, namespace, None, "client_secret is required", request
+            )
         # `Supervisor.add` registers the namespace and writes the file sink's
         # client file, in that order and with no await between. The pair lives
         # there, not here: the supervisor owns every credential call, and a
@@ -1138,15 +1141,22 @@ def build_routes(
             token_fmt = (
                 None if entry.oauth.header is not None else entry.oauth.token_file.format
             )
+            # A public client header sink keeps its grant in `refresh.json`,
+            # so its `expires_in` is checked like a file sink's.
+            refreshable = entry.oauth.header is not None and provider.public_client
             try:
-                _oauth.check_token_response(token_fmt, token_json)
+                _oauth.check_token_response(token_fmt, token_json, refresh=refreshable)
             except _oauth.OAuthTokenError as exc:
                 flows.pop(state)
                 return _oauth_error(request, str(exc))
             if entry.oauth.header is not None:
                 # Header sink: no file; finish_oauth writes the token into the
                 # registry Authorization header in one update.
-                spec = HeaderSpec(entry.oauth.header.name, entry.oauth.header.scheme)
+                spec = HeaderSpec(
+                    entry.oauth.header.name,
+                    entry.oauth.header.scheme,
+                    provider.token_url if refreshable else None,
+                )
                 ok = await supervisor.finish_oauth(
                     flow, None, token_json, reauth=flow.reauth, header=spec
                 )
@@ -1231,17 +1241,20 @@ def build_routes(
             authorized = creds.has_token(ns)
         if not authorized:
             return bad("this server is not yet authorized; connect it first")
-        client_id = (form.get("client_id") or "").strip()
-        client_secret = (form.get("client_secret") or "").strip()
-        if not client_id:
-            return bad("client_id is required")
-        if not client_secret:
-            return bad("client_secret is required")
-        if flows.has_open(ns):
-            return bad("a re-authorization is already in progress")
         provider = _providers().get(entry.oauth.provider)
         if provider is None:  # pragma: no cover - catalog skips an unknown provider
             return bad("unknown provider")
+        client_id = (form.get("client_id") or "").strip()
+        # A public client has no secret: a posted one is ignored.
+        client_secret = (
+            "" if provider.public_client else (form.get("client_secret") or "").strip()
+        )
+        if not client_id:
+            return bad("client_id is required")
+        if not client_secret and not provider.public_client:
+            return bad("client_secret is required")
+        if flows.has_open(ns):
+            return bad("a re-authorization is already in progress")
         # The client rides in the flow's memory; nothing is written until the
         # callback succeeds, so a failed re-auth leaves the old token in place.
         client = ClientCreds(client_id=client_id, client_secret=client_secret)

@@ -12,13 +12,16 @@ import contextlib
 import itertools
 import logging
 import os
+import re
 import threading
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TextIO
 
+import httpx
 from fastmcp import Client, FastMCP
 from fastmcp.client.transports import (
     ClientTransport,
@@ -51,7 +54,16 @@ from .actions import (
     secret_literals,
 )
 from .config import Settings
-from .oauth import ClientCreds, CredStore, HeaderSpec, PendingFlow, PendingFlows
+from . import oauth as _oauth
+from .oauth import (
+    ClientCreds,
+    CredStore,
+    HeaderSpec,
+    PendingFlow,
+    PendingFlows,
+    refresh_request,
+    refresh_state,
+)
 from .registry import (
     PINNED_ADMIN_TOOLS,
     RESERVED_NAMESPACE,
@@ -107,6 +119,20 @@ LEASE_DRAIN_TIMEOUT: float = 5.0  # seconds, per teardown
 # `_teardown` owns `open -> closing -> closed`. `acquire` and the proxy factory
 # grant only while the state is `open`.
 SessionState = Literal["starting", "open", "closing", "closed"]
+
+# Header sink token refresh (design D6). The task fires `max(60 s, lifetime/10)`
+# before `expires_at`; a transient failure retries from 30 s, doubling to a
+# 300 s cap, and keeps retrying past the expiry.
+REFRESH_MIN_MARGIN: float = 60.0
+REFRESH_RETRY_START: float = 30.0
+REFRESH_RETRY_CAP: float = 300.0
+# The characters of an OAuth error code; anything else a provider sends is
+# dropped before it reaches `last_error`.
+_OAUTH_ERROR_JUNK = re.compile(r"[^A-Za-z0-9_.-]")
+_OAUTH_ERROR_MAX = 64
+# Clock and sleep of the refresh task, module-level so a test drives them.
+_now = time.time
+_sleep = asyncio.sleep
 
 
 def scrub_secrets(text: str, secrets: Iterable[str]) -> str:
@@ -454,6 +480,16 @@ class Child:
     lock: asyncio.Lock
     task: asyncio.Task | None
     session: ChildSession | None
+    # The grant generation of a header sink (design D5). `finish_oauth` for a
+    # header sink and `remove` bump it; a refresh result whose captured value
+    # differs is discarded. In memory only: it restarts at 0 on a re-add, so
+    # the refresh task also checks the `Child` object's identity.
+    grant: int = 0
+    # The message of a refresh the provider rejected (design D6). Set when the
+    # refresh task stops on a rejection; cleared only by `finish_oauth`. In
+    # memory only. `_run_start` restores it as `last_error` on a successful
+    # start, so a restart before the expiry does not hide "re-authorize".
+    refresh_rejected: str | None = None
 
 
 @dataclass(frozen=True)
@@ -573,6 +609,9 @@ class Supervisor:
         # child key. None of the four may reach the built-in mount.
         self._builtin: FastMCP | None = None
         self._builtin_visibility: Visibility | None = None
+        # One header sink refresh task per namespace that holds a
+        # `refresh.json` (design D7). A task removes only its own entry.
+        self._refresh_tasks: dict[str, asyncio.Task] = {}
 
     # --- environment, command, transport ---------------------------------
 
@@ -791,6 +830,27 @@ class Supervisor:
     # --- lifecycle -------------------------------------------------------
 
     async def startup(self) -> None:
+        # Before any child starts (design D7). First drop the credential of
+        # every namespace the registry does not list: a crash between
+        # `registry.remove` and `creds.remove` leaves a live refresh token on
+        # disk otherwise (I2b).
+        for ns in self.creds.namespaces():
+            if ns not in self._children:
+                self.creds.remove(ns)
+        # Then make each header follow its `refresh.json` (D4, I5): a crash
+        # between the file write and the header write left the old token in
+        # the registry. No network call. Then one task per file, enabled or
+        # not: a disabled child keeps its grant alive.
+        for ns, child in self._children.items():
+            try:
+                state = self.creds.read_refresh(ns)
+            except ValueError:
+                logger.warning("ignoring an unreadable refresh.json for %s", ns)
+                continue
+            if state is None:
+                continue
+            self._apply_refresh_header(child, state)
+            self._start_refresh_task(ns, child)
         for child in self._children.values():
             if child.spec.enabled:
                 child.status = "starting"
@@ -799,8 +859,207 @@ class Supervisor:
                 child.status = "stopped"
 
     async def shutdown(self) -> None:
+        tasks = list(self._refresh_tasks.values())
+        self._refresh_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         for child in list(self._children.values()):
             await self._teardown(child)
+
+    # --- header sink token refresh (design D1-D8) -----------------------
+
+    def _apply_refresh_header(self, child: Child, state: dict) -> None:
+        """Derive the registry header, and the live transport header, from
+        a `refresh.json` state. The caller holds the child lock, or runs in
+        `startup` before any task. No teardown, no restart (D8): fastmcp reads
+        `transport.headers` at each connect, and every lease and proxy call
+        builds a new `Client` over `child.transport`."""
+        ns = child.spec.namespace
+        name = state["header_name"]
+        value = f"{state['header_scheme']} {state['access_token']}"
+        remember_log_secrets(
+            [state["access_token"], state["refresh_token"], value]
+        )
+        self.registry.set_oauth_header(ns, name, value)
+        child.spec = self.registry.get(ns)
+        headers = getattr(child.transport, "headers", None)
+        if isinstance(headers, dict):
+            headers[name] = value
+
+    def _cancel_refresh_task(self, namespace: str) -> None:
+        """Cancel the namespace's task, if any. No await, so it is atomic with
+        the caller's lock hold."""
+        old = self._refresh_tasks.pop(namespace, None)
+        if old is not None:
+            old.cancel()
+
+    def _start_refresh_task(self, namespace: str, child: Child) -> None:
+        """Start the task of the current grant. The caller has cancelled any
+        previous task and knows `refresh.json` exists. No await."""
+        self._refresh_tasks[namespace] = asyncio.create_task(
+            self._refresh_loop(namespace, child, child.grant)
+        )
+
+    def _refresh_current(self, namespace: str, child: Child, grant: int) -> bool:
+        # I1: apply only for the same grant of the same `Child` object.
+        return self._children.get(namespace) is child and child.grant == grant
+
+    async def _refresh_loop(self, namespace: str, child: Child, grant: int) -> None:
+        """Keep one header sink grant alive (design D5, D6).
+
+        Each round sleeps until `expires_at - max(60, lifetime / 10)`, POSTs
+        the refresh without the child lock, then applies under the lock only
+        when the captured grant and `Child` are still current. The lifetime is
+        measured from when the task read the state, so a state read at startup
+        uses the remaining lifetime (a later, still-safe margin).
+
+        The first round may fire at once (a past expiry at startup). Every
+        later round sleeps at least `REFRESH_RETRY_START`, so a provider that
+        issues a very short `expires_in` cannot drive back-to-back refreshes.
+        An unexpected exception in a round (a disk error on the write, an
+        unusable URL, a corrupt `expires_at`) never ends the task: the round
+        records a scrubbed error with the exception class only, and the next
+        round retries after the same 30 s to 300 s backoff.
+        """
+        try:
+            try:
+                state = self.creds.read_refresh(namespace)
+            except ValueError:
+                logger.warning("ignoring an unreadable refresh.json for %s", namespace)
+                return
+            read_at = _now()
+            floor = 0.0
+            backoff: float | None = None
+            while state is not None and state.get("expires_at") is not None:
+                try:
+                    if backoff is None:
+                        expires_at = state["expires_at"]
+                        margin = max(REFRESH_MIN_MARGIN, (expires_at - read_at) / 10)
+                        wait = max(floor, expires_at - margin - _now())
+                    else:
+                        wait = backoff
+                    await _sleep(wait)
+                    floor = REFRESH_RETRY_START
+                    state = await self._refresh_once(namespace, child, grant, state)
+                    read_at = _now()
+                    backoff = None
+                except Exception as exc:  # noqa: BLE001 -- the task must outlive any fault; CancelledError is not an Exception
+                    backoff = (
+                        REFRESH_RETRY_START
+                        if backoff is None
+                        else min(backoff * 2, REFRESH_RETRY_CAP)
+                    )
+                    # The class name only: the message can carry the URL or
+                    # the body.
+                    name = type(exc).__name__
+                    logger.warning(
+                        "token refresh for %s failed (%s); retrying in %.0fs",
+                        namespace, name, backoff,
+                    )
+                    async with child.lock:
+                        if self._refresh_current(namespace, child, grant):
+                            self._record_error(
+                                child,
+                                f"refresh failed ({name}); retrying",
+                                self._secrets_of(child.spec),
+                            )
+        finally:
+            if self._refresh_tasks.get(namespace) is asyncio.current_task():
+                del self._refresh_tasks[namespace]
+
+    async def _refresh_once(
+        self, namespace: str, child: Child, grant: int, state: dict
+    ) -> dict | None:
+        """One refresh with retries. Returns the applied state, or None to
+        stop the task (rejected, or the grant is no longer current). Never logs
+        a body or a token."""
+        delay = REFRESH_RETRY_START
+        while True:
+            if not self._refresh_current(namespace, child, grant):
+                return None
+            url, body = refresh_request(state)
+            resp = None
+            try:
+                # Through the module, so a test can `monkeypatch` the factory.
+                async with _oauth.http_client() as client:
+                    resp = await client.post(url, data=body)
+            except httpx.HTTPError:
+                # A transport error or a timeout. The exception can carry the
+                # URL and the body, so it is not logged.
+                pass
+            status = resp.status_code if resp is not None else None
+            if status is None or status in (408, 429) or status >= 500:
+                logger.info(
+                    "token refresh for %s failed (%s); retrying in %.0fs",
+                    namespace, status or "transport error", delay,
+                )
+                await _sleep(delay)
+                delay = min(delay * 2, REFRESH_RETRY_CAP)
+                continue
+            tokens: object = None
+            if status // 100 == 2:
+                try:
+                    tokens = resp.json()
+                except ValueError:
+                    tokens = None
+            if (
+                isinstance(tokens, dict)
+                and isinstance(tokens.get("access_token"), str)
+                and tokens["access_token"]
+            ):
+                # Mask the new tokens before anything else can log them.
+                remember_log_secrets(
+                    [tokens["access_token"], str(tokens.get("refresh_token") or "")]
+                )
+                try:
+                    new_state = refresh_state(
+                        state["client_id"],
+                        state["token_url"],
+                        HeaderSpec(state["header_name"], state["header_scheme"]),
+                        tokens,
+                        prior_refresh_token=state["refresh_token"],
+                    )
+                except _oauth.OAuthTokenError:
+                    new_state = None
+                if new_state is not None:
+                    async with child.lock:
+                        if not self._refresh_current(namespace, child, grant):
+                            return None
+                        # D4: the file first, then the header.
+                        self.creds.write_refresh(namespace, new_state)
+                        self._apply_refresh_header(child, new_state)
+                    logger.info("refreshed the access token of %s", namespace)
+                    return new_state
+            # Any other status, or a 2xx this task cannot use: stop, keep the
+            # file, and tell the admin to re-authorize.
+            # The current tokens join the scrub set: a provider may echo the
+            # refresh token in its error word.
+            secrets = [
+                *self._secrets_of(child.spec),
+                state["access_token"],
+                state["refresh_token"],
+            ]
+            error = ""
+            if resp is not None and status // 100 != 2:
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    payload = None
+                if isinstance(payload, dict):
+                    error = _OAUTH_ERROR_JUNK.sub("", str(payload.get("error") or ""))
+                    # Scrub before the cut, or the cut leaves a token prefix
+                    # that no longer matches the secret.
+                    error = scrub_secrets(error, secrets)[:_OAUTH_ERROR_MAX]
+            async with child.lock:
+                if self._refresh_current(namespace, child, grant):
+                    self._record_error(
+                        child,
+                        f"refresh rejected ({status} {error}); re-authorize",
+                        secrets,
+                    )
+                    child.refresh_rejected = child.last_error
+            return None
 
     def children(self) -> list[Child]:
         return list(self._children.values())
@@ -883,7 +1142,9 @@ class Supervisor:
                 child.provider = provider
                 self.table.providers.append(provider)
                 child.started_at = datetime.now(UTC)
-                child.last_error = None
+                # The one clearer of `last_error`: a rejected refresh stays
+                # visible until a re-authorization clears it.
+                child.last_error = child.refresh_rejected
                 child.status = "running"
                 # Open the generation in the same locked block that publishes
                 # the provider and sets `running`, so a lease or a proxy call is
@@ -1183,6 +1444,11 @@ class Supervisor:
                 # of that namespace runs", and it races only the file of the
                 # child being removed.
                 self.flows.discard(namespace)
+                # Retire the grant and its refresh task before the teardown
+                # (design D7, I2): a refresh response that arrives later sees
+                # the bump and writes nothing.
+                child.grant += 1
+                self._cancel_refresh_task(namespace)
                 self.creds.remove(namespace)
                 # Drop the child before the first await, so `children()` never
                 # sees a child that is half torn down. Nothing between the
@@ -1236,8 +1502,10 @@ class Supervisor:
 
         Header sink (`header` set, `token_fmt` None): ONE `registry.set_oauth_header`
         sets the child's `Authorization` header AND `oauth_pending=False`, so the
-        token and the awaiting flag flip in one atomic `servers.json` write. No
-        file is written.
+        token and the awaiting flag flip in one atomic `servers.json` write.
+        A public client writes `refresh.json` before that write; every other
+        header sink callback deletes `refresh.json`. The grant is bumped and
+        the old refresh task cancelled before any write.
 
         Then, for connect enable a `stopped` child; for re-auth restart only a
         child the registry still says is enabled (a disable during the flow is
@@ -1262,16 +1530,48 @@ class Supervisor:
                 # Removed or expired during the exchange: write nothing.
                 return False
             if header is not None:
+                # A new grant (D5), retired first: a refresh in flight for the
+                # old grant is discarded, and the old task is cancelled before
+                # any write, so a failing write cannot leave it live.
+                child.grant += 1
+                self._cancel_refresh_task(namespace)
+                # The rejection belonged to the old grant.
+                if child.last_error is not None and child.last_error == child.refresh_rejected:
+                    child.last_error = None
+                child.refresh_rejected = None
+                # Public client (design D3, D4): `refresh.json` first, in this
+                # lock hold, then the header. Every other header sink callback
+                # deletes the file: no refresh token, or a provider that is now
+                # confidential. A stale file would otherwise let a later task
+                # overwrite this grant's header with the old grant.
+                wrote_refresh = header.refresh_token_url is not None and bool(
+                    tokens.get("refresh_token")
+                )
+                if wrote_refresh:
+                    self.creds.write_refresh(
+                        namespace,
+                        refresh_state(
+                            flow.client.client_id,
+                            header.refresh_token_url,
+                            header,
+                            tokens,
+                        ),
+                    )
+                else:
+                    self.creds.remove_refresh(namespace)
                 # Header sink: one registry write sets the header AND clears
                 # oauth_pending, so the token and the awaiting flag flip in one
                 # atomic write. `update` preserves oauth_pending, so this uses
-                # the dedicated `set_oauth_header`. No file is written.
-                self.registry.set_oauth_header(
-                    namespace,
-                    header.name,
-                    f"{header.scheme} {tokens['access_token']}",
+                # the dedicated `set_oauth_header`. A confidential client
+                # writes no file.
+                value = f"{header.scheme} {tokens['access_token']}"
+                remember_log_secrets(
+                    [tokens["access_token"], str(tokens.get("refresh_token") or ""), value]
                 )
+                self.registry.set_oauth_header(namespace, header.name, value)
                 child.spec = self.registry.get(namespace)
+                if wrote_refresh:
+                    self._start_refresh_task(namespace, child)
             else:
                 if reauth:
                     # Stop the child before writing. A child that refreshes its
@@ -1777,9 +2077,10 @@ class Supervisor:
         when the operation began, not `child.spec`, because a concurrent
         `update` can swap `child.spec` to a different generation while the
         operation runs; the error text belongs to the generation that produced
-        it.
+        it. The process-wide log secrets join the set, so a token that a
+        concurrent refresh rotated while the operation ran is masked too.
         """
-        child.last_error = scrub_secrets(text, secrets)
+        child.last_error = scrub_secrets(text, [*secrets, *_LOG_SECRETS])
 
     def log_tail(self, namespace: str, lines: int = 100) -> str:
         child = self.get(namespace)

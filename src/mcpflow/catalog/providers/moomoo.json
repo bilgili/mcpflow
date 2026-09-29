@@ -1,0 +1,10 @@
+{
+  "id": "moomoo",
+  "name": "moomoo",
+  "authorize_url": "https://webapi.moomoo.com/oauth2/authorize/confirm",
+  "token_url": "https://webapi.moomoo.com/oauth2/token",
+  "pkce": true,
+  "public_client": true,
+  "help": "moomoo uses a public OAuth client with no secret. Register one with POST https://webapi.moomoo.com/oauth2/register, and give the redirect URI shown here as its redirect URI. Copy the client id it returns.",
+  "help_url": "https://webapi.moomoo.com/oauth2/register"
+}

@@ -129,6 +129,8 @@ def test_child_fields():
         "lock",
         "task",
         "session",
+        "grant",
+        "refresh_rejected",
     ]
 
 
@@ -362,7 +364,9 @@ def test_header_sink_and_spec():
     from mcpflow import catalog
     assert catalog.HeaderSink().name == "Authorization"
     assert catalog.HeaderSink().scheme == "Bearer"
-    assert [f.name for f in dataclasses.fields(oauth.HeaderSpec)] == ["name", "scheme"]
+    assert [f.name for f in dataclasses.fields(oauth.HeaderSpec)] == [
+        "name", "scheme", "refresh_token_url",
+    ]
     assert catalog.OAuthBlock.model_fields["client_file"].default is None
     assert catalog.OAuthBlock.model_fields["token_file"].default is None
     assert catalog.OAuthBlock.model_fields["header"].default is None

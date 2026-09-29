@@ -21,7 +21,7 @@ from mcpflow.registry import RegistryError
 # The known names the web layer passes at load so the built-in `gmail` oauth
 # entry is not skipped. A bad provider or format name still skips its file.
 KNOWN = {
-    "providers": frozenset({"google", "linear"}),
+    "providers": frozenset({"google", "linear", "moomoo"}),
     "client_formats": CLIENT_FORMATS,
     "token_formats": TOKEN_FORMATS,
 }
