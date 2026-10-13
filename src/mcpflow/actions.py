@@ -8,10 +8,11 @@ page cannot mask its secrets.
 
 `ActionScopeFilter` sits innermost in every child chain and removes every
 tagged tool from a session whose `AccessToken` lacks the `admin` scope, on the
-named list and the named call. `AuthorizedHashProvider` sits outermost and
-re-applies the same decision to the hashed and app dispatch paths, which
-`get_tool_by_hash` and `get_app_tool` would otherwise take past every
-transform. Together they fail closed for every tagged tool on every path.
+named list and the named call. `AuthorizedHashProvider` sits outermost. On
+the hashed path the chain's own `get_tool_by_hash` template applies the same
+transforms once, and the provider adds the mute check. On the app path, which
+`get_app_tool` takes past every transform, it re-applies the named decision.
+Together they fail closed for every tagged tool on every path.
 `ActionScopeFilter` is not a copy of `admin_mcp.ScopeFilter`, which hides
 every component: a child's untagged tools stay published.
 
@@ -29,7 +30,7 @@ import math
 from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastmcp import FastMCP
 from fastmcp.server.auth.auth import AccessToken
@@ -40,6 +41,9 @@ from fastmcp.server.transforms.visibility import is_enabled
 from fastmcp.tools.base import Tool, ToolResult
 from mcp.server.auth.middleware.auth_context import auth_context_var
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+
+if TYPE_CHECKING:
+    from .identity import User
 
 ACTION_META_KEY: str = "mcpflow"
 ADMIN_SCOPE: str = "admin"
@@ -237,8 +241,9 @@ class ActionScopeFilter(Transform):
     """Remove every tagged tool from a non-admin session on the named path.
 
     Fails closed: no token is not admin, and a clause violator is hidden like
-    an action. `AuthorizedHashProvider` closes the hashed and app paths, so the
-    filter no longer needs a hash-reachable exception: it hides every tagged
+    an action. On the hashed path the chain's own template runs this filter,
+    and `AuthorizedHashProvider` closes the app path, so the filter no longer
+    needs a hash-reachable exception: it hides every tagged
     tool. `_hides` is the one predicate of both seams; `get_tool` resolves
     first, because the verdict needs the tool's meta.
     """
@@ -268,17 +273,25 @@ class ActionScopeFilter(Transform):
 
 
 class AuthorizedHashProvider(Provider):
-    """Re-apply the child chain's authorization to the hashed and app paths.
+    """Apply the child chain's authorization to the hashed and app paths.
+
+    This provider wraps the whole child chain and delegates every ordinary
+    method to it, so the named `list_tools` and `get_tool` are unchanged.
 
     `FastMCP.call_tool` resolves a `<hash>_<name>` call through
-    `get_tool_by_hash`, and an MCP-Apps client resolves through `get_app_tool`.
-    Both read the raw tool and apply no transform (`Provider._get_tool`,
-    `_WrappedProvider.get_tool_by_hash`), so the namespace transform, the
-    visibility transform, and `ActionScopeFilter` never run on those paths.
-    This provider wraps the whole child chain and delegates every ordinary
-    method to it, so the named `list_tools` and `get_tool` are unchanged. It
-    overrides the two transform-bypassing methods and re-runs the chain's named
-    decision on the tool they resolve, so scope and mute guard those paths too.
+    `get_tool_by_hash`. Since FastMCP 4.0.11 that is a template: the chain's
+    own template applies the namespace transform, the visibility mark, and
+    `ActionScopeFilter` once, and returns the transformed tool. This provider
+    supplies only the two hooks: `_get_tool_by_hash` asks the chain, and
+    `_check_hashed_target` refuses a muted tool. `CallerRouter._passes` stays
+    the main mute check on that path; this hook is the kill switch at the
+    provider seam (D6).
+
+    An MCP-Apps client resolves through `get_app_tool`, which still reads the
+    raw tool past every transform (`_WrappedProvider.get_app_tool`), so
+    `_authorize` re-runs the chain's named decision there.
+    `Supervisor._build_provider` wraps every child chain, action-capable or
+    not (D6), so the global mute covers the hashed and app paths of each one.
     """
 
     def __init__(self, chain: Provider, namespace: str) -> None:
@@ -323,26 +336,33 @@ class AuthorizedHashProvider(Provider):
         async with self._chain.lifespan():
             yield
 
-    # The two transform-bypassing paths: authorize the tool they resolve.
-    async def get_tool_by_hash(self, tool_hash: str, tool_name: str) -> Tool | None:
-        raw = await self._chain.get_tool_by_hash(tool_hash, tool_name)
-        return await self._authorize(raw)
+    # The hashed path: hooks of the base `get_tool_by_hash` template. The chain
+    # answers already transformed; the template re-enters `get_tool`, whose
+    # bottom answers `_check_hashed_target(found)` here.
+    async def _get_tool_by_hash(self, tool_hash: str, tool_name: str) -> Tool | None:
+        return await self._chain.get_tool_by_hash(tool_hash, tool_name)
 
+    async def _check_hashed_target(self, tool: Tool) -> Tool | None:
+        return tool if is_enabled(tool) else None
+
+    # The app path still bypasses every transform: authorize the tool it resolves.
     async def get_app_tool(self, app_name: str, tool_name: str) -> Tool | None:
         raw = await self._chain.get_app_tool(app_name, tool_name)
         return await self._authorize(raw)
 
     async def _authorize(self, raw: Tool | None) -> Tool | None:
-        """Re-run the named-path decision on a hash- or app-resolved tool.
+        """Re-run the named-path decision on an app-resolved tool.
 
-        `raw` carries the bare child name, so the named lookup uses the
-        namespaced display name. `chain.get_tool` runs the namespace transform,
-        the visibility transform (which marks a muted tool disabled), and
-        `ActionScopeFilter` (which drops a tagged tool for a non-admin caller,
-        reading `get_access_token()`). `is_enabled` closes the mute-bypass: the
-        server runs a hash-resolved tool with no enabled check, and it is the
-        same reader the named path uses (`server.get_tool`), so a mute marked
-        on the visibility metadata refuses here too. A raw `Tool`/`ProxyTool`
+        It serves the app path only; the hashed path gets the chain's
+        transforms from its own template. `raw` carries the bare child name,
+        so the named lookup uses the namespaced display name. `chain.get_tool`
+        runs the namespace transform, the visibility transform (which marks a
+        muted tool disabled), and `ActionScopeFilter` (which drops a tagged
+        tool for a non-admin caller, reading `get_access_token()`).
+        `is_enabled` closes the mute-bypass: the server runs an app-resolved
+        tool with no enabled check, and it is the same reader the named path
+        uses (`server.get_tool`), so a mute marked on the visibility metadata
+        refuses here too. A raw `Tool`/`ProxyTool`
         carries no `enabled` attribute, so the check must read the mark, not
         the field.
         """
@@ -355,19 +375,25 @@ class AuthorizedHashProvider(Provider):
 
 
 async def call_tool_as_admin(
-    gateway: FastMCP, name: str, arguments: dict[str, Any]
+    gateway: FastMCP, name: str, arguments: dict[str, Any], user: User
 ) -> ToolResult:
-    """Call a gateway tool under an in-memory admin token.
+    """Call a gateway tool under an in-memory admin token for `user`.
 
     The UI routes sit on the outer Starlette app, outside any MCP request, so
     `get_access_token()` falls through to the SDK context variable this sets.
-    The token lives for this call only, matches no stored digest, and is reset
-    on every exit path.
+    The token names `user` as its subject (F7d), so the router resolves that
+    admin and its view. It lives for this call only, matches no stored
+    digest, and is reset on every exit path. A non-admin user is refused
+    before any token exists.
     """
-    user = AuthenticatedUser(
-        AccessToken(token="", client_id="mcpflow-ui", scopes=[ADMIN_SCOPE])
+    if not user.is_admin:
+        raise PermissionError(f"{user.id} is not an admin")
+    authenticated = AuthenticatedUser(
+        AccessToken(
+            token="", client_id="mcpflow-ui", scopes=[ADMIN_SCOPE], subject=user.id
+        )
     )
-    reset = auth_context_var.set(user)
+    reset = auth_context_var.set(authenticated)
     try:
         return await gateway.call_tool(name, arguments)
     finally:

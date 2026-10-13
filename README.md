@@ -80,6 +80,23 @@ Select a picture to open it at full size.
   </tr>
 </table>
 
+### How the dashboard loads
+
+`GET /` returns a page shell with no tools. The page then loads the tool tree
+from `/tools/tree`. The tree reads one stored tool list for each running child
+and waits for no child. Thus a slow child never delays the page.
+
+The gateway keeps the tool list of each running child. When a list is older than
+10 seconds, a load of the tree or a control answer starts a background refresh.
+The refresh also marks a dead `running` child as `failed`. While a child starts
+or a refresh runs, the tree polls every 3 seconds. `GET /api/tools` and
+`mcpflow_list_tools` read the same stored lists.
+
+When the session has ended, a request from the page gets `401` with an
+`HX-Redirect` header to `/login?next=<page>`. The htmx library then loads the
+full sign-in page, not a sign-in form inside the tool tree. A plain browser
+`GET` gets `303` to `/login`.
+
 ## Contents
 
 - [Screens](#screens)
@@ -92,6 +109,7 @@ Select a picture to open it at full size.
 - [Add a server](#add-a-server)
 - [Import from mcpmarket](#import-from-mcpmarket)
 - [API tokens](#api-tokens)
+- [Multiple users](#multiple-users)
 - [Connect an agent](#connect-an-agent)
 - [Admin API](#admin-api)
 - [Admin MCP tools](#admin-mcp-tools)
@@ -102,8 +120,9 @@ Select a picture to open it at full size.
 
 ## Install
 
-Install the package with pip. The package needs Python 3.12 or newer. The source
-is at `https://github.com/bilgili/mcpflow`.
+Install the package with pip. The package needs Python 3.12 or newer. The package
+needs `fastmcp` 4.1.0 or newer, and older than 5. Pip installs it for you. The
+source is at `https://github.com/bilgili/mcpflow`.
 
 ```sh
 pip install mcpflow
@@ -121,6 +140,10 @@ The command prints one line that starts with `pbkdf2_sha256$`. Set the line as
 `ADMIN_PASSWORD_HASH`. You can also set the clear-text `ADMIN_PASSWORD` instead,
 but the hash is safer.
 
+`ADMIN_PASSWORD_HASH` or `ADMIN_PASSWORD` owns the password of the user `admin`.
+The process sets that password from the environment at every start. To change it,
+change the environment variable and restart. See [Multiple users](#multiple-users).
+
 ## Run the server
 
 Start the gateway with `serve`. The flags override the environment variables.
@@ -130,7 +153,8 @@ export ADMIN_PASSWORD_HASH='pbkdf2_sha256$...'
 mcpflow serve --host 127.0.0.1 --port 8000 --data-dir ./data
 ```
 
-Open `http://127.0.0.1:8000/login` and log in with the admin password.
+Open `http://127.0.0.1:8000/login`. Enter the user `admin` and the admin password.
+An empty user name means `admin`.
 
 ## Run with Docker
 
@@ -143,7 +167,7 @@ docker compose up -d
 ```
 
 The compose file builds the image, maps port `8000`, and mounts a named volume
-at `/data`. Open `http://localhost:8000/login`.
+at `/data`. Open `http://localhost:8000/login`. Leave the user name empty, or enter `admin`.
 
 The named volume is `mcpflow-data`.
 
@@ -157,8 +181,8 @@ command builds the wheel and passes it to Docker through a named build context.
 | `DATA_DIR` | `./data` (Docker: `/data`) | registry, tokens, logs, caches |
 | `HOST` | `127.0.0.1` (Docker: `0.0.0.0`) | bind address |
 | `PORT` | `8000` | bind port |
-| `ADMIN_PASSWORD` | unset | clear-text admin password; hashed in memory at start |
-| `ADMIN_PASSWORD_HASH` | unset | output of `mcpflow hash-password`; wins over `ADMIN_PASSWORD` |
+| `ADMIN_PASSWORD` | unset | clear-text password of the user `admin`; hashed in memory at start |
+| `ADMIN_PASSWORD_HASH` | unset | password hash of the user `admin`; output of `mcpflow hash-password`; wins over `ADMIN_PASSWORD` |
 | `SECRET_KEY` | unset | cookie signing key; else `DATA_DIR/secret_key` |
 | `COOKIE_SECURE` | `0` | set `1` behind HTTPS |
 | `SESSION_TTL_SECONDS` | `604800` | session lifetime |
@@ -166,22 +190,43 @@ command builds the wheel and passes it to Docker through a named build context.
 | `CHILD_CACHE_TTL` | `300` | seconds a child component list serves lookups by name |
 | `LOG_LEVEL` | `INFO` | process log level |
 | `PUBLIC_URL` | unset | externally reachable base URL; else the request host |
+| `MAX_USER_SERVERS` | `20` | maximum count of servers that one non-admin user owns; `0` allows none; the admin has no limit |
+| `MAX_USER_TOKENS` | `10` | maximum count of tokens that one non-admin user holds; `0` allows none; an admin mint has no limit |
 | `UV_CACHE_DIR` | Docker: `/data/cache/uv` | uvx cache |
 | `npm_config_cache` | Docker: `/data/cache/npm` | npx cache |
 
 A child's `cache_ttl` in `servers.json` or the form overrides it; `0` disables the cache for that child.
 
+A lower `MAX_USER_SERVERS` or `MAX_USER_TOKENS` removes no existing server or token. The process starts with the existing files. The next add or mint of that user fails until the count is below the limit. A token that an admin mints for a user counts toward the limit of that user. A value that is not an integer, or that is below `0`, stops the start with an error.
+
+Behind a reverse proxy, forward the original `Host` header, with the public
+port when it is not 80 or 443. The gateway checks the `Origin` header of every
+form `POST`, sign-in and setup sign-in included. When `Origin` is present and
+its host differs from `Host`, the gateway answers `403 cross-origin request
+rejected`. An `Origin` of `null` also fails. A `POST` with no `Origin` passes.
+
+The check skips `/mcp` and `/api/`, because they take a bearer token and no
+cookie. The match uses whole path segments. `/mcp/x` is skipped. `/mcpfoo` is
+not.
+
 ## Files under `DATA_DIR`
 
 The process keeps all state under one data directory.
 
-- `servers.json`: the persisted list of child servers.
-- `tokens.json`: the API tokens. The file holds only the SHA-256 digest of each token.
+- `servers.json`: the persisted list of admin-owned child servers.
+- `user_servers.json`: the child servers that users own, with the owner and the approved revision. See [Multiple users](#multiple-users).
+- `tokens.json`: the API tokens of the user `admin`. The file holds only the SHA-256 digest of each token.
+- `user_tokens.json`: the API tokens of every other user. The file holds only the SHA-256 digest of each token.
+- `users.json`: the users and the groups. The admin role is membership of the group `admins`.
+- `rules.json`: the grant rules.
 - `secret_key`: the cookie signing key. The process creates it on first start with mode `0600`.
-- `logs/{namespace}.log`: the stderr of one child. The process truncates it on each start. The process deletes it when the secrets of the child change and when the child is removed.
-- `servers/{namespace}/`: the inline source files of one child (see Inline source servers). Directories are mode `0700`, files `0600`.
-- `creds/{namespace}/`: `client.json` and `token.json` for an OAuth child. Files are mode `0600`.
+- `logs/{ref}.log`: the stderr of one child. The process truncates it on each start. The process deletes it when the secrets of the child change and when the child is removed.
+- `servers/{ref}/`: the inline source files of one child (see Inline source servers). Directories are mode `0700`, files `0600`.
+- `creds/{ref}/`: `client.json` and `token.json` for an OAuth child. Files are mode `0600`.
 - `cache/uv` and `cache/npm`: the package caches in Docker.
+
+`{ref}` is the server reference. For an admin-owned server it is the namespace.
+For a user-owned server it is `<namespace>@<owner>`.
 
 ## Add a server
 
@@ -249,7 +294,8 @@ manage the tokens.
 A token has one scope. An `mcp` token authenticates `/mcp` only. An `admin`
 token authenticates `/api` and `/mcp`. An `admin` session on `/mcp` also sees
 the built-in admin tools (see Admin MCP tools below). The scope selector
-defaults to `mcp`.
+defaults to `mcp`. A token belongs to one user. An `admin` token works only while
+its user holds the admin role.
 
 Send the token in the `Authorization` header.
 
@@ -258,6 +304,49 @@ Authorization: Bearer mcpflow_<token>
 ```
 
 The gateway publishes every tool of a running child as `{namespace}_{tool}`.
+
+## Multiple users
+
+The gateway serves more than one user. The admin creates users and groups, and
+writes grant rules that allow or deny a server or a tool. A user sees only the
+servers and tools that the rules allow, plus the servers that the user owns. A
+non-admin user never sees a `mcpflow_*` tool.
+
+- The user `admin` always exists and always holds the admin role. The environment
+  owns its password. See [Set the admin password](#set-the-admin-password).
+- Each token belongs to one user. A non-admin user creates an `mcp` token for
+  themself on `/tokens`. See [API tokens](#api-tokens).
+- A non-admin user proposes a server on the dashboard. The server stays pending
+  until the admin approves it on `/approvals`. The registry accepts only pinned
+  code from a user: an exact package version, or a git source with a full commit
+  hash.
+- `/api` and the `mcpflow_*` tools stay admin-only.
+- The admin manages users, groups, and grant rules on `/security`. The page has
+  three sections: Users, Groups, and Rules. `/users`, `/groups`, and `/rules`
+  redirect to it.
+- A group list shows as tags. The × on a tag removes one user from one group. A
+  list of more than three shows the first three and a `+N more` control. **Edit
+  user** and **Edit members** open a picker. **Delete** of a user or a group
+  asks for confirmation.
+- The admin never sets a password. A new user is **pending** until the user
+  enters a one-time setup code on `/login/setup` and chooses a password. The
+  code ends after 7 days. A user changes the password on `/settings`.
+- **Reset password** makes the user pending and gives a new setup code. It ends
+  every session and revokes every token of that user. `POST /api/users` and
+  `POST /api/users/{id}/setup-code` return the code once, in `setup_code`.
+- An admin writes every server. A non-admin user writes only the servers that
+  the user owns. Only an admin approves a server or mutes a tool.
+- The gateway checks the acting user again just before each write. A write
+  gets `403` when the user was deleted, or lost the admin role, since the
+  request began. A refused write changes nothing.
+- An approved user server runs as the gateway process and can read `DATA_DIR`. Read
+  the residual risks before you approve one.
+- An upgrade needs no manual step. It signs every browser out once. A downgrade
+  fails closed.
+- For how the gateway masks secrets, see [Secrets](#secrets).
+
+The full design, the resolution order of the rules, the pinned forms, the risks,
+and the upgrade notes are in [docs/multi-user-access.md](docs/multi-user-access.md).
 
 ## Connect an agent
 
@@ -335,7 +424,8 @@ agent can add and restart servers itself. See "Admin MCP tools" below.
 ## Admin API
 
 The gateway serves a JSON REST API under `/api`. A script manages the same
-servers, tools, and tokens as the HTML pages. Every route needs an `admin`
+servers, tools, tokens, users, groups, grant rules, and approvals as the HTML
+pages. Every route needs an `admin`
 token in the `Authorization` header. The session cookie does not authenticate
 `/api`. An `mcp` token authenticates `/mcp` only; an `admin` token
 authenticates `/api` and `/mcp`. Create an `admin` token on `/tokens`.
@@ -356,8 +446,26 @@ authenticates `/api` and `/mcp`. Create an `admin` token on `/tokens`.
 | PUT | `/api/visibility/namespaces/{ns}` | `{"muted": bool}` | mute one namespace |
 | PUT | `/api/visibility/namespaces/{ns}/tools` | `{"tool": str, "muted": bool}` | mute one tool |
 | GET | `/api/tokens` | — | list the tokens |
-| POST | `/api/tokens` | `{"name": str, "scope"?: "mcp"\|"admin"}` | create a token, `201` |
+| POST | `/api/tokens` | `{"name": str, "scope"?: "mcp"\|"admin", "user_id"?: str}` | create a token, `201` |
 | DELETE | `/api/tokens/{id}` | — | revoke a token, `204` |
+| POST | `/api/servers/{ns}/approve` | `{"revision": str}` | approve a pending user server |
+| GET | `/api/approvals` | — | list the pending servers |
+| GET | `/api/users` | — | list the users |
+| POST | `/api/users` | `{"id": str, "name"?: str, "groups"?: [str]}` | create a pending user; the answer has `setup_code`, `201` |
+| PUT | `/api/users/{id}` | `{"groups"?: [str], "admin"?: bool}` | change the groups or the admin role |
+| POST | `/api/users/{id}/setup-code` | — | reset the password; the answer has a new `setup_code` |
+| DELETE | `/api/users/{id}` | — | delete a user, `204` |
+| GET | `/api/groups` | — | list the groups and their members |
+| POST | `/api/groups` | `{"name": str}` | create a group, `201` |
+| DELETE | `/api/groups/{name}` | — | delete a group, `204` |
+| GET | `/api/rules` | — | list the grant rules |
+| POST | `/api/rules` | `{"subject_kind": str, "subject": str, "level": str, "effect": str, "server"?: str, "tool"?: str}` | create a grant rule, `201` |
+| DELETE | `/api/rules/{id}` | — | delete a grant rule, `204` |
+
+In the server routes, `{ns}` is a server reference. The reference of an
+admin-owned server is `<namespace>`. The reference of a user-owned server is
+`<namespace>@<owner>`. The admin creates a user without a password; the user
+sets one with the setup code. See [Multiple users](#multiple-users).
 
 A `PUT /api/servers/{ns}` is a full replacement. An omitted field takes the
 `ServerSpec` default, so an omitted `enabled` starts a stopped child. Send
@@ -521,6 +629,8 @@ make test
 The project designs each change with OpenSpec. The development branch `ci`
 holds the specs under `openspec/`; the `main` branch holds the code and the
 documentation only.
+
+The changelog is [`CHANGELOG.md`](CHANGELOG.md).
 
 The logo lives at `src/mcpflow/static/logo.svg`. The web UI serves the same
 file at `/static/logo.svg`.

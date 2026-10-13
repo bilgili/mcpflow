@@ -44,25 +44,38 @@
   {% endif %}
 </div>
 {% endif %}
+{# The scope and user selectors are an admin's only. A non-admin user mints
+   an `mcp` token for themself; `AccessPolicy.mint_token` refuses any other
+   posted value, so the form shows no choice it cannot honour. #}
+{% set admin = current_user is not none and current_user.is_admin %}
 <form method="post" action="/tokens">
   <label>Name</label>
   <input name="name" placeholder="claude-desktop">
+  {% if admin %}
   <label>Scope</label>
   <select name="scope">
     <option value="mcp" selected>mcp</option>
     <option value="admin">admin</option>
   </select>
+  <label>User</label>
+  <select name="user">
+    {% for u in users %}
+    <option value="{{ u.id }}" {{ 'selected' if u.id == current_user.id }}>{{ u.id }}</option>
+    {% endfor %}
+  </select>
+  {% endif %}
   <p><button type="submit">Create token</button></p>
 </form>
 <table>
   <thead>
-    <tr><th>ID</th><th>Name</th><th>Scope</th><th>Created</th><th>Last used</th><th></th></tr>
+    <tr><th>ID</th><th>Name</th>{% if admin %}<th>User</th>{% endif %}<th>Scope</th><th>Created</th><th>Last used</th><th></th></tr>
   </thead>
   <tbody>
     {% for t in tokens %}
     <tr>
       <td><code>{{ t.id }}</code></td>
       <td>{{ t.name }}</td>
+      {% if admin %}<td>{{ t.user_id }}</td>{% endif %}
       <td>{{ t.scope }}</td>
       <td>{{ t.created_at }}</td>
       <td>{{ t.last_used_at or '—' }}</td>
@@ -72,7 +85,7 @@
     </tr>
     {% endfor %}
     {% if not tokens %}
-    <tr><td colspan="6" class="muted">No tokens yet.</td></tr>
+    <tr><td colspan="{{ 7 if admin else 6 }}" class="muted">No tokens yet.</td></tr>
     {% endif %}
   </tbody>
 </table>

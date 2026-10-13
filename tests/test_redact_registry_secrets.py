@@ -22,6 +22,7 @@ from mcpflow.registry import (
     SECRET_MASK,
     Registry,
     RegistryError,
+    ServerKey,
     ServerSpec,
     redact_secrets,
     redact_spec,
@@ -35,6 +36,11 @@ M = SECRET_MASK
 GL_TOKEN = "glpat-abc-secret-1"
 QV_TOKEN = "tok-quiver-secret-1"
 URL_KEY = "k-999999-secret"
+
+
+def K(ns: str) -> ServerKey:
+    """The admin-owned key of `ns`; its reference is `ns`."""
+    return ServerKey(None, ns)
 
 
 def _remote(ns: str = "quiver", **extra) -> ServerSpec:
@@ -51,7 +57,7 @@ def _gitlab() -> ServerSpec:
 
 
 def _reg(tmp_path, *specs) -> Registry:
-    reg = Registry(tmp_path / "servers.json")
+    reg = Registry(tmp_path / "servers.json", tmp_path / "user_servers.json")
     reg.load()
     for s in specs:
         reg.add(s)
@@ -113,10 +119,10 @@ def test_oauth_header_write_refuses_a_mask(tmp_path):
     reg = _reg(tmp_path, _remote(headers={}, oauth_pending=True))
     before = (tmp_path / "servers.json").read_text()
     with pytest.raises(RegistryError) as exc:
-        reg.set_oauth_header("quiver", "Authorization", f"Bearer {M}")
+        reg.set_oauth_header(K("quiver"), "Authorization", f"Bearer {M}")
     assert str(exc.value).startswith("headers:")
     assert (tmp_path / "servers.json").read_text() == before
-    assert reg.get("quiver").oauth_pending is True
+    assert reg.get(K("quiver")).oauth_pending is True
 
 
 def test_decoded_forms_are_scrubbed_through_the_supervisor():
@@ -143,8 +149,8 @@ def test_remote_command_line_masks_the_url():
 
 def test_redact_spec_leaves_the_stored_record_raw(tmp_path):
     reg = _reg(tmp_path, _gitlab())
-    redact_spec(reg.get("gitlab"))
-    assert reg.get("gitlab").env["GITLAB_PERSONAL_ACCESS_TOKEN"] == GL_TOKEN
+    redact_spec(reg.get(K("gitlab")))
+    assert reg.get(K("gitlab")).env["GITLAB_PERSONAL_ACCESS_TOKEN"] == GL_TOKEN
 
 
 def test_diagnostic_scrub_masks_a_url_credential():
@@ -161,14 +167,14 @@ def test_diagnostic_scrub_masks_a_url_credential():
 
 def test_echo_keeps_every_stored_secret(tmp_path):
     reg = _reg(tmp_path, _gitlab(), _remote())
-    reg.update(_body(reg.get("gitlab"), description="changed"))
-    reg.update(_body(reg.get("quiver")))
-    fresh = Registry(tmp_path / "servers.json")
+    reg.update(_body(reg.get(K("gitlab")), description="changed"))
+    reg.update(_body(reg.get(K("quiver"))))
+    fresh = Registry(tmp_path / "servers.json", tmp_path / "user_servers.json")
     fresh.load()
-    assert fresh.get("gitlab").env == {"GITLAB_PERSONAL_ACCESS_TOKEN": GL_TOKEN, "EMPTY": ""}
-    assert fresh.get("gitlab").description == "changed"
-    assert fresh.get("quiver").headers["Authorization"] == f"Bearer {QV_TOKEN}"
-    assert URL_KEY in fresh.get("quiver").url and "pw-secret" in fresh.get("quiver").url
+    assert fresh.get(K("gitlab")).env == {"GITLAB_PERSONAL_ACCESS_TOKEN": GL_TOKEN, "EMPTY": ""}
+    assert fresh.get(K("gitlab")).description == "changed"
+    assert fresh.get(K("quiver")).headers["Authorization"] == f"Bearer {QV_TOKEN}"
+    assert URL_KEY in fresh.get(K("quiver")).url and "pw-secret" in fresh.get(K("quiver")).url
     # Parse, do not grep: `_write` escapes the mask as \u2022 on disk.
     assert M not in json.dumps(
         json.loads((tmp_path / "servers.json").read_text()), ensure_ascii=False
@@ -177,12 +183,12 @@ def test_echo_keeps_every_stored_secret(tmp_path):
 
 def test_new_value_replaces_the_stored_secret(tmp_path):
     reg = _reg(tmp_path, _gitlab(), _remote())
-    reg.update(_body(reg.get("gitlab"), env={"GITLAB_PERSONAL_ACCESS_TOKEN": "glpat-new"}))
+    reg.update(_body(reg.get(K("gitlab")), env={"GITLAB_PERSONAL_ACCESS_TOKEN": "glpat-new"}))
     new_url = "https://b.example/mcp?api_key=k-new"
-    reg.update(_body(reg.get("quiver"), url=new_url, headers={"Authorization": "Bearer n"}))
-    assert reg.get("gitlab").env == {"GITLAB_PERSONAL_ACCESS_TOKEN": "glpat-new"}
-    assert reg.get("quiver").url == new_url
-    assert reg.get("quiver").headers == {"Authorization": "Bearer n"}
+    reg.update(_body(reg.get(K("quiver")), url=new_url, headers={"Authorization": "Bearer n"}))
+    assert reg.get(K("gitlab")).env == {"GITLAB_PERSONAL_ACCESS_TOKEN": "glpat-new"}
+    assert reg.get(K("quiver")).url == new_url
+    assert reg.get(K("quiver")).headers == {"Authorization": "Bearer n"}
 
 
 @pytest.mark.parametrize(
@@ -199,7 +205,7 @@ def test_update_that_leaves_a_mask_is_refused(tmp_path, ns, changes, field):
     reg = _reg(tmp_path, _gitlab(), _remote())
     before = (tmp_path / "servers.json").read_text()
     with pytest.raises(RegistryError) as exc:
-        reg.update(_body(reg.get(ns), **changes))
+        reg.update(_body(reg.get(K(ns)), **changes))
     assert str(exc.value).startswith(f"{field}:")
     # The message names the field, never a value.
     for secret in (GL_TOKEN, QV_TOKEN, URL_KEY, "pw-secret"):
@@ -242,9 +248,9 @@ def test_add_of_a_masked_clone_is_refused(tmp_path, spec, field):
 def _seed(holder: dict, *specs: ServerSpec):
     def seed(data_dir):
         seed_registry(*specs)(data_dir)
-        store = TokenStore(data_dir / "tokens.json")
+        store = TokenStore(data_dir / "tokens.json", data_dir / "user_tokens.json")
         store.load()
-        holder["admin"] = store.create("admin", "admin")[1]
+        holder["admin"] = store.create("admin", "admin", "admin")[1]
 
     return seed
 
@@ -281,9 +287,9 @@ def test_admin_mcp_list_and_get_hide_secrets_and_round_trip(server_factory):
             if k not in ("status", "last_error", "tool_count", "started_at")}
     answer = _call(base, tok, "mcpflow_update_server", {"namespace": "gitlab", "spec": spec})
     _no_secret(json.dumps(answer))
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    assert reg.get("gitlab").env["GITLAB_PERSONAL_ACCESS_TOKEN"] == GL_TOKEN
+    assert reg.get(K("gitlab")).env["GITLAB_PERSONAL_ACCESS_TOKEN"] == GL_TOKEN
 
 
 def test_rest_answers_hide_secrets(server_factory):
@@ -304,10 +310,10 @@ def test_rest_answers_hide_secrets(server_factory):
         _no_secret(put.text)
         clone = c.post("/api/servers", json={**body, "namespace": "clone"})
         assert clone.status_code == 400
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    assert reg.get("quiver").headers["Authorization"] == f"Bearer {QV_TOKEN}"
-    assert URL_KEY in reg.get("quiver").url
+    assert reg.get(K("quiver")).headers["Authorization"] == f"Bearer {QV_TOKEN}"
+    assert URL_KEY in reg.get(K("quiver")).url
 
 
 # --- web ---------------------------------------------------------------------
@@ -330,9 +336,9 @@ def test_edit_form_shows_masks_and_save_keeps_secret(server_factory):
     )
     client.close()
     assert resp.status_code == 303
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    assert reg.get("gitlab").env["GITLAB_PERSONAL_ACCESS_TOKEN"] == GL_TOKEN
+    assert reg.get(K("gitlab")).env["GITLAB_PERSONAL_ACCESS_TOKEN"] == GL_TOKEN
 
 
 def test_import_preview_keeps_pasted_values(server_factory):

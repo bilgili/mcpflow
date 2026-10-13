@@ -6,7 +6,16 @@
      hx-target="#detail" hx-swap="innerHTML">Add server</a>
 </div>
 
-{% include "_tools_tree.html" %}
+{# The placeholder takes the tree's id, so the first answer of `/tools/tree`
+   replaces it like any later swap, and the open-state script below needs no
+   special case. A failed load leaves a message, not a stuck placeholder. #}
+<div id="tools-tree" hx-get="/tools/tree" hx-trigger="load"
+     hx-swap="outerHTML"
+     hx-on::response-error="this.textContent = 'Could not load the tools. Reload the page.'"
+     hx-on::send-error="this.textContent = 'Could not load the tools. Reload the page.'">
+  <p class="muted">Loading tools…</p>
+  <noscript><p><a href="/tools/tree">Open the tool list</a></p></noscript>
+</div>
 
 {# The server window and the add-server window land here. The dialog sits
    outside the tree, so a tree swap (a poll or a visibility control) never

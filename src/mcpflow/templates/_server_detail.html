@@ -19,8 +19,10 @@
     <div class="vendor">
       <span class="status status-{{ c.status }}">{{ c.status }}</span>
       · <span class="kind">{{ c.spec.kind }}</span>
+      {% if c.spec.owner %} · owner {{ c.spec.owner }}{% endif %}
+      {% if c.spec.approval == 'pending' %}<span class="awaiting">awaiting approval</span>{% endif %}
       {% if e %} · from marketplace entry {{ e.name }}{% endif %}
-      {% if ns in awaiting %}<span class="awaiting" title="Delete this server and connect again to retry.">awaiting authorization</span>{% endif %}
+      {% if c.spec.key.ref in awaiting %}<span class="awaiting" title="Delete this server and connect again to retry.">awaiting authorization</span>{% endif %}
     </div>
   </div>
   {% if page %}
@@ -34,6 +36,11 @@
   <div>
     <h3>Settings</h3>
     {% if error %}<p class="error">{{ error }}</p>{% endif %}
+    {% if c.spec.owner %}
+    <p class="note">A save that changes a code field (kind, package, source,
+      arguments, URL, transport, headers, command, or environment) sets this
+      server back to pending until the admin approves it again.</p>
+    {% endif %}
     {% include "_server_form_fields.html" %}
   </div>
 
@@ -64,7 +71,7 @@
       {% if c.status == "running" and c.spec.actions %}
       <a class="btn" href="/servers/{{ ns }}/actions">Actions</a>
       {% endif %}
-      {% if ns in reauthable %}
+      {% if c.spec.key.ref in reauthable %}
       <a class="btn" href="/servers/{{ ns }}/reauthorize">re-authorize</a>
       {% endif %}
     </div>

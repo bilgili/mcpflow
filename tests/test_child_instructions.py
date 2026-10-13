@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import fake_child_spec
+from conftest import ADMIN_ACTOR, admin_reach, fake_child_spec
 from test_supervisor import make_supervisor  # noqa: F401 -- fixture
 from test_visibility import ROOT, _seed, admin, call, mute, ns_path
 
@@ -24,6 +24,7 @@ from mcpflow.instructions import (
     TRUNCATION_MARKER,
     render_instructions,
 )
+from mcpflow.registry import ServerKey
 from mcpflow.supervisor import INSTRUCTIONS_READ_TIMEOUT
 
 SRC = Path(__file__).parent.parent / "src" / "mcpflow"
@@ -119,23 +120,23 @@ def test_child_without_the_resource_contributes_no_block(
 
 
 @pytest.mark.asyncio
-async def test_only_a_running_child_contributes(make_supervisor, tmp_path):  # noqa: F811
+async def test_only_a_running_child_contributes(make_supervisor, tmp_path):
     spec, _ = text_child(tmp_path, "skills", "catalog")
     sup = make_supervisor(spec)
     await sup.startup()
-    child = sup.get("skills")
+    child = sup.get(ServerKey(None, "skills"))
     await child.task
-    assert await sup.instructions_blocks() == [("skills", "catalog")]
+    assert await sup.instructions_blocks(admin_reach(sup, "mcp")) == [("skills", "catalog")]
 
     # The gate is the owner's; hold the child in each non-running state.
     for status in ("starting", "failed"):
         child.status = status
-        assert await sup.instructions_blocks() == []
+        assert await sup.instructions_blocks(admin_reach(sup, "mcp")) == []
     child.status = "running"
 
-    await sup.disable("skills")
+    await sup.disable(ServerKey(None, "skills"), ADMIN_ACTOR)
     assert child.status == "stopped"
-    assert await sup.instructions_blocks() == []
+    assert await sup.instructions_blocks(admin_reach(sup, "mcp")) == []
 
 
 # --- C-3: mutes -----------------------------------------------------------------
@@ -162,7 +163,7 @@ def test_raising_read_keeps_the_child_running(server_factory, caplog):
     server, base, token = _start(
         server_factory, fake_child_spec("bad", "good"), running=1
     )
-    child = server.supervisor.get("bad")
+    child = server.supervisor.get(ServerKey(None, "bad"))
     before = child.last_error
 
     assert initialize(base, token) is None
@@ -187,7 +188,7 @@ def test_hanging_read_adds_at_most_the_bound(server_factory, tmp_path, caplog):
     # The other children still contribute.
     assert text == "## skills\ncatalog"
     assert elapsed < INSTRUCTIONS_READ_TIMEOUT + 3.0
-    assert server.supervisor.get("slow").status == "running"
+    assert server.supervisor.get(ServerKey(None, "slow")).status == "running"
     assert _warnings(caplog, "mcpflow.supervisor", "slow") == [
         "instructions://self read timed out for slow after 2.0s"
     ]
@@ -212,7 +213,7 @@ def test_hanging_read_keeps_the_child_session(server_factory, tmp_path):
 
 @pytest.mark.asyncio
 async def test_a_cancelled_borrowed_read_keeps_the_shared_transport(
-    make_supervisor, tmp_path  # noqa: F811
+    make_supervisor, tmp_path
 ):
     """D2 replaced the fresh-client-per-read with a borrowed owned client, so
     the old "bound never covers the enter" proof no longer applies. The
@@ -225,7 +226,7 @@ async def test_a_cancelled_borrowed_read_keeps_the_shared_transport(
     )
     sup = make_supervisor(spec)
     await sup.startup()
-    child = sup.get("skills")
+    child = sup.get(ServerKey(None, "skills"))
     await child.task
     pids = pid_file.read_text().split()
     assert len(pids) == 1
@@ -247,8 +248,11 @@ async def test_a_cancelled_borrowed_read_keeps_the_shared_transport(
     assert session.leases == 0
     assert child.session is session and session.state == "open"
     assert pid_file.read_text().split() == pids
-    views = await sup._probe_child(child)
-    assert any(v.tool == "get_current_time" for v in views)
+    # A stale, cleared snapshot, so only this probe's read can fill it.
+    session.tools = None
+    session.probed_at = None
+    await asyncio.wait_for(sup._probe_child(child, session), 15)
+    assert any(tool.name == "get_current_time" for tool in session.tools)
     assert pid_file.read_text().split() == pids
 
 
@@ -336,13 +340,13 @@ def test_block_within_the_cap_is_unchanged(server_factory, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_both_clients_share_one_session_profile(make_supervisor, tmp_path):  # noqa: F811
+async def test_both_clients_share_one_session_profile(make_supervisor, tmp_path):
     from fastmcp.client.transports.base import TransportOptions
 
     spec, _ = text_child(tmp_path, "skills", "catalog")
     sup = make_supervisor(spec)
     await sup.startup()
-    child = sup.get("skills")
+    child = sup.get(ServerKey(None, "skills"))
     await child.task
 
     proxy_client = sup._make_factory(child.session)()
@@ -352,7 +356,7 @@ async def test_both_clients_share_one_session_profile(make_supervisor, tmp_path)
     async with proxy_client:
         # The supervisor's read borrows the same owned client while the
         # factory's reference is held.
-        assert await sup.instructions_blocks() == [("skills", "catalog")]
+        assert await sup.instructions_blocks(admin_reach(sup, "mcp")) == [("skills", "catalog")]
         assert proxy_client._transport_options is None
         # `_session_options` lives on the inner StdioTransport now.
         assert child.transport.inner._session_options == TransportOptions()
@@ -386,3 +390,53 @@ def test_render_cut_lands_on_a_character_boundary():
     assert out.endswith("\n" + TRUNCATION_MARKER)
     assert kept == "x" + "é" * ((INSTRUCTIONS_BLOCK_CAP - 1) // 2)
     assert len(kept.encode()) <= INSTRUCTIONS_BLOCK_CAP
+
+
+# --- 10.14 Handshake instructions follow the policy (multi-user-access) -------
+#
+# Fixture `router_live.py`: admin-owned `time` publishes
+# `TIME-INSTR-MARK of time`; user-owned `github@alice` publishes
+# `ALICE-INSTR-MARK of github@alice`. Each docstring names the TLA+ invariant
+# of `specs/tla/multi_user_access.tla` that the test guards.
+
+from router_live import start_live
+
+
+@pytest.fixture(scope="module")
+def live(tmp_path_factory):
+    lv, stop = start_live(tmp_path_factory.mktemp("instructions"))
+    yield lv
+    stop()
+
+
+@pytest.fixture
+def env(live):
+    live.reset()
+    yield live
+    live.reset()
+
+
+def test_no_instructions_of_a_hidden_server_ac8(env):
+    """No instructions of a hidden server (AC-8). Invariant: NoInstructionsLeak."""
+    text = initialize(env.base_url, env.tokens["alice"]) or ""
+    assert "## time" not in text and "TIME-INSTR-MARK" not in text
+    # Control: the owner's own server is in the Reach, so its block is there.
+    assert "ALICE-INSTR-MARK" in text
+
+
+def test_no_instructions_of_a_user_server_for_the_admin_ac4(env):
+    """No instructions of a user server for the admin (AC-4).
+    Invariant: NoInstructionsLeak, AdminViewExcludesPrivate."""
+    for uid in ("admin", "root"):
+        text = initialize(env.base_url, env.tokens[uid]) or ""
+        assert "TIME-INSTR-MARK" in text  # control
+        assert "ALICE-INSTR-MARK" not in text and "github@alice" not in text
+
+
+def test_instructions_of_an_allowed_server(env):
+    """Instructions of an allowed server. Invariant: NoInstructionsLeak (the
+    block follows the live Reach at the next handshake)."""
+    assert "TIME-INSTR-MARK" not in (initialize(env.base_url, env.tokens["alice"]) or "")
+    env.grant("user", "alice", "server", "allow", "time")
+    text = initialize(env.base_url, env.tokens["alice"]) or ""
+    assert "## time" in text and "TIME-INSTR-MARK of time" in text

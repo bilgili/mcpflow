@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 import httpx
 import pytest
 import pytest_asyncio
-from conftest import fake_child_spec, make_settings
+from conftest import ADMIN_ACTOR, fake_child_spec, make_policy, make_settings
 
 from mcpflow.gateway import build_app
 from mcpflow.oauth import CredStore, PendingFlows
@@ -22,6 +22,7 @@ from mcpflow.registry import (
     SECRET_MASK,
     Registry,
     RegistryError,
+    ServerKey,
     ServerSpec,
     redact_url,
     source_secrets,
@@ -45,15 +46,18 @@ def _redactor():
 
 @pytest_asyncio.fixture
 async def sup(tmp_path):
-    reg = Registry(tmp_path / "servers.json")
+    reg = Registry(tmp_path / "servers.json", tmp_path / "user_servers.json")
     reg.load()
-    s = Supervisor(reg, make_settings(tmp_path), CredStore(tmp_path), PendingFlows())
+    s = Supervisor(
+        reg, make_settings(tmp_path), CredStore(tmp_path), PendingFlows(),
+        make_policy(tmp_path, reg),
+    )
     yield s
     await s.shutdown()
 
 
 async def _started(sup: Supervisor, spec: ServerSpec):
-    child = await sup.add(spec)
+    child = await sup.add(spec, ADMIN_ACTOR)
     await child.task
     return child
 
@@ -103,7 +107,7 @@ async def test_httpx_request_line_masks_the_encoded_form(sup, caplog):
 async def test_removed_child_secret_stays_masked(sup, caplog):
     spec = fake_child_spec("gitlab", "good", env={"TOKEN": "glpat-abc-secret-1"})
     await _started(sup, spec)
-    await sup.remove("gitlab")
+    await sup.remove(ServerKey(None, "gitlab"), ADMIN_ACTOR)
     caplog.set_level(logging.ERROR)
     logging.getLogger("mcp.client.stdio").error("late: glpat-abc-secret-1")
     assert "glpat-abc-secret-1" not in caplog.text
@@ -114,7 +118,9 @@ async def test_replaced_generation_secret_stays_masked(sup, caplog):
     old = {"Authorization": "Bearer tok-old-secret-1"}
     await _started(sup, _remote("hs", f"{DEAD}/mcp", headers=old))
     new = {"Authorization": "Bearer tok-new-secret-2"}
-    child = await sup.update(_remote("hs", f"{DEAD}/mcp", headers=new))
+    child = await sup.update(
+        ServerKey(None, "hs"), _remote("hs", f"{DEAD}/mcp", headers=new), ADMIN_ACTOR
+    )
     await child.task
     caplog.set_level(logging.ERROR)
     logging.getLogger("mcp.client.sse").error("old token tok-old-secret-1 rejected")
@@ -190,7 +196,7 @@ def test_scrub_failure_fails_closed(caplog):
     try:
         raise ValueError("fail-secret-8")
     except ValueError:
-        logging.getLogger("mcpflow.test").exception("%s %s", "only-one")  # noqa: PLE1206 - bad record on purpose
+        logging.getLogger("mcpflow.test").exception("%s %s", "only-one")
     record = _only(caplog, "mcpflow.test")
     assert record.getMessage() == REDACTION_FAILED
     assert record.exc_info is None
@@ -280,7 +286,7 @@ async def test_unparseable_url_is_refused_without_echo(shape, sup, caplog):
     secret = f"refused-secret-{REFUSED_URL_SHAPES.index(shape)}"
     caplog.set_level(logging.DEBUG)
     with pytest.raises(RegistryError) as err:
-        await sup.add(_remote("bad", shape.format(s=secret)))
+        await sup.add(_remote("bad", shape.format(s=secret)), ADMIN_ACTOR)
     assert str(err.value) == "url: not a valid http(s) URL"
     assert secret not in caplog.text
     assert [s.namespace for s in sup.registry.list()] == []
@@ -298,7 +304,7 @@ async def test_unparseable_url_is_refused_without_echo(shape, sup, caplog):
 def test_url_a_remote_transport_cannot_use_is_refused(url, tmp_path):
     # Not a leak (these parse, and httpx names only the port), but a remote
     # child that can never start is refused at the same boundary.
-    reg = Registry(tmp_path / "servers.json")
+    reg = Registry(tmp_path / "servers.json", tmp_path / "user_servers.json")
     reg.load()
     with pytest.raises(RegistryError, match="url: not a valid http"):
         reg.add(_remote("r", url))
@@ -312,7 +318,7 @@ def test_url_a_remote_transport_cannot_use_is_refused(url, tmp_path):
     ],
 )
 def test_unparseable_source_is_refused_without_echo(source, tmp_path):
-    reg = Registry(tmp_path / "servers.json")
+    reg = Registry(tmp_path / "servers.json", tmp_path / "user_servers.json")
     reg.load()
     spec = ServerSpec(namespace="src", kind="python", package="p", source=source)
     with pytest.raises(RegistryError) as err:
@@ -372,10 +378,10 @@ def test_redact_url_never_raises_on_an_unparseable_url(shape):
     ],
 )
 def test_legitimate_url_shapes_are_accepted(url, tmp_path):
-    reg = Registry(tmp_path / "servers.json")
+    reg = Registry(tmp_path / "servers.json", tmp_path / "user_servers.json")
     reg.load()
     reg.add(_remote("ok", url))
-    assert reg.get("ok").url == url
+    assert reg.get(ServerKey(None, "ok")).url == url
 
 
 def test_marketplace_refusal_page_renders_a_bad_catalog_url(server_factory):

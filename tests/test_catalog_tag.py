@@ -15,7 +15,7 @@ from starlette.testclient import TestClient
 
 from mcpflow.auth import TokenStore
 from mcpflow.gateway import build_app
-from mcpflow.registry import Registry, ServerSpec
+from mcpflow.registry import Registry, ServerKey, ServerSpec
 
 
 def _npm(namespace: str, **extra) -> ServerSpec:
@@ -28,54 +28,54 @@ def test_file_without_catalog_loads_as_none(tmp_path):
         '{"version": 1, "servers": ['
         '{"namespace": "time", "kind": "npm", "package": "@scope/pkg"}]}'
     )
-    reg = Registry(path)
+    reg = Registry(path, path.with_name("user_servers.json"))
     reg.load()
-    assert reg.get("time").catalog is None
+    assert reg.get(ServerKey(None, "time")).catalog is None
 
 
 def test_catalog_tag_round_trips(tmp_path):
-    reg = Registry(tmp_path / "servers.json")
+    reg = Registry(tmp_path / "servers.json", tmp_path / "user_servers.json")
     reg.load()
     reg.add(_npm("gmail", catalog="gmail"))
-    again = Registry(tmp_path / "servers.json")
+    again = Registry(tmp_path / "servers.json", tmp_path / "user_servers.json")
     again.load()
-    assert again.get("gmail").catalog == "gmail"
+    assert again.get(ServerKey(None, "gmail")).catalog == "gmail"
 
 
 def test_catalog_tag_is_free_text(tmp_path):
-    reg = Registry(tmp_path / "servers.json")
+    reg = Registry(tmp_path / "servers.json", tmp_path / "user_servers.json")
     reg.load()
     reg.add(_npm("x", catalog="no_such_entry"))
-    assert reg.get("x").catalog == "no_such_entry"
+    assert reg.get(ServerKey(None, "x")).catalog == "no_such_entry"
 
 
 def test_update_without_tag_keeps_it(tmp_path):
-    reg = Registry(tmp_path / "servers.json")
+    reg = Registry(tmp_path / "servers.json", tmp_path / "user_servers.json")
     reg.load()
     reg.add(_npm("gmail", catalog="gmail"))
     reg.update(_npm("gmail", description="changed"))
-    assert reg.get("gmail").catalog == "gmail"
-    assert reg.get("gmail").description == "changed"
+    assert reg.get(ServerKey(None, "gmail")).catalog == "gmail"
+    assert reg.get(ServerKey(None, "gmail")).description == "changed"
 
 
 def test_update_cannot_change_tag(tmp_path):
-    reg = Registry(tmp_path / "servers.json")
+    reg = Registry(tmp_path / "servers.json", tmp_path / "user_servers.json")
     reg.load()
     reg.add(_npm("gmail", catalog="gmail"))
     reg.update(_npm("gmail", catalog="other"))
-    assert reg.get("gmail").catalog == "gmail"
+    assert reg.get(ServerKey(None, "gmail")).catalog == "gmail"
 
 
 @pytest.fixture
 def api(tmp_path):
     data = tmp_path / "d"
     (data / "logs").mkdir(parents=True)
-    reg = Registry(data / "servers.json")
+    reg = Registry(data / "servers.json", data / "user_servers.json")
     reg.load()
     reg.add(_npm("gmail", enabled=False, catalog="gmail"))
-    store = TokenStore(data / "tokens.json")
+    store = TokenStore(data / "tokens.json", data / "user_tokens.json")
     store.load()
-    _, token = store.create("admin", "admin")
+    _, token = store.create("admin", "admin", "admin")
     client = TestClient(build_app(make_settings(data)), raise_server_exceptions=True)
     client.__enter__()
     yield SimpleNamespace(client=client, headers={"Authorization": f"Bearer {token}"})
@@ -110,7 +110,7 @@ def test_edit_form_save_keeps_tag(server_factory):
     )
     client.close()
     assert resp.status_code == 303
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    assert reg.get("gmail").catalog == "gmail"
-    assert reg.get("gmail").description == "changed"
+    assert reg.get(ServerKey(None, "gmail")).catalog == "gmail"
+    assert reg.get(ServerKey(None, "gmail")).description == "changed"

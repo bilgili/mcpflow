@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block content %}
+{# Admin-only. One page, three sections, no JavaScript. A refusal renders this
+   page with 400 at the URL of the form, so the banner sits above the first
+   section and links down to the section that shows the full error. #}
+<h1>Security</h1>
+{% if error and section and not reopen %}
+<p class="error" role="alert">Error in <a href="#{{ section }}">{{ section }}</a>: {{ error }}</p>
+{% endif %}
+{% include "_security_users.html" %}
+{% include "_security_groups.html" %}
+{% include "_security_rules.html" %}
+{% endblock %}

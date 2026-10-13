@@ -20,21 +20,21 @@ import contextlib
 import threading
 
 import pytest
-from conftest import fake_child_spec
+from conftest import ADMIN_ACTOR, fake_child_spec, make_policy
 
 from mcpflow.auth import TokenStore
-from mcpflow.registry import Registry, RegistryError, ServerSpec
+from mcpflow.registry import Registry, RegistryError, ServerKey, ServerSpec
 
 
 def _seed(*specs: ServerSpec, holder: dict):
     def seed(data_dir):
-        reg = Registry(data_dir / "servers.json")
+        reg = Registry(data_dir / "servers.json", data_dir / "user_servers.json")
         reg.load()
         for spec in specs:
             reg.add(spec)
-        store = TokenStore(data_dir / "tokens.json")
+        store = TokenStore(data_dir / "tokens.json", data_dir / "user_tokens.json")
         store.load()
-        _record, clear = store.create("test")
+        _record, clear = store.create("test", "mcp", "admin")
         holder["clear"] = clear
 
     return seed
@@ -92,24 +92,24 @@ def test_a_failed_write_leaves_the_child_in_the_registry(running_server, monkeyp
     with admin(running_server) as client:
         assert delete(client, "time").status_code >= 500
 
-    assert running_server.supervisor.registry.get("time").namespace == "time"
-    fresh = Registry(running_server.data_dir / "servers.json")
+    assert running_server.supervisor.registry.get(ServerKey(None, "time")).namespace == "time"
+    fresh = Registry(running_server.data_dir / "servers.json", running_server.data_dir / "user_servers.json")
     fresh.load()
-    assert fresh.get("time").namespace == "time"
+    assert fresh.get(ServerKey(None, "time")).namespace == "time"
 
 
 def test_a_failed_write_leaves_the_child_running_with_its_provider(
     running_server, monkeypatch
 ):
     sup = running_server.supervisor
-    provider = sup.get("time").provider
+    provider = sup.get(ServerKey(None, "time")).provider
     assert provider in sup.table.providers
 
     break_writes(running_server, monkeypatch)
     with admin(running_server) as client:
         assert delete(client, "time").status_code >= 500
 
-    child = sup.get("time")
+    child = sup.get(ServerKey(None, "time"))
     assert child.status == "running"
     assert child.provider is provider
     assert provider in sup.table.providers
@@ -131,18 +131,18 @@ def test_a_failed_write_leaves_the_tools_published(running_server, monkeypatch):
 def test_a_successful_remove_requests_close_and_forgets(running_server):
     """The success path is unchanged by the reorder."""
     sup = running_server.supervisor
-    provider = sup.get("time").provider
+    provider = sup.get(ServerKey(None, "time")).provider
 
     with admin(running_server) as client:
         assert delete(client, "time").status_code in (200, 303)
 
     assert provider not in sup.table.providers
     with pytest.raises(KeyError):
-        sup.get("time")
-    fresh = Registry(running_server.data_dir / "servers.json")
+        sup.get(ServerKey(None, "time"))
+    fresh = Registry(running_server.data_dir / "servers.json", running_server.data_dir / "user_servers.json")
     fresh.load()
     with pytest.raises(KeyError):
-        fresh.get("time")
+        fresh.get(ServerKey(None, "time"))
     assert tool_names(running_server.base_url, running_server.token) == []
 
 
@@ -158,7 +158,7 @@ def test_teardown_swallows_a_failing_transport_close(running_server):
         async def close(self):
             raise RuntimeError("close blew up")
 
-    child = sup.get("time")
+    child = sup.get(ServerKey(None, "time"))
     child.transport = Exploding()
 
     with admin(running_server) as client:
@@ -166,11 +166,11 @@ def test_teardown_swallows_a_failing_transport_close(running_server):
 
     # The removal completed despite the raising close.
     with pytest.raises(KeyError):
-        sup.get("time")
-    fresh = Registry(running_server.data_dir / "servers.json")
+        sup.get(ServerKey(None, "time"))
+    fresh = Registry(running_server.data_dir / "servers.json", running_server.data_dir / "user_servers.json")
     fresh.load()
     with pytest.raises(KeyError):
-        fresh.get("time")
+        fresh.get(ServerKey(None, "time"))
 
 
 def test_teardown_swallows_a_cancellation_during_close(running_server):
@@ -184,17 +184,17 @@ def test_teardown_swallows_a_cancellation_during_close(running_server):
         async def close(self):
             raise asyncio.CancelledError
 
-    sup.get("time").transport = Cancelling()
+    sup.get(ServerKey(None, "time")).transport = Cancelling()
 
     with admin(running_server) as client:
         assert delete(client, "time").status_code in (200, 303)
 
     with pytest.raises(KeyError):
-        sup.get("time")
-    fresh = Registry(running_server.data_dir / "servers.json")
+        sup.get(ServerKey(None, "time"))
+    fresh = Registry(running_server.data_dir / "servers.json", running_server.data_dir / "user_servers.json")
     fresh.load()
     with pytest.raises(KeyError):
-        fresh.get("time")
+        fresh.get(ServerKey(None, "time"))
 
 
 def test_a_concurrent_add_under_the_same_namespace_is_refused(running_server):
@@ -221,7 +221,7 @@ def test_a_concurrent_add_under_the_same_namespace_is_refused(running_server):
             while not gate.is_set():
                 await asyncio.sleep(0.01)
 
-    sup.get("time").transport = Gated()
+    sup.get(ServerKey(None, "time")).transport = Gated()
 
     outcome: dict = {}
 
@@ -256,7 +256,7 @@ def test_a_concurrent_add_under_the_same_namespace_is_refused(running_server):
 
     # Nothing was registered under the reserved namespace.
     with pytest.raises(KeyError):
-        sup.get("time")
+        sup.get(ServerKey(None, "time"))
     assert not _still_registered(sup)
 
     gate.set()
@@ -278,7 +278,7 @@ def test_a_concurrent_add_under_the_same_namespace_is_refused(running_server):
             },
         )
         assert resp.status_code == 303, resp.text
-    assert sup.registry.get("time").description == "replacement"
+    assert sup.registry.get(ServerKey(None, "time")).description == "replacement"
 
 
 def test_a_queued_remove_cannot_delete_a_later_generation(tmp_path):
@@ -295,31 +295,32 @@ def test_a_queued_remove_cannot_delete_a_later_generation(tmp_path):
 
     from mcpflow.supervisor import Supervisor, _new_child
 
-    reg = Registry(tmp_path / "servers.json")
+    reg = Registry(tmp_path / "servers.json", tmp_path / "user_servers.json")
     reg.load()
     reg.add(fake_child_spec("time", "good", enabled=False))
     from mcpflow.oauth import CredStore, PendingFlows
 
-    sup = Supervisor(reg, make_settings(tmp_path), CredStore(tmp_path), PendingFlows())
-    stale = sup.get("time")
+    sup = Supervisor(reg, make_settings(tmp_path), CredStore(tmp_path), PendingFlows(),
+                     make_policy(tmp_path, reg))
+    stale = sup.get(ServerKey(None, "time"))
 
     async def scenario():
         # Hold the stale child's lock so a second remove queues behind it.
         await stale.lock.acquire()
-        queued = asyncio.create_task(sup.remove("time"))
+        queued = asyncio.create_task(sup.remove(ServerKey(None, "time"), ADMIN_ACTOR))
         await asyncio.sleep(0)  # let it reach the lock
         await asyncio.sleep(0)
 
         # The real removal completes and an add installs a replacement, both
         # while the queued operation still holds the stale child object.
-        del sup._children["time"]
-        sup.registry.remove("time")
+        del sup._children[ServerKey(None, "time")]
+        sup.registry.remove(ServerKey(None, "time"))
         replacement_spec = fake_child_spec(
             "time", "good", enabled=False, description="replacement"
         )
         sup.registry.add(replacement_spec)
         replacement = _new_child(replacement_spec)
-        sup._children["time"] = replacement
+        sup._children[ServerKey(None, "time")] = replacement
 
         stale.lock.release()
         try:
@@ -333,8 +334,8 @@ def test_a_queued_remove_cannot_delete_a_later_generation(tmp_path):
     # The queued remove must refuse rather than delete the replacement.
     assert outcome == "refused", "the queued remove acted on a dead generation"
     assert "changed while the operation waited" in message
-    assert sup.get("time") is replacement
-    assert sup.registry.get("time").description == "replacement"
+    assert sup.get(ServerKey(None, "time")) is replacement
+    assert sup.registry.get(ServerKey(None, "time")).description == "replacement"
 
 
 def test_remove_drops_creds_before_teardown(tmp_path):
@@ -346,16 +347,17 @@ def test_remove_drops_creds_before_teardown(tmp_path):
     from mcpflow.oauth import ClientCreds, CredStore, PendingFlows
     from mcpflow.supervisor import Supervisor
 
-    reg = Registry(tmp_path / "servers.json")
+    reg = Registry(tmp_path / "servers.json", tmp_path / "user_servers.json")
     reg.load()
     reg.add(fake_child_spec("gmail", "good", enabled=False))
-    sup = Supervisor(reg, make_settings(tmp_path), CredStore(tmp_path), PendingFlows())
+    sup = Supervisor(reg, make_settings(tmp_path), CredStore(tmp_path), PendingFlows(),
+                     make_policy(tmp_path, reg))
     sup.creds.write_client("gmail", "google-client", ClientCreds("a", "1"))
     sup.creds.write_token("gmail", "google-auth-library", {
         "access_token": "a", "refresh_token": "r", "scope": "s",
         "token_type": "Bearer", "expires_in": 3600,
     })
-    flow = sup.flows.create("gmail", "gmail", ClientCreds("a", "1"))
+    flow = sup.flows.create("gmail", "gmail", ClientCreds("a", "1"), ADMIN_ACTOR)
     creds_dir = sup.creds.root / "gmail"
     assert creds_dir.exists()
 
@@ -368,7 +370,7 @@ def test_remove_drops_creds_before_teardown(tmp_path):
             await released.wait()
 
         sup._teardown = blocked_teardown
-        task = asyncio.create_task(sup.remove("gmail"))
+        task = asyncio.create_task(sup.remove(ServerKey(None, "gmail"), ADMIN_ACTOR))
         await entered.wait()
         # The teardown is still blocked, yet the creds and the flow are gone.
         assert not creds_dir.exists()
@@ -388,10 +390,11 @@ def _oauth_sup(tmp_path, namespace="gmail"):
     from mcpflow.oauth import ClientCreds, CredStore, PendingFlows
     from mcpflow.supervisor import Supervisor
 
-    reg = Registry(tmp_path / "servers.json")
+    reg = Registry(tmp_path / "servers.json", tmp_path / "user_servers.json")
     reg.load()
     reg.add(fake_child_spec(namespace, "good", enabled=False))
-    sup = Supervisor(reg, make_settings(tmp_path), CredStore(tmp_path), PendingFlows())
+    sup = Supervisor(reg, make_settings(tmp_path), CredStore(tmp_path), PendingFlows(),
+                     make_policy(tmp_path, reg))
     sup.creds.write_client(namespace, "google-client", ClientCreds("a", "1"))
     sup.creds.write_token(namespace, "google-auth-library", {
         "access_token": "a", "refresh_token": "r", "scope": "s",
@@ -423,7 +426,7 @@ def test_remove_deletes_creds_again_after_the_teardown(tmp_path):
             token.write_text('{"access_token": "a", "refresh_token": "r"}')
 
         sup._teardown = child_writes_during_teardown
-        await sup.remove("gmail")
+        await sup.remove(ServerKey(None, "gmail"), ADMIN_ACTOR)
 
     asyncio.run(scenario())
     assert not token.exists()
@@ -449,14 +452,15 @@ def test_add_purges_residue_of_an_interrupted_removal(tmp_path):
     token = sup.creds.paths("gmail").token
     # Simulate the interrupted removal: the registry entry is gone, the token
     # the child wrote is not, and a fresh process starts with no reservation.
-    sup.registry.remove("gmail")
+    sup.registry.remove(ServerKey(None, "gmail"))
     assert token.exists()
     fresh = Supervisor(
-        sup.registry, make_settings(tmp_path), CredStore(tmp_path), PendingFlows()
+        sup.registry, make_settings(tmp_path), CredStore(tmp_path), PendingFlows(),
+        make_policy(tmp_path, sup.registry),
     )
     assert fresh.creds.paths("gmail").token.exists()  # residue survived
 
-    asyncio.run(fresh.add(fake_child_spec("gmail", "good", enabled=False)))
+    asyncio.run(fresh.add(fake_child_spec("gmail", "good", enabled=False), ADMIN_ACTOR))
 
     assert not fresh.creds.paths("gmail").token.exists()
     assert not fresh.creds.has_client("gmail")
@@ -477,7 +481,7 @@ def test_a_duplicate_add_keeps_the_live_childs_credential(tmp_path):
     assert paths.client.exists() and paths.token.exists()
 
     with pytest.raises(RegistryError, match="already exists"):
-        asyncio.run(sup.add(fake_child_spec("gmail", "good", enabled=False)))
+        asyncio.run(sup.add(fake_child_spec("gmail", "good", enabled=False), ADMIN_ACTOR))
 
     assert paths.client.exists()
     assert paths.token.exists()
@@ -500,9 +504,10 @@ def test_a_failed_client_write_leaves_a_removable_child(tmp_path):
     from mcpflow.oauth import ClientCreds, CredStore, PendingFlows
     from mcpflow.supervisor import Supervisor
 
-    reg = Registry(tmp_path / "servers.json")
+    reg = Registry(tmp_path / "servers.json", tmp_path / "user_servers.json")
     reg.load()
-    sup = Supervisor(reg, make_settings(tmp_path), CredStore(tmp_path), PendingFlows())
+    sup = Supervisor(reg, make_settings(tmp_path), CredStore(tmp_path), PendingFlows(),
+                     make_policy(tmp_path, reg))
 
     def boom(*_a, **_kw):
         raise PermissionError("read-only filesystem")
@@ -511,8 +516,7 @@ def test_a_failed_client_write_leaves_a_removable_child(tmp_path):
 
     with pytest.raises(PermissionError):
         asyncio.run(
-            sup.add(
-                fake_child_spec("gmail", "good", enabled=False),
+            sup.add(fake_child_spec("gmail", "good", enabled=False), ADMIN_ACTOR,
                 "google-client",
                 ClientCreds("id", "secret"),
             )
@@ -520,10 +524,10 @@ def test_a_failed_client_write_leaves_a_removable_child(tmp_path):
 
     # Both stores agree, so the child is removable and the operator can retry.
     assert "gmail" in [s.namespace for s in sup.registry.list()]
-    assert "gmail" in sup._children
-    asyncio.run(sup.remove("gmail"))
+    assert ServerKey(None, "gmail") in sup._children
+    asyncio.run(sup.remove(ServerKey(None, "gmail"), ADMIN_ACTOR))
     assert "gmail" not in [s.namespace for s in sup.registry.list()]
-    assert "gmail" not in sup._children
+    assert ServerKey(None, "gmail") not in sup._children
 
 
 def test_a_failed_reauth_write_leaves_a_restartable_child(tmp_path):
@@ -539,18 +543,19 @@ def test_a_failed_reauth_write_leaves_a_restartable_child(tmp_path):
     from mcpflow.oauth import ClientCreds, CredStore, PendingFlows
     from mcpflow.supervisor import Supervisor
 
-    reg = Registry(tmp_path / "servers.json")
+    reg = Registry(tmp_path / "servers.json", tmp_path / "user_servers.json")
     reg.load()
     reg.add(fake_child_spec("gmail", "good", enabled=True))
-    sup = Supervisor(reg, make_settings(tmp_path), CredStore(tmp_path), PendingFlows())
-    child = sup._children["gmail"]
+    sup = Supervisor(reg, make_settings(tmp_path), CredStore(tmp_path), PendingFlows(),
+                     make_policy(tmp_path, reg))
+    child = sup._children[ServerKey(None, "gmail")]
     child.status = "running"
 
     def boom(*_a, **_kw):
         raise OSError("no space left on device")
 
     sup.creds.write_token = boom
-    flow = sup.flows.create("gmail", "gmail", ClientCreds("a", "1"), reauth=True)
+    flow = sup.flows.create("gmail", "gmail", ClientCreds("a", "1"), ADMIN_ACTOR, reauth=True)
 
     with pytest.raises(OSError):
         asyncio.run(
@@ -580,13 +585,13 @@ def test_connect_writes_the_client_file_through_add(tmp_path):
     from mcpflow.oauth import ClientCreds, CredStore, PendingFlows
     from mcpflow.supervisor import Supervisor
 
-    reg = Registry(tmp_path / "servers.json")
+    reg = Registry(tmp_path / "servers.json", tmp_path / "user_servers.json")
     reg.load()
-    sup = Supervisor(reg, make_settings(tmp_path), CredStore(tmp_path), PendingFlows())
+    sup = Supervisor(reg, make_settings(tmp_path), CredStore(tmp_path), PendingFlows(),
+                     make_policy(tmp_path, reg))
 
     asyncio.run(
-        sup.add(
-            fake_child_spec("gmail", "good", enabled=False),
+        sup.add(fake_child_spec("gmail", "good", enabled=False), ADMIN_ACTOR,
             "google-client",
             ClientCreds("id", "secret"),
         )

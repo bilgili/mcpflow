@@ -15,11 +15,18 @@ import time
 
 import pytest
 import pytest_asyncio
-from conftest import fake_child_spec, make_settings
+from conftest import (
+    ADMIN_ACTOR,
+    admin_reach,
+    fake_child_spec,
+    make_policy,
+    make_settings,
+    run_stale_probe,
+)
 from fastmcp.client.transports import StdioTransport, StreamableHttpTransport
 
 from mcpflow.oauth import ClientCreds, CredStore, HeaderSpec, PendingFlows
-from mcpflow.registry import Registry, RegistryError, ServerSpec
+from mcpflow.registry import Registry, RegistryError, ServerKey, ServerSpec
 from mcpflow.supervisor import SingleConnectTransport, Supervisor
 
 _CREDS = ClientCreds("abc", "secret")
@@ -38,12 +45,14 @@ async def make_supervisor(tmp_path):
         counter["n"] += 1
         data_dir = tmp_path / f"sup{counter['n']}"
         data_dir.mkdir()
-        reg = Registry(data_dir / "servers.json")
+        reg = Registry(data_dir / "servers.json", data_dir / "user_servers.json")
         reg.load()
         for spec in specs:
             reg.add(spec)
         settings = make_settings(data_dir, **over)
-        sup = Supervisor(reg, settings, CredStore(data_dir), PendingFlows())
+        sup = Supervisor(
+            reg, settings, CredStore(data_dir), PendingFlows(), make_policy(data_dir, reg)
+        )
         created.append(sup)
         return sup
 
@@ -173,7 +182,7 @@ async def test_failed_source_start_does_not_leak_token(make_supervisor):
         package="my-tool",
         source=f"git+https://oauth2:{token}@127.0.0.1:9/o/r",
     )
-    child = await sup.add(spec)
+    child = await sup.add(spec, ADMIN_ACTOR)
     await child.task
     assert child.status == "failed"
     assert child.last_error is not None
@@ -230,7 +239,7 @@ def test_gateway_secrets_do_not_reach_the_child(make_supervisor, monkeypatch):
 @pytest.mark.asyncio
 async def test_probe_success(make_supervisor):
     sup = make_supervisor()
-    child = await sup.add(fake_child_spec("time", "good"))
+    child = await sup.add(fake_child_spec("time", "good"), ADMIN_ACTOR)
     await child.task
     assert child.status == "running"
     assert child.tool_count == 1
@@ -239,7 +248,7 @@ async def test_probe_success(make_supervisor):
 @pytest.mark.asyncio
 async def test_probe_failure(make_supervisor):
     sup = make_supervisor()
-    child = await sup.add(fake_child_spec("broken", "fail"))
+    child = await sup.add(fake_child_spec("broken", "fail"), ADMIN_ACTOR)
     await child.task
     assert child.status == "failed"
     assert child.last_error
@@ -248,7 +257,7 @@ async def test_probe_failure(make_supervisor):
 @pytest.mark.asyncio
 async def test_probe_timeout(make_supervisor):
     sup = make_supervisor(CHILD_START_TIMEOUT="2")
-    child = await sup.add(fake_child_spec("slow", "hang"))
+    child = await sup.add(fake_child_spec("slow", "hang"), ADMIN_ACTOR)
     await child.task
     assert child.status == "failed"
     assert "timed out" in child.last_error
@@ -257,12 +266,12 @@ async def test_probe_timeout(make_supervisor):
 @pytest.mark.asyncio
 async def test_log_tail_after_failure(make_supervisor):
     sup = make_supervisor()
-    child = await sup.add(fake_child_spec("broken", "fail"))
+    child = await sup.add(fake_child_spec("broken", "fail"), ADMIN_ACTOR)
     await child.task
     deadline = time.time() + 5
     tail = ""
     while time.time() < deadline:
-        tail = sup.log_tail("broken")
+        tail = sup.log_tail(ServerKey(None, "broken"))
         if "child boom" in tail:
             break
         await asyncio.sleep(0.1)
@@ -309,11 +318,11 @@ async def test_log_tail_scrubs_configured_env_secret(make_supervisor):
     spec = fake_child_spec("slack", env={"SLACK_BOT_TOKEN": secret}, enabled=False)
     child = await sup_add_disabled(make_supervisor, spec)
     sup = child["sup"]
-    path = sup._log_path("slack")
+    path = sup._log_path(ServerKey(None, "slack"))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"token={secret}\nlistening on 127.0.0.1\n")
 
-    tail = sup.log_tail("slack")
+    tail = sup.log_tail(ServerKey(None, "slack"))
     assert secret not in tail
     assert "token=•••" in tail
     # A non-secret line is untouched.
@@ -381,15 +390,15 @@ async def test_update_that_changes_secret_discards_stale_disabled_log(make_super
     spec = fake_child_spec("svc", env={"API_KEY": old}, enabled=False)
     child = await sup_add_disabled(make_supervisor, spec)
     sup = child["sup"]
-    path = sup._log_path("svc")
+    path = sup._log_path(ServerKey(None, "svc"))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"boom with {old}\n")
 
     new_spec = fake_child_spec("svc", env={"API_KEY": "new-secret-value-xyz"}, enabled=False)
-    await sup.update(new_spec)
+    await sup.update(ServerKey(None, new_spec.namespace), new_spec, ADMIN_ACTOR)
 
     # The stale log is gone, so the old secret cannot be read back.
-    assert old not in sup.log_tail("svc")
+    assert old not in sup.log_tail(ServerKey(None, "svc"))
 
 
 @pytest.mark.asyncio
@@ -401,14 +410,14 @@ async def test_update_to_enabled_remote_discards_stale_log(make_supervisor):
     spec = fake_child_spec("svc", env={"API_KEY": old}, enabled=False)
     child = await sup_add_disabled(make_supervisor, spec)
     sup = child["sup"]
-    path = sup._log_path("svc")
+    path = sup._log_path(ServerKey(None, "svc"))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"boom with {old}\n")
 
     remote = ServerSpec(namespace="svc", kind="remote", url="http://127.0.0.1:9/mcp")
-    await sup.update(remote)
+    await sup.update(*_keyed(remote), ADMIN_ACTOR)
 
-    assert old not in sup.log_tail("svc")
+    assert old not in sup.log_tail(ServerKey(None, "svc"))
 
 
 @pytest.mark.asyncio
@@ -420,14 +429,14 @@ async def test_remove_then_readd_does_not_expose_the_old_log(make_supervisor):
     spec = fake_child_spec("svc", env={"API_KEY": old}, enabled=False)
     child = await sup_add_disabled(make_supervisor, spec)
     sup = child["sup"]
-    path = sup._log_path("svc")
+    path = sup._log_path(ServerKey(None, "svc"))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"boom with {old}\n")
 
-    await sup.remove("svc")
-    await sup.add(fake_child_spec("svc", enabled=False))
+    await sup.remove(ServerKey(None, "svc"), ADMIN_ACTOR)
+    await sup.add(fake_child_spec("svc", enabled=False), ADMIN_ACTOR)
 
-    assert old not in sup.log_tail("svc")
+    assert old not in sup.log_tail(ServerKey(None, "svc"))
 
 
 @pytest.mark.asyncio
@@ -443,7 +452,7 @@ async def test_mute_during_update_teardown_does_not_expose_the_old_log(
     spec = fake_child_spec("svc", env={"API_KEY": old}, enabled=False)
     child = await sup_add_disabled(make_supervisor, spec)
     sup = child["sup"]
-    path = sup._log_path("svc")
+    path = sup._log_path(ServerKey(None, "svc"))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"boom with {old}\n")
 
@@ -457,17 +466,17 @@ async def test_mute_during_update_teardown_does_not_expose_the_old_log(
 
     monkeypatch.setattr(sup, "_teardown", slow_teardown)
     new_spec = fake_child_spec("svc", env={"API_KEY": "new-secret-value-xyz"}, enabled=False)
-    task = asyncio.create_task(sup.update(new_spec))
+    task = asyncio.create_task(sup.update(*_keyed(new_spec), ADMIN_ACTOR))
     await paused.wait()
 
-    sup.set_namespace_muted("svc", True)
-    assert old not in sup.log_tail("svc")
-    sup.set_tool_muted("svc", "echo", True)
-    assert old not in sup.log_tail("svc")
+    sup.set_namespace_muted(ServerKey(None, "svc"), True, ADMIN_ACTOR)
+    assert old not in sup.log_tail(ServerKey(None, "svc"))
+    sup.set_tool_muted(ServerKey(None, "svc"), "echo", True, ADMIN_ACTOR)
+    assert old not in sup.log_tail(ServerKey(None, "svc"))
 
     release.set()
     await task
-    assert old not in sup.log_tail("svc")
+    assert old not in sup.log_tail(ServerKey(None, "svc"))
 
 
 @pytest.mark.asyncio
@@ -501,15 +510,15 @@ async def test_update_during_start_does_not_let_the_old_child_recreate_the_log(
     # yields on fastmcp 4.0.2), so sweep the update across the start.
     for yields in range(8):
         sup = make_supervisor()
-        await sup.add(spec)
+        await sup.add(spec, ADMIN_ACTOR)
         for _ in range(yields):
             await asyncio.sleep(0)
-        path = sup._log_path("svc")
-        await sup.update(new)
+        path = sup._log_path(ServerKey(None, "svc"))
+        await sup.update(*_keyed(new), ADMIN_ACTOR)
         await asyncio.sleep(0.3)  # give a stray open or a late write the chance
 
         assert not path.exists(), f"recreated after {yields} yields"
-        assert old not in sup.log_tail("svc")
+        assert old not in sup.log_tail(ServerKey(None, "svc"))
 
 
 def _log_gone_at_write(sup, path):
@@ -537,12 +546,12 @@ async def test_update_discards_the_log_before_it_persists(make_supervisor):
     old = "old-secret-value-xyz"
     spec = fake_child_spec("svc", env={"API_KEY": old}, enabled=False)
     sup = (await sup_add_disabled(make_supervisor, spec))["sup"]
-    path = sup._log_path("svc")
+    path = sup._log_path(ServerKey(None, "svc"))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"boom with {old}\n")
     seen = _log_gone_at_write(sup, path)
 
-    await sup.update(fake_child_spec("svc", env={"API_KEY": "new-secret-value-xyz"}, enabled=False))
+    await sup.update(*_keyed(fake_child_spec("svc", env={"API_KEY": "new-secret-value-xyz"}, enabled=False)), ADMIN_ACTOR)
 
     assert seen == [False]
 
@@ -560,7 +569,7 @@ async def test_update_keeps_the_old_record_when_the_log_delete_fails(
     old = "old-secret-value-xyz"
     spec = fake_child_spec("svc", env={"API_KEY": old}, enabled=False)
     sup = (await sup_add_disabled(make_supervisor, spec))["sup"]
-    path = sup._log_path("svc")
+    path = sup._log_path(ServerKey(None, "svc"))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"boom with {old}\n")
     real_unlink = pathlib.Path.unlink
@@ -572,25 +581,25 @@ async def test_update_keeps_the_old_record_when_the_log_delete_fails(
 
     monkeypatch.setattr(pathlib.Path, "unlink", refuse)
     with pytest.raises(PermissionError):
-        await sup.update(
+        await sup.update(*_keyed(
             fake_child_spec("svc", env={"API_KEY": "new-secret-value-xyz"}, enabled=False)
-        )
+        ), ADMIN_ACTOR)
 
-    assert sup.registry.get("svc").env == {"API_KEY": old}
-    sup.set_namespace_muted("svc", True)
-    assert old not in sup.log_tail("svc")
+    assert sup.registry.get(ServerKey(None, "svc")).env == {"API_KEY": old}
+    sup.set_namespace_muted(ServerKey(None, "svc"), True, ADMIN_ACTOR)
+    assert old not in sup.log_tail(ServerKey(None, "svc"))
 
 
 @pytest.mark.asyncio
 async def test_add_discards_a_residue_log_before_it_persists(make_supervisor):
     old = "old-secret-value-xyz"
     sup = make_supervisor()
-    path = sup._log_path("svc")
+    path = sup._log_path(ServerKey(None, "svc"))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"boom with {old}\n")
     seen = _log_gone_at_write(sup, path)
 
-    await sup.add(fake_child_spec("svc", enabled=False))
+    await sup.add(fake_child_spec("svc", enabled=False), ADMIN_ACTOR)
 
     assert seen == [False]
 
@@ -599,12 +608,12 @@ async def test_add_discards_a_residue_log_before_it_persists(make_supervisor):
 async def test_duplicate_add_keeps_the_live_log(make_supervisor):
     spec = fake_child_spec("svc", enabled=False)
     sup = (await sup_add_disabled(make_supervisor, spec))["sup"]
-    path = sup._log_path("svc")
+    path = sup._log_path(ServerKey(None, "svc"))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("live output\n")
 
     with pytest.raises(RegistryError):
-        await sup.add(spec)
+        await sup.add(spec, ADMIN_ACTOR)
 
     assert path.read_text() == "live output\n"
 
@@ -617,13 +626,13 @@ async def test_add_discards_a_residue_log(make_supervisor):
     # discards it, next to the credential residue purge.
     old = "old-secret-value-xyz"
     sup = make_supervisor()
-    path = sup._log_path("svc")
+    path = sup._log_path(ServerKey(None, "svc"))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"boom with {old}\n")
 
-    await sup.add(fake_child_spec("svc", enabled=False))
+    await sup.add(fake_child_spec("svc", enabled=False), ADMIN_ACTOR)
 
-    assert old not in sup.log_tail("svc")
+    assert old not in sup.log_tail(ServerKey(None, "svc"))
     assert not path.exists()
 
 
@@ -632,16 +641,21 @@ async def test_log_tail_with_no_secrets_is_unchanged(make_supervisor):
     spec = fake_child_spec("time", enabled=False)
     child = await sup_add_disabled(make_supervisor, spec)
     sup = child["sup"]
-    path = sup._log_path("time")
+    path = sup._log_path(ServerKey(None, "time"))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("ready\n")
-    assert "ready" in sup.log_tail("time")
+    assert "ready" in sup.log_tail(ServerKey(None, "time"))
+
+
+def _keyed(spec):
+    """`(key, spec)` for `Supervisor.update`, whose key names the child."""
+    return spec.key, spec
 
 
 async def sup_add_disabled(make_supervisor, spec):
     """Register a disabled child so it lands in `_children` without spawning."""
     sup = make_supervisor()
-    obj = await sup.add(spec)
+    obj = await sup.add(spec, ADMIN_ACTOR)
     return {"sup": sup, "child": obj}
 
 
@@ -651,7 +665,7 @@ async def sup_add_disabled(make_supervisor, spec):
 @pytest.mark.asyncio
 async def test_add_enabled_child_starts_it(make_supervisor):
     sup = make_supervisor()
-    child = await sup.add(fake_child_spec("time", "good"))
+    child = await sup.add(fake_child_spec("time", "good"), ADMIN_ACTOR)
     assert child.status == "starting"
     assert "time" in [s.namespace for s in sup.registry.list()]
     await child.task
@@ -660,7 +674,7 @@ async def test_add_enabled_child_starts_it(make_supervisor):
 @pytest.mark.asyncio
 async def test_add_disabled_child(make_supervisor):
     sup = make_supervisor()
-    child = await sup.add(fake_child_spec("time", "good", enabled=False))
+    child = await sup.add(fake_child_spec("time", "good", enabled=False), ADMIN_ACTOR)
     assert child.status == "stopped"
     assert "time" in [s.namespace for s in sup.registry.list()]
 
@@ -668,7 +682,7 @@ async def test_add_disabled_child(make_supervisor):
 @pytest.mark.asyncio
 async def test_update_restarts_a_running_child(make_supervisor):
     sup = make_supervisor()
-    child = await sup.add(fake_child_spec("time", "good"))
+    child = await sup.add(fake_child_spec("time", "good"), ADMIN_ACTOR)
     await child.task
     assert child.status == "running"
     new = ServerSpec(
@@ -677,35 +691,35 @@ async def test_update_restarts_a_running_child(make_supervisor):
         command=child.spec.command,
         args=[*child.spec.args, "--flag-ignored"],
     )
-    updated = await sup.update(new)
+    updated = await sup.update(ServerKey(None, new.namespace), new, ADMIN_ACTOR)
     assert updated.status == "starting"
-    assert sup.registry.get("time").args[-1] == "--flag-ignored"
+    assert sup.registry.get(ServerKey(None, "time")).args[-1] == "--flag-ignored"
     await updated.task
 
 
 @pytest.mark.asyncio
 async def test_remove_requests_close_and_forgets(make_supervisor):
     sup = make_supervisor()
-    child = await sup.add(fake_child_spec("time", "good"))
+    child = await sup.add(fake_child_spec("time", "good"), ADMIN_ACTOR)
     await child.task
     assert child.status == "running"
-    await sup.remove("time")
+    await sup.remove(ServerKey(None, "time"), ADMIN_ACTOR)
     assert "time" not in [s.namespace for s in sup.registry.list()]
     with pytest.raises(KeyError):
-        sup.get("time")
+        sup.get(ServerKey(None, "time"))
     assert sup.table.providers == []
 
 
 @pytest.mark.asyncio
 async def test_remove_during_start(make_supervisor):
     sup = make_supervisor()
-    child = await sup.add(fake_child_spec("time", "good"))
+    child = await sup.add(fake_child_spec("time", "good"), ADMIN_ACTOR)
     assert child.status == "starting"
     # Remove before the probe finishes.
-    await sup.remove("time")
+    await sup.remove(ServerKey(None, "time"), ADMIN_ACTOR)
     assert "time" not in [s.namespace for s in sup.registry.list()]
     with pytest.raises(KeyError):
-        sup.get("time")
+        sup.get(ServerKey(None, "time"))
 
 
 # --- Child lifecycle transitions (12.9) --------------------------------------
@@ -714,10 +728,10 @@ async def test_remove_during_start(make_supervisor):
 @pytest.mark.asyncio
 async def test_restart_from_failed(make_supervisor):
     sup = make_supervisor()
-    child = await sup.add(fake_child_spec("broken", "fail"))
+    child = await sup.add(fake_child_spec("broken", "fail"), ADMIN_ACTOR)
     await child.task
     assert child.status == "failed"
-    await sup.restart("broken")
+    await sup.restart(ServerKey(None, "broken"), ADMIN_ACTOR)
     assert child.status == "starting"
     await child.task
     assert child.status in ("running", "failed")
@@ -726,9 +740,9 @@ async def test_restart_from_failed(make_supervisor):
 @pytest.mark.asyncio
 async def test_enable_sets_starting(make_supervisor):
     sup = make_supervisor()
-    child = await sup.add(fake_child_spec("time", "good", enabled=False))
+    child = await sup.add(fake_child_spec("time", "good", enabled=False), ADMIN_ACTOR)
     assert child.status == "stopped"
-    await sup.enable("time")
+    await sup.enable(ServerKey(None, "time"), ADMIN_ACTOR)
     assert child.status == "starting"
     await child.task
 
@@ -741,14 +755,14 @@ async def test_enable_of_a_running_child_is_a_noop(make_supervisor):
     # subprocess leaked. enable is now idempotent: a non-`stopped` child is
     # left untouched.
     sup = make_supervisor()
-    child = await sup.add(fake_child_spec("time", "good"))
+    child = await sup.add(fake_child_spec("time", "good"), ADMIN_ACTOR)
     await child.task
     assert child.status == "running"
     transport = child.transport
     provider = child.provider
     provider_count = len(sup.table.providers)
 
-    await sup.enable("time")
+    await sup.enable(ServerKey(None, "time"), ADMIN_ACTOR)
 
     assert child.status == "running"
     assert child.task is None  # no second start task
@@ -760,10 +774,10 @@ async def test_enable_of_a_running_child_is_a_noop(make_supervisor):
 @pytest.mark.asyncio
 async def test_restart_of_a_disabled_child(make_supervisor):
     sup = make_supervisor()
-    child = await sup.add(fake_child_spec("time", "good", enabled=False))
+    child = await sup.add(fake_child_spec("time", "good", enabled=False), ADMIN_ACTOR)
     assert child.status == "stopped"
     with pytest.raises(RegistryError):
-        await sup.restart("time")
+        await sup.restart(ServerKey(None, "time"), ADMIN_ACTOR)
     assert child.status == "stopped"
 
 
@@ -777,8 +791,8 @@ async def test_one_of_two_children_fails(make_supervisor, tmp_path):
     # Child `a` runs the real transport; while `brk` exists its `tools/list`
     # raises, so the probe fails through the owned client (no transport swap:
     # the read borrows `session.client`, not `child.transport`).
-    a = await sup.add(fake_child_spec("a", "action", env={"MCPFLOW_BREAK": str(brk)}))
-    b = await sup.add(fake_child_spec("b", "good"))
+    a = await sup.add(fake_child_spec("a", "action", env={"MCPFLOW_BREAK": str(brk)}), ADMIN_ACTOR)
+    b = await sup.add(fake_child_spec("b", "good"), ADMIN_ACTOR)
     # Capture the task refs before awaiting: a finished start clears child.task
     # to None (the in-flight task, else None).
     a_task, b_task = a.task, b.task
@@ -788,7 +802,10 @@ async def test_one_of_two_children_fails(make_supervisor, tmp_path):
     assert len(sup.table.providers) == 2
     # Child a's connection breaks: any list_tools on it now raises.
     brk.write_text("")
-    views = await sup.tools()
+    # Failure detection now comes from the background probe (D3/D4): make the
+    # snapshot stale, render to start the probe, await it, then render again.
+    await run_stale_probe(sup, admin_reach(sup), a.session)
+    views = await sup.tools(admin_reach(sup))
     assert a.status == "failed"
     assert b.status == "running"
     # The gateway keeps serving b's tools.
@@ -800,7 +817,7 @@ async def test_one_of_two_children_fails(make_supervisor, tmp_path):
 @pytest.mark.asyncio
 async def test_provider_added_after_probe(make_supervisor):
     sup = make_supervisor()
-    child = await sup.add(fake_child_spec("time", "good"))
+    child = await sup.add(fake_child_spec("time", "good"), ADMIN_ACTOR)
     await child.task
     assert child.status == "running"
     assert child.provider is not None
@@ -810,10 +827,10 @@ async def test_provider_added_after_probe(make_supervisor):
 @pytest.mark.asyncio
 async def test_provider_removed_on_stop(make_supervisor):
     sup = make_supervisor()
-    child = await sup.add(fake_child_spec("time", "good"))
+    child = await sup.add(fake_child_spec("time", "good"), ADMIN_ACTOR)
     await child.task
     assert len(sup.table.providers) == 1
-    await sup.disable("time")
+    await sup.disable(ServerKey(None, "time"), ADMIN_ACTOR)
     assert child.status == "stopped"
     assert sup.table.providers == []
     assert child.transport is None
@@ -865,7 +882,7 @@ async def test_teardown_releases_everything_when_a_base_exception_escapes(
     handle it owns), and closed the generation. Before, it escaped with the
     transport, the process, and the log handle still held."""
     sup = make_supervisor()
-    child = await sup.add(fake_child_spec("time", "good"))
+    child = await sup.add(fake_child_spec("time", "good"), ADMIN_ACTOR)
     await child.task
     assert child.status == "running"
     transport, session, provider = child.transport, child.session, child.provider
@@ -917,17 +934,17 @@ async def test_disable_completes_when_close_raises_ordinary_or_cancelled(
     """`_teardown` swallows `Exception` and `CancelledError`, so `disable`
     reaches its status assignment and the handle is dropped regardless."""
     sup = make_supervisor()
-    child = await sup.add(fake_child_spec("time", "good"))
+    child = await sup.add(fake_child_spec("time", "good"), ADMIN_ACTOR)
     await child.task
     child.transport.log.close()  # the stub below drops the real transport
     child.transport = _RaisingTransport(exc)
 
-    await sup.disable("time")
+    await sup.disable(ServerKey(None, "time"), ADMIN_ACTOR)
 
     assert child.status == "stopped"
     assert sup.table.providers == []
     assert child.transport is None
-    assert sup.registry.get("time").enabled is False
+    assert sup.registry.get(ServerKey(None, "time")).enabled is False
 
 
 @pytest.mark.asyncio
@@ -943,19 +960,19 @@ async def test_disable_leaves_the_handle_when_close_raises_baseexception(
         pass
 
     sup = make_supervisor()
-    child = await sup.add(fake_child_spec("time", "good"))
+    child = await sup.add(fake_child_spec("time", "good"), ADMIN_ACTOR)
     await child.task
     child.transport.log.close()  # the stub below drops the real transport
     child.transport = _RaisingTransport(Boom)
 
     with pytest.raises(Boom):
-        await sup.disable("time")
+        await sup.disable(ServerKey(None, "time"), ADMIN_ACTOR)
 
     assert child.status == "running"
     assert child.transport is not None
     # The provider is released before the close, so it is already gone.
     assert sup.table.providers == []
-    assert sup.registry.get("time").enabled is False
+    assert sup.registry.get(ServerKey(None, "time")).enabled is False
 
     # Drop the raising transport, or the fixture's shutdown re-raises it.
     child.transport = None
@@ -969,9 +986,9 @@ async def test_enable_refuses_awaiting(make_supervisor):
     sup = make_supervisor(fake_child_spec("gmail", "good", enabled=False))
     sup.creds.write_client("gmail", "google-client", _CREDS)
     with pytest.raises(RegistryError) as exc:
-        await sup.enable("gmail")
+        await sup.enable(ServerKey(None, "gmail"), ADMIN_ACTOR)
     assert "gmail" in str(exc.value) and "awaits authorization" in str(exc.value)
-    assert sup.get("gmail").status == "stopped"
+    assert sup.get(ServerKey(None, "gmail")).status == "stopped"
 
 
 @pytest.mark.asyncio
@@ -980,9 +997,9 @@ async def test_update_refuses_awaiting(make_supervisor):
     sup.creds.write_client("gmail", "google-client", _CREDS)
     spec = fake_child_spec("gmail", "good", enabled=True)
     with pytest.raises(RegistryError) as exc:
-        await sup.update(spec)
+        await sup.update(ServerKey(None, spec.namespace), spec, ADMIN_ACTOR)
     assert "awaits authorization" in str(exc.value)
-    assert sup.registry.get("gmail").enabled is False
+    assert sup.registry.get(ServerKey(None, "gmail")).enabled is False
 
 
 @pytest.mark.asyncio
@@ -990,7 +1007,7 @@ async def test_add_refuses_awaiting(make_supervisor):
     sup = make_supervisor()
     sup.creds.write_client("gmail", "google-client", _CREDS)
     with pytest.raises(RegistryError) as exc:
-        await sup.add(fake_child_spec("gmail", "good", enabled=True))
+        await sup.add(fake_child_spec("gmail", "good", enabled=True), ADMIN_ACTOR)
     assert "awaits authorization" in str(exc.value)
 
 
@@ -999,8 +1016,8 @@ async def test_enable_after_token_exists(make_supervisor):
     sup = make_supervisor(fake_child_spec("gmail", "good", enabled=False))
     sup.creds.write_client("gmail", "google-client", _CREDS)
     sup.creds.write_token("gmail", "google-auth-library", _TOKENS)
-    await sup.enable("gmail")
-    child = sup.get("gmail")
+    await sup.enable(ServerKey(None, "gmail"), ADMIN_ACTOR)
+    child = sup.get(ServerKey(None, "gmail"))
     if child.task is not None:
         await child.task
     assert child.status == "running"
@@ -1011,9 +1028,9 @@ async def test_remove_deletes_creds_and_flow(make_supervisor):
     sup = make_supervisor(fake_child_spec("gmail", "good", enabled=False))
     sup.creds.write_client("gmail", "google-client", _CREDS)
     sup.creds.write_token("gmail", "google-auth-library", _TOKENS)
-    flow = sup.flows.create("gmail", "gmail", _CREDS)
+    flow = sup.flows.create("gmail", "gmail", _CREDS, ADMIN_ACTOR)
     assert (sup.creds.root / "gmail").exists()
-    await sup.remove("gmail")
+    await sup.remove(ServerKey(None, "gmail"), ADMIN_ACTOR)
     assert not (sup.creds.root / "gmail").exists()
     assert sup.flows.pop(flow.state) is None
 
@@ -1021,7 +1038,7 @@ async def test_remove_deletes_creds_and_flow(make_supervisor):
 @pytest.mark.asyncio
 async def test_remove_without_creds_ok(make_supervisor):
     sup = make_supervisor(fake_child_spec("gmail", "good", enabled=False))
-    await sup.remove("gmail")  # no creds, no error
+    await sup.remove(ServerKey(None, "gmail"), ADMIN_ACTOR)  # no creds, no error
     assert "gmail" not in [s.namespace for s in sup.registry.list()]
 
 
@@ -1029,12 +1046,12 @@ async def test_remove_without_creds_ok(make_supervisor):
 async def test_finish_oauth_success(make_supervisor):
     sup = make_supervisor(fake_child_spec("gmail", "good", enabled=False))
     sup.creds.write_client("gmail", "google-client", _CREDS)
-    flow = sup.flows.create("gmail", "gmail", _CREDS)
+    flow = sup.flows.create("gmail", "gmail", _CREDS, ADMIN_ACTOR)
     ok = await sup.finish_oauth(flow, "google-auth-library", _TOKENS)
     assert ok is True
     assert sup.creds.has_token("gmail")
     assert sup.flows.pop(flow.state) is None  # consumed
-    child = sup.get("gmail")
+    child = sup.get(ServerKey(None, "gmail"))
     if child.task is not None:
         await child.task
     assert child.status == "running"
@@ -1045,8 +1062,8 @@ async def test_finish_oauth_rejects_when_removed(make_supervisor):
     # A delete during the token exchange: finish_oauth must write nothing.
     sup = make_supervisor(fake_child_spec("gmail", "good", enabled=False))
     sup.creds.write_client("gmail", "google-client", _CREDS)
-    flow = sup.flows.create("gmail", "gmail", _CREDS)
-    await sup.remove("gmail")  # discards the flow, removes creds
+    flow = sup.flows.create("gmail", "gmail", _CREDS, ADMIN_ACTOR)
+    await sup.remove(ServerKey(None, "gmail"), ADMIN_ACTOR)  # discards the flow, removes creds
     ok = await sup.finish_oauth(flow, "google-auth-library", _TOKENS)
     assert ok is False
     assert not (sup.creds.root / "gmail").exists()
@@ -1061,7 +1078,7 @@ _NEW_TOKENS = {
 
 async def _connected_running(sup):
     """An enabled, running, authorized `gmail` child."""
-    child = await sup.add(fake_child_spec("gmail", "good", enabled=True, catalog="gmail"))
+    child = await sup.add(fake_child_spec("gmail", "good", enabled=True, catalog="gmail"), ADMIN_ACTOR)
     if child.task is not None:
         await child.task
     sup.creds.write_client("gmail", "google-client", ClientCreds("old-id", "old-secret"))
@@ -1075,7 +1092,7 @@ async def test_finish_oauth_reauth_writes_client_and_token(make_supervisor):
 
     sup = make_supervisor()
     await _connected_running(sup)
-    flow = sup.flows.create("gmail", "gmail", ClientCreds("new-id", "new-secret"), reauth=True)
+    flow = sup.flows.create("gmail", "gmail", ClientCreds("new-id", "new-secret"), ADMIN_ACTOR, reauth=True)
     ok = await sup.finish_oauth(
         flow, "google-auth-library", _NEW_TOKENS,
         client_fmt="google-client", reauth=True,
@@ -1091,13 +1108,13 @@ async def test_finish_oauth_reauth_writes_client_and_token(make_supervisor):
 async def test_finish_oauth_reauth_restarts(make_supervisor):
     sup = make_supervisor()
     await _connected_running(sup)
-    flow = sup.flows.create("gmail", "gmail", ClientCreds("new-id", "new-secret"), reauth=True)
+    flow = sup.flows.create("gmail", "gmail", ClientCreds("new-id", "new-secret"), ADMIN_ACTOR, reauth=True)
     ok = await sup.finish_oauth(
         flow, "google-auth-library", _NEW_TOKENS,
         client_fmt="google-client", reauth=True,
     )
     assert ok is True
-    child = sup.get("gmail")
+    child = sup.get(ServerKey(None, "gmail"))
     if child.task is not None:
         await child.task
     assert child.status == "running"
@@ -1110,8 +1127,8 @@ async def test_finish_oauth_reauth_honors_disable(make_supervisor):
 
     sup = make_supervisor()
     await _connected_running(sup)
-    await sup.disable("gmail")  # a disable during the flow
-    flow = sup.flows.create("gmail", "gmail", ClientCreds("new-id", "new-secret"), reauth=True)
+    await sup.disable(ServerKey(None, "gmail"), ADMIN_ACTOR)  # a disable during the flow
+    flow = sup.flows.create("gmail", "gmail", ClientCreds("new-id", "new-secret"), ADMIN_ACTOR, reauth=True)
     ok = await sup.finish_oauth(
         flow, "google-auth-library", _NEW_TOKENS,
         client_fmt="google-client", reauth=True,
@@ -1120,8 +1137,8 @@ async def test_finish_oauth_reauth_honors_disable(make_supervisor):
     # The new token is written, but the child stays stopped: the disable wins.
     token_on_disk = json.loads(sup.creds.paths("gmail").token.read_text())
     assert token_on_disk["access_token"] == "new-access"
-    assert sup.get("gmail").status == "stopped"
-    assert sup.registry.get("gmail").enabled is False
+    assert sup.get(ServerKey(None, "gmail")).status == "stopped"
+    assert sup.registry.get(ServerKey(None, "gmail")).enabled is False
 
 
 # --- header sink (remote-oauth) ----------------------------------------------
@@ -1136,12 +1153,12 @@ def _header_child(**over):
 @pytest.mark.asyncio
 async def test_finish_oauth_header_sink(make_supervisor):
     sup = make_supervisor(_header_child())
-    flow = sup.flows.create("linear", "linear", _CREDS)
+    flow = sup.flows.create("linear", "linear", _CREDS, ADMIN_ACTOR)
     ok = await sup.finish_oauth(
         flow, None, {"access_token": "tok-xyz"}, header=HeaderSpec("Authorization", "Bearer")
     )
     assert ok is True
-    spec = sup.registry.get("linear")
+    spec = sup.registry.get(ServerKey(None, "linear"))
     assert spec.headers["Authorization"] == "Bearer tok-xyz"
     assert spec.oauth_pending is False
     # The header token has the same exposure as a hand-typed header: scrubbed
@@ -1151,7 +1168,7 @@ async def test_finish_oauth_header_sink(make_supervisor):
 
     secrets = sup._secrets_of(spec)
     assert "tok-xyz" not in scrub_secrets("child error: token tok-xyz", secrets)
-    child = sup.get("linear")
+    child = sup.get(ServerKey(None, "linear"))
     if child.task is not None:
         await child.task
     assert child.status == "running"
@@ -1161,9 +1178,9 @@ async def test_finish_oauth_header_sink(make_supervisor):
 async def test_enable_refuses_header_pending(make_supervisor):
     sup = make_supervisor(_header_child())
     with pytest.raises(RegistryError) as exc:
-        await sup.enable("linear")
+        await sup.enable(ServerKey(None, "linear"), ADMIN_ACTOR)
     assert "awaits authorization" in str(exc.value)
-    assert sup.get("linear").status == "stopped"
+    assert sup.get(ServerKey(None, "linear")).status == "stopped"
 
 
 @pytest.mark.asyncio
@@ -1173,13 +1190,13 @@ async def test_update_preserves_oauth_pending(make_supervisor):
     sup = make_supervisor(_header_child())
     enabling = fake_child_spec("linear", "good", enabled=True, catalog="linear")
     with pytest.raises(RegistryError) as exc:
-        await sup.update(enabling)
+        await sup.update(ServerKey(None, enabling.namespace), enabling, ADMIN_ACTOR)
     assert "awaits authorization" in str(exc.value)
-    assert sup.registry.get("linear").oauth_pending is True
+    assert sup.registry.get(ServerKey(None, "linear")).oauth_pending is True
     # A benign disabled edit is applied but still preserves the flag.
     benign = fake_child_spec("linear", "good", enabled=False, catalog="linear")
-    await sup.update(benign)
-    assert sup.registry.get("linear").oauth_pending is True
+    await sup.update(ServerKey(None, benign.namespace), benign, ADMIN_ACTOR)
+    assert sup.registry.get(ServerKey(None, "linear")).oauth_pending is True
 
 
 @pytest.mark.asyncio
@@ -1187,8 +1204,8 @@ async def test_finish_oauth_header_atomic_with_remove(make_supervisor):
     # A delete during the exchange: finish_oauth writes no header for a gone
     # namespace (the pop under the child lock returns None).
     sup = make_supervisor(_header_child())
-    flow = sup.flows.create("linear", "linear", _CREDS)
-    await sup.remove("linear")
+    flow = sup.flows.create("linear", "linear", _CREDS, ADMIN_ACTOR)
+    await sup.remove(ServerKey(None, "linear"), ADMIN_ACTOR)
     ok = await sup.finish_oauth(
         flow, None, {"access_token": "x"}, header=HeaderSpec("Authorization", "Bearer")
     )
@@ -1201,16 +1218,17 @@ async def test_finish_oauth_header_atomic_with_remove(make_supervisor):
 
 def _proxy_cache_ttl(child) -> float:
     # Reads the private `ProxyProvider._cache_ttl` of FastMCP 4.0.x, under the
-    # visibility and namespace wrappers. A FastMCP upgrade that renames either
-    # attribute breaks this helper only; the `grow` tests in test_gateway.py
-    # stay the behavioral proof.
-    return child.provider._inner._inner._cache_ttl
+    # visibility and namespace wrappers, inside the AuthorizedHashProvider that
+    # wraps every child chain (multi-user-access D6). A FastMCP upgrade that
+    # renames either attribute breaks this helper only; the `grow` tests in
+    # test_gateway.py stay the behavioral proof.
+    return child.provider._chain._inner._inner._cache_ttl
 
 
 @pytest.mark.asyncio
 async def test_provider_takes_the_gateway_default(make_supervisor):
     sup = make_supervisor()
-    child = await sup.add(fake_child_spec("time", "good"))
+    child = await sup.add(fake_child_spec("time", "good"), ADMIN_ACTOR)
     await child.task
     assert child.status == "running"
     assert _proxy_cache_ttl(child) == 300.0
@@ -1219,7 +1237,7 @@ async def test_provider_takes_the_gateway_default(make_supervisor):
 @pytest.mark.asyncio
 async def test_provider_takes_the_configured_gateway_default(make_supervisor):
     sup = make_supervisor(CHILD_CACHE_TTL="2")
-    child = await sup.add(fake_child_spec("time", "good"))
+    child = await sup.add(fake_child_spec("time", "good"), ADMIN_ACTOR)
     await child.task
     assert child.status == "running"
     assert _proxy_cache_ttl(child) == 2.0
@@ -1228,7 +1246,334 @@ async def test_provider_takes_the_configured_gateway_default(make_supervisor):
 @pytest.mark.asyncio
 async def test_provider_takes_the_per_child_override(make_supervisor):
     sup = make_supervisor()
-    child = await sup.add(fake_child_spec("skills", "good", cache_ttl=0))
+    child = await sup.add(fake_child_spec("skills", "good", cache_ttl=0), ADMIN_ACTOR)
     await child.task
     assert child.status == "running"
     assert _proxy_cache_ttl(child) == 0.0
+
+
+# --- 10E (10.21): source ownership by reference ------------------------------
+#
+# Guarded invariant: OpTouchesOnlyOwnPaths
+# (specs/tla/multi_user_access_lifecycle.tla, negative config
+# multi_user_access_lifecycle_nskeyed.cfg): a child never runs from the store
+# directory of another key.
+
+import os
+
+from keyed_stores import (  # noqa: F401
+    ALICE,
+    BOB,
+    build,
+    drain,
+    tree,
+    user_add,
+    user_spec,
+)
+
+
+def _src(namespace: str, source, owner=None, **over) -> ServerSpec:
+    package = "p==1.0.0" if owner else "p"
+    return ServerSpec(namespace=namespace, kind="python", package=package,
+                      source=str(source), owner=owner, **over)
+
+
+def _names(exc, source, ref: str) -> bool:
+    """The message names `source` and the reference `ref` outside the quoted
+    source path (the path itself may hold the same text)."""
+    import re
+
+    msg = str(exc.value)
+    rest = msg.replace(str(source), "")
+    return "source" in msg and re.search(
+        rf"(?<![\w@/]){re.escape(ref)}(?![\w@/])", rest) is not None
+
+
+def _files(sup) -> dict:
+    data = sup.settings.data_dir
+    return {n: (data / n).read_bytes() if (data / n).exists() else None
+            for n in ("servers.json", "user_servers.json")}
+
+
+@pytest.mark.asyncio
+async def test_source_of_another_namespace_rejected_on_add(tmp_path):
+    """Source of another namespace rejected on add: names `source` and `a`,
+    and `servers.json` is unchanged."""
+    sup = build(tmp_path)
+    a_dir = sup.sources.write("a", {"main.py": "x"})
+    before = _files(sup)
+    try:
+        with pytest.raises(RegistryError) as exc:
+            await sup.add(_src("b", a_dir, enabled=False), ADMIN_ACTOR)
+        assert _names(exc, a_dir, "a")
+        assert _files(sup) == before
+    finally:
+        await drain(sup)
+
+
+@pytest.mark.asyncio
+async def test_source_of_another_owner_rejected(tmp_path):
+    """Source of another owner rejected (F2): `alice`'s `github` with source
+    `servers/github` is refused, naming `source` and `github`; the user file
+    is unchanged. Section 5 owns `_check_source`; the add runs the check
+    before the registry write."""
+    sup = build(tmp_path)
+    admin_dir = sup.sources.write("github", {"main.py": "admin"})
+    spec = _src("github", admin_dir, owner="alice", enabled=False)
+    before = _files(sup)
+    try:
+        with pytest.raises(RegistryError) as exc:
+            sup._check_source(spec)
+        assert _names(exc, admin_dir, "github")
+        assert _files(sup) == before
+        with pytest.raises(RegistryError) as exc:
+            await user_add(sup, spec)
+        assert _names(exc, admin_dir, "github")
+        assert _files(sup) == before
+    finally:
+        await drain(sup)
+
+
+@pytest.mark.asyncio
+async def test_source_of_another_namespace_rejected_on_update(tmp_path):
+    """Source of another namespace rejected on update: refused before any
+    teardown, and running `b` keeps its previous spec."""
+    sup = build(tmp_path, fake_child_spec("b", "good", enabled=False))
+    a_dir = sup.sources.write("a", {"main.py": "x"})
+    key = ServerKey(None, "b")
+    await sup.enable(key, ADMIN_ACTOR)
+    child = sup.get(key)
+    await child.task
+    assert child.status == "running"
+    torn: list = []
+    real = sup._teardown
+
+    async def teardown(c):
+        torn.append(c)
+        await real(c)
+
+    sup._teardown = teardown
+    try:
+        with pytest.raises(RegistryError, match="source"):
+            await sup.update(key, _src("b", a_dir), ADMIN_ACTOR)
+        assert torn == []
+        assert sup.get(key).status == "running"
+        assert sup.registry.get(key).kind == "custom"
+    finally:
+        await drain(sup)
+
+
+@pytest.mark.asyncio
+async def test_subdirectory_of_own_directory_rejected(tmp_path):
+    """Subdirectory of own directory rejected: names `source`."""
+    sup = build(tmp_path)
+    own = sup.sources.write("a", {"sub/main.py": "x"})
+    try:
+        with pytest.raises(RegistryError, match="source"):
+            await sup.add(_src("a", own / "sub", enabled=False), ADMIN_ACTOR)
+    finally:
+        await drain(sup)
+
+
+@pytest.mark.asyncio
+async def test_own_directory_accepted(tmp_path):
+    """Own directory accepted: the add succeeds and the child is starting."""
+    sup = build(tmp_path)
+    own = sup.sources.write("a", {"main.py": "x"})
+    try:
+        child = await sup.add(_src("a", own), ADMIN_ACTOR)
+        assert child.status == "starting"
+    finally:
+        await sup.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_user_spec_cannot_point_at_another_reference(tmp_path):
+    """A user spec cannot point at another reference (F2): `_check_source`
+    names `source` and `github`; the registry does not change. A symlink at
+    `servers/x@alice` that points at `servers/github` is refused the same way."""
+    sup = build(tmp_path)
+    admin_dir = sup.sources.write("github", {"main.py": "admin"})
+    link = sup.sources.root / "x@alice"
+    os.symlink(admin_dir, link)
+    before = _files(sup)
+    try:
+        for spec in (_src("github", admin_dir, owner="alice"),
+                     _src("x", link, owner="alice")):
+            with pytest.raises(RegistryError) as exc:
+                sup._check_source(spec)
+            assert _names(exc, spec.source, "github")
+        assert _files(sup) == before
+        assert sup.sources.owns(str(link), "x@alice") is False
+    finally:
+        await drain(sup)
+
+
+@pytest.mark.asyncio
+async def test_a_traversal_source_resolves_before_the_check(tmp_path):
+    """A traversal source resolves before the check: `servers/tool@alice/..
+    /github` resolves to `servers/github` and is refused naming `github`."""
+    sup = build(tmp_path)
+    sup.sources.write("github", {"main.py": "admin"})
+    sup.sources.write("tool@alice", {"main.py": "alice"})
+    source = f"{sup.sources.root}/tool@alice/../github"
+    spec = _src("tool", source, owner="alice", enabled=False)
+    before = _files(sup)
+    try:
+        with pytest.raises(RegistryError) as exc:
+            sup._check_source(spec)
+        assert _names(exc, source, "github")
+        with pytest.raises(RegistryError) as exc:
+            await user_add(sup, spec)
+        assert _names(exc, source, "github")
+        assert _files(sup) == before
+    finally:
+        await drain(sup)
+
+
+# --- 10E (10.22): stores key by the server reference -------------------------
+#
+# Guarded invariant: OpTouchesOnlyOwnPaths
+# (specs/tla/multi_user_access_lifecycle.tla, negative config
+# multi_user_access_lifecycle_nskeyed.cfg).
+
+from keyed_stores import TOKENS as _KS_TOKENS
+
+
+@pytest.mark.asyncio
+async def test_a_user_add_keeps_the_admin_credential(tmp_path):
+    """A user add keeps the admin credential (F2): `creds/github/token.json`
+    still exists, and the purge touches only `creds/github@alice/`."""
+    sup = build(tmp_path, fake_child_spec("github", "good", enabled=False))
+    sup.creds.write_token("github", "google-auth-library", _KS_TOKENS)
+    sup.creds.write_token("github@alice", "google-auth-library", _KS_TOKENS)
+    admin_before = tree(tmp_path / "creds" / "github")
+    try:
+        await user_add(sup, user_spec("github", "alice", enabled=False))
+        assert tree(tmp_path / "creds" / "github") == admin_before
+        assert not (tmp_path / "creds" / "github@alice").exists()
+    finally:
+        await drain(sup)
+
+
+@pytest.mark.asyncio
+async def test_a_user_remove_keeps_the_admin_sources(tmp_path):
+    """A user remove keeps the admin sources (F2): `servers/github` stays
+    byte-identical and admin-owned `github` keeps running."""
+    sup = build(tmp_path, user_spec("github", "alice", enabled=False))
+    admin_dir = sup.sources.write("github", {"main.py": "admin"})
+    await sup.add(_src("github", admin_dir, enabled=False), ADMIN_ACTOR)
+    admin = sup.get(ServerKey(None, "github"))
+    admin.status = "running"  # stands in for a live child; no uvx build
+    servers_before = tree(sup.sources.root)
+    torn: list = []
+    real = sup._teardown
+
+    async def teardown(c):
+        torn.append(c)
+        await real(c)
+
+    sup._teardown = teardown
+    try:
+        await sup.remove(ServerKey("alice", "github"), ADMIN_ACTOR)
+        assert admin not in torn
+        assert tree(sup.sources.root) == servers_before
+        assert sup.get(ServerKey(None, "github")) is admin
+        assert admin.status == "running"
+    finally:
+        admin.status = "stopped"
+        await drain(sup)
+
+
+@pytest.mark.asyncio
+async def test_a_removal_reserves_the_key_not_the_namespace(tmp_path):
+    """A removal reserves the key, not the namespace: while `github@alice`
+    is inside its teardown, an add of `github` under another key (the
+    admin's) succeeds. The `bob` variant follows."""
+    sup = build(tmp_path, user_spec("github", "alice", enabled=False))
+    entered, released = asyncio.Event(), asyncio.Event()
+    real = sup._teardown
+
+    async def blocked(c):
+        entered.set()
+        await released.wait()
+        await real(c)
+
+    sup._teardown = blocked
+    task = asyncio.create_task(sup.remove(ServerKey("alice", "github"), ADMIN_ACTOR))
+    try:
+        await entered.wait()
+        sup._teardown = real
+        await sup.add(fake_child_spec("github", "good", enabled=False), ADMIN_ACTOR)
+        assert ServerKey(None, "github") in {s.key for s in sup.registry.list()}
+        released.set()
+        await task
+        assert ServerKey("alice", "github") not in {s.key for s in sup.registry.list()}
+    finally:
+        released.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await drain(sup)
+
+
+@pytest.mark.asyncio
+async def test_a_removal_reserves_the_key_for_a_user_add(tmp_path):
+    """A removal reserves the key, not the namespace: `bob` adds `github`
+    while the removal of `github@alice` is inside its teardown."""
+    sup = build(tmp_path, user_spec("github", "alice", enabled=False))
+    entered, released = asyncio.Event(), asyncio.Event()
+    real = sup._teardown
+
+    async def blocked(c):
+        entered.set()
+        await released.wait()
+        await real(c)
+
+    sup._teardown = blocked
+    task = asyncio.create_task(sup.remove(ServerKey("alice", "github"), ADMIN_ACTOR))
+    try:
+        await entered.wait()
+        await user_add(sup, user_spec("github", "bob", enabled=False), BOB)
+        assert ServerKey("bob", "github") in {s.key for s in sup.registry.list()}
+    finally:
+        released.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await drain(sup)
+
+
+@pytest.mark.asyncio
+async def test_admin_owned_paths_do_not_move(tmp_path):
+    """Admin-owned paths do not move: `time` logs to `logs/time.log` and its
+    credentials stay in `creds/time/`."""
+    sup = build(tmp_path, fake_child_spec("time", "good", enabled=False))
+    key = ServerKey(None, "time")
+    assert sup.creds.paths("time").client.parent == tmp_path / "creds" / "time"
+    try:
+        await sup.enable(key, ADMIN_ACTOR)
+        await sup.get(key).task
+        assert sorted(p.name for p in (tmp_path / "logs").iterdir()) == ["time.log"]
+        (tmp_path / "logs" / "time.log").write_text("TIME-MARK\n")
+        assert "TIME-MARK" in sup.log_tail(key)
+    finally:
+        await drain(sup)
+
+
+@pytest.mark.asyncio
+async def test_two_users_own_the_same_namespace_logs(tmp_path):
+    """Two users own the same namespace: their logs are
+    `logs/github@alice.log` and `logs/github@bob.log`, and admin-owned
+    `github` keeps `logs/github.log`."""
+    sup = build(tmp_path, fake_child_spec("github", "good", enabled=False),
+                user_spec("github", "alice", enabled=False),
+                user_spec("github", "bob", enabled=False))
+    logs = tmp_path / "logs"
+    marks = {"github": "ADMIN-MARK", "github@alice": "ALICE-MARK",
+             "github@bob": "BOB-MARK"}
+    for ref, mark in marks.items():
+        (logs / f"{ref}.log").write_text(mark + "\n")
+    try:
+        for ref, mark in marks.items():
+            tail = sup.log_tail(ServerKey.parse(ref))
+            assert mark in tail
+            assert all(m not in tail for m in marks.values() if m != mark)
+    finally:
+        await drain(sup)

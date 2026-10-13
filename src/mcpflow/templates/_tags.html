@@ -1,0 +1,43 @@
+{# Membership tags, one macro for both lists (D4). The caller sets exactly one
+   of `group` and `user`; each item fills the other name. The macro owns the
+   URL shape and the accessible name of the x button. A tag is a <div>, not a
+   <span>: it holds a <form>. No form ever holds another form.
+
+   Import the macros `with context`: they read `bootstrap_id` and
+   `admins_group`. The chip that joins the bootstrap user and `admins` is
+   locked: no form, no x, a lock (admins-group D9). #}
+{% macro shield_icon() %}<svg class="shield" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5 13 3.5v4c0 3.2-2.1 5.6-5 7-2.9-1.4-5-3.8-5-7v-4z"/></svg>{% endmacro %}
+
+{% macro lock_icon() %}<span class="lock" title="Locked for the bootstrap user" aria-label="Locked"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3.5" y="7" width="9" height="7" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg></span>{% endmacro %}
+
+{% macro member_tag(item, group, user, back) %}
+{% set g = group if group is not none else item %}
+{% set u = user if user is not none else item %}
+{# The shield marks the group `admins` in the Users section only, where the
+   item is the group. #}
+{% set admins_chip = group is none and item == admins_group %}
+{% set cls = "tag admins" if admins_chip else "tag" %}
+{% if g == admins_group and u == bootstrap_id %}
+<div class="{{ cls }} nox">{% if admins_chip %}{{ shield_icon() }}{% endif %}<code>{{ item }}</code>{{ lock_icon() }}</div>
+{% else %}
+<div class="{{ cls }}">{% if admins_chip %}{{ shield_icon() }}{% endif %}<code>{{ item }}</code><form class="inline" method="post" action="/groups/{{ g }}/members/{{ u }}/remove?from={{ back }}"><button class="tag-x" type="submit" aria-label="Remove {{ u }} from {{ g }}" title="Remove {{ u }} from {{ g }}"><svg viewBox="0 0 10 10" aria-hidden="true"><line x1="2" y1="2" x2="8" y2="8"/><line x1="8" y1="2" x2="2" y2="8"/></svg></button></form></div>
+{% endif %}
+{% endmacro %}
+
+{% macro member_tags(items, group=none, user=none, back="groups") %}
+{% set sorted_items = items | sort %}
+{% if not sorted_items %}
+<span class="muted">none</span>
+{% elif sorted_items | length <= 3 %}
+<div class="tags">{% for item in sorted_items %}{{ member_tag(item, group, user, back) }}{% endfor %}</div>
+{% else %}
+<div class="tags">
+  <span class="muted small">{{ sorted_items | length }}</span>
+  {% for item in sorted_items[:3] %}{{ member_tag(item, group, user, back) }}{% endfor %}
+  <details class="tags-more">
+    <summary>+{{ sorted_items | length - 3 }} more</summary>
+    <div class="tags">{% for item in sorted_items[3:] %}{{ member_tag(item, group, user, back) }}{% endfor %}</div>
+  </details>
+</div>
+{% endif %}
+{% endmacro %}

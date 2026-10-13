@@ -21,24 +21,24 @@ from urllib.parse import parse_qs, parse_qsl, urlsplit
 
 import httpx
 import pytest
-from conftest import fake_child_spec, seed_registry
+from conftest import ADMIN_ACTOR, fake_child_spec, seed_registry
 
 from mcpflow.auth import TokenStore
 from mcpflow.oauth import ClientCreds
-from mcpflow.registry import Registry, ServerSpec
+from mcpflow.registry import Registry, ServerKey, ServerSpec
 
 PUBLIC = "https://mcp.example"
 
 
 def seed_with_admin(*specs: ServerSpec, holder: dict):
     def seed(data_dir: Path) -> None:
-        reg = Registry(data_dir / "servers.json")
+        reg = Registry(data_dir / "servers.json", data_dir / "user_servers.json")
         reg.load()
         for spec in specs:
             reg.add(spec)
-        store = TokenStore(data_dir / "tokens.json")
+        store = TokenStore(data_dir / "tokens.json", data_dir / "user_tokens.json")
         store.load()
-        _record, token = store.create("admin", "admin")
+        _record, token = store.create("admin", "admin", "admin")
         holder["admin"] = token
 
     return seed
@@ -159,9 +159,9 @@ def test_connect_registers_disabled_and_redirects(server_factory):
     assert q["client_id"] == ["abc"] and q["state"]
     assert q["redirect_uri"] == ["https://mcp.example/oauth/callback"]
 
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    spec = reg.get("gmail")
+    spec = reg.get(ServerKey(None, "gmail"))
     assert spec.enabled is False
     creds_dir = server.data_dir / "creds" / "gmail"
     assert spec.env["GMAIL_OAUTH_PATH"] == str(creds_dir / "client.json")
@@ -180,9 +180,29 @@ def test_connect_missing_secret(server_factory):
     client.close()
     assert resp.status_code == 400
     assert "client_secret is required" in resp.text
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
     assert not any(s.namespace == "gmail" for s in reg.list())
+
+
+@pytest.mark.parametrize("namespace", ["bad-name", "gmail@alice", "Gmail"])
+def test_connect_bad_namespace_rerenders_not_500(server_factory, namespace):
+    # Codex round 2: the OAuth connect built its ServerKey outside the
+    # ValueError handler, so a bad namespace answered 500.
+    server = server_factory(PUBLIC_URL=PUBLIC)
+    client = server.login()
+    resp = client.post(
+        "/marketplace/gmail/connect",
+        data={"namespace": namespace, "client_id": "abc", "client_secret": "shhh"},
+    )
+    client.close()
+    assert resp.status_code == 400
+    assert not (server.data_dir / "creds").exists() or not any(
+        (server.data_dir / "creds").iterdir()
+    )
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
+    reg.load()
+    assert not any(s.catalog == "gmail" for s in reg.list())
 
 
 def test_connect_second_on_pending(server_factory):
@@ -229,7 +249,7 @@ def test_callback_success(server_factory, mock_token_endpoint):
     server = server_factory(seed_registry(_gmail_child()), PUBLIC_URL=PUBLIC, CHILD_START_TIMEOUT="2")
     sup = server.supervisor
     sup.creds.write_client("gmail", "google-client", ClientCreds("abc", "shhh"))
-    flow = sup.flows.create("gmail", "gmail", ClientCreds("abc", "shhh"))
+    flow = sup.flows.create("gmail", "gmail", ClientCreds("abc", "shhh"), ADMIN_ACTOR)
     client = server.login()
     resp = client.get(f"/oauth/callback?state={flow.state}&code=the-code")
     client.close()
@@ -247,7 +267,7 @@ def test_callback_provider_error(server_factory, mock_token_endpoint):
     server = server_factory(seed_registry(_gmail_child()), PUBLIC_URL=PUBLIC)
     sup = server.supervisor
     sup.creds.write_client("gmail", "google-client", ClientCreds("abc", "shhh"))
-    flow = sup.flows.create("gmail", "gmail", ClientCreds("abc", "shhh"))
+    flow = sup.flows.create("gmail", "gmail", ClientCreds("abc", "shhh"), ADMIN_ACTOR)
     client = server.login()
     resp = client.get(f"/oauth/callback?state={flow.state}&error=access_denied")
     client.close()
@@ -262,7 +282,7 @@ def test_callback_token_rejected(server_factory, mock_token_endpoint):
     server = server_factory(seed_registry(_gmail_child()), PUBLIC_URL=PUBLIC)
     sup = server.supervisor
     sup.creds.write_client("gmail", "google-client", ClientCreds("abc", "shhh"))
-    flow = sup.flows.create("gmail", "gmail", ClientCreds("abc", "shhh"))
+    flow = sup.flows.create("gmail", "gmail", ClientCreds("abc", "shhh"), ADMIN_ACTOR)
     client = server.login()
     resp = client.get(f"/oauth/callback?state={flow.state}&code=bad")
     client.close()
@@ -276,7 +296,7 @@ def test_callback_transport_error(server_factory, mock_token_endpoint):
     server = server_factory(seed_registry(_gmail_child()), PUBLIC_URL=PUBLIC, CHILD_START_TIMEOUT="2")
     sup = server.supervisor
     sup.creds.write_client("gmail", "google-client", ClientCreds("abc", "shhh"))
-    flow = sup.flows.create("gmail", "gmail", ClientCreds("abc", "shhh"))
+    flow = sup.flows.create("gmail", "gmail", ClientCreds("abc", "shhh"), ADMIN_ACTOR)
     client = server.login()
     resp = client.get(f"/oauth/callback?state={flow.state}&code=c")
     client.close()
@@ -293,7 +313,7 @@ def test_callback_duplicate_in_flight_400(server_factory, mock_token_endpoint):
     server = server_factory(seed_registry(_gmail_child()), PUBLIC_URL=PUBLIC, CHILD_START_TIMEOUT="2")
     sup = server.supervisor
     sup.creds.write_client("gmail", "google-client", ClientCreds("abc", "shhh"))
-    flow = sup.flows.create("gmail", "gmail", ClientCreds("abc", "shhh"))
+    flow = sup.flows.create("gmail", "gmail", ClientCreds("abc", "shhh"), ADMIN_ACTOR)
     assert sup.flows.begin_exchange(flow.state) is True  # first exchange in flight
     client = server.login()
     resp = client.get(f"/oauth/callback?state={flow.state}&code=c")
@@ -307,7 +327,7 @@ def test_callback_replay_400(server_factory, mock_token_endpoint):
     server = server_factory(seed_registry(_gmail_child()), PUBLIC_URL=PUBLIC, CHILD_START_TIMEOUT="2")
     sup = server.supervisor
     sup.creds.write_client("gmail", "google-client", ClientCreds("abc", "shhh"))
-    flow = sup.flows.create("gmail", "gmail", ClientCreds("abc", "shhh"))
+    flow = sup.flows.create("gmail", "gmail", ClientCreds("abc", "shhh"), ADMIN_ACTOR)
     client = server.login()
     first = client.get(f"/oauth/callback?state={flow.state}&code=c")
     second = client.get(f"/oauth/callback?state={flow.state}&code=c")
@@ -330,14 +350,14 @@ def test_callback_after_delete(server_factory, mock_token_endpoint):
     server = server_factory(seed_registry(_gmail_child()), PUBLIC_URL=PUBLIC, CHILD_START_TIMEOUT="2")
     sup = server.supervisor
     sup.creds.write_client("gmail", "google-client", ClientCreds("abc", "shhh"))
-    flow = sup.flows.create("gmail", "gmail", ClientCreds("abc", "shhh"))
+    flow = sup.flows.create("gmail", "gmail", ClientCreds("abc", "shhh"), ADMIN_ACTOR)
     client = server.login()
     assert client.post("/servers/gmail/delete").status_code in (200, 303)
     resp = client.get(f"/oauth/callback?state={flow.state}&code=c")
     client.close()
     assert resp.status_code == 400
     assert not (server.data_dir / "creds" / "gmail").exists()
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
     assert not any(s.namespace == "gmail" for s in reg.list())
 
@@ -347,7 +367,7 @@ def test_token_response_not_logged(server_factory, mock_token_endpoint, caplog):
     server = server_factory(seed_registry(_gmail_child()), PUBLIC_URL=PUBLIC, CHILD_START_TIMEOUT="2", LOG_LEVEL="DEBUG")
     sup = server.supervisor
     sup.creds.write_client("gmail", "google-client", ClientCreds("abc", "shhh"))
-    flow = sup.flows.create("gmail", "gmail", ClientCreds("abc", "shhh"))
+    flow = sup.flows.create("gmail", "gmail", ClientCreds("abc", "shhh"), ADMIN_ACTOR)
     client = server.login()
     resp = client.get(f"/oauth/callback?state={flow.state}&code=c")
     client.close()
@@ -378,7 +398,7 @@ def test_group_header_shows_awaiting_mark(server_factory):
         "/marketplace/gmail/connect",
         data={"namespace": "gmail", "client_id": "abc", "client_secret": "shhh"},
     )
-    html = client.get("/").text
+    html = client.get("/tools/tree").text
     client.close()
     assert "awaiting authorization" in html
 
@@ -387,12 +407,13 @@ def test_authorized_child_no_mark(server_factory, mock_token_endpoint):
     server = server_factory(seed_registry(_gmail_child()), PUBLIC_URL=PUBLIC, CHILD_START_TIMEOUT="2")
     sup = server.supervisor
     sup.creds.write_client("gmail", "google-client", ClientCreds("abc", "shhh"))
-    flow = sup.flows.create("gmail", "gmail", ClientCreds("abc", "shhh"))
+    flow = sup.flows.create("gmail", "gmail", ClientCreds("abc", "shhh"), ADMIN_ACTOR)
     client = server.login()
     client.get(f"/oauth/callback?state={flow.state}&code=c")
     server.wait(running=1)
-    html = client.get("/servers").text
+    html = client.get("/tools/tree").text
     client.close()
+    assert "gmail" in html
     assert "awaiting authorization" not in html
 
 
@@ -467,7 +488,7 @@ def test_reauth_without_token_400(server_factory):
 def test_reauth_second_refused(server_factory):
     server = server_factory(seed_registry(_gmail_child()), PUBLIC_URL=PUBLIC, CHILD_START_TIMEOUT="2")
     _seed_connected_gmail(server)
-    server.supervisor.flows.create("gmail", "gmail", ClientCreds("a", "b"), reauth=True)
+    server.supervisor.flows.create("gmail", "gmail", ClientCreds("a", "b"), ADMIN_ACTOR, reauth=True)
     client = server.login()
     resp = client.post("/servers/gmail/reauthorize", data={"client_id": "abc", "client_secret": "shhh"})
     client.close()
@@ -482,7 +503,7 @@ def test_reauth_callback_replaces_token(server_factory, mock_token_endpoint):
     server.wait(running=1)
     sup = server.supervisor
     _seed_connected_gmail(server)
-    flow = sup.flows.create("gmail", "gmail", ClientCreds("new-id", "new-secret"), reauth=True)
+    flow = sup.flows.create("gmail", "gmail", ClientCreds("new-id", "new-secret"), ADMIN_ACTOR, reauth=True)
     client = server.login()
     resp = client.get(f"/oauth/callback?state={flow.state}&code=c")
     client.close()
@@ -535,7 +556,7 @@ def test_reauth_stops_the_child_before_it_writes(server_factory, mock_token_endp
     sup.creds.write_token = traced_write_token
 
     flow = sup.flows.create(
-        "gmail", "gmail", ClientCreds("new-id", "new-secret"), reauth=True
+        "gmail", "gmail", ClientCreds("new-id", "new-secret"), ADMIN_ACTOR, reauth=True
     )
     client = server.login()
     resp = client.get(f"/oauth/callback?state={flow.state}&code=c")
@@ -552,7 +573,7 @@ def test_reauth_callback_failure_keeps_token(server_factory, mock_token_endpoint
     server = server_factory(seed_registry(_gmail_child()), PUBLIC_URL=PUBLIC, CHILD_START_TIMEOUT="2")
     _seed_connected_gmail(server)
     sup = server.supervisor
-    flow = sup.flows.create("gmail", "gmail", ClientCreds("new-id", "new-secret"), reauth=True)
+    flow = sup.flows.create("gmail", "gmail", ClientCreds("new-id", "new-secret"), ADMIN_ACTOR, reauth=True)
     client = server.login()
     resp = client.get(f"/oauth/callback?state={flow.state}&code=c")
     client.close()
@@ -577,7 +598,7 @@ def test_callback_malformed_expiry_refused_before_apply(server_factory, mock_tok
     server = server_factory(seed_registry(_gmail_child()), PUBLIC_URL=PUBLIC, CHILD_START_TIMEOUT="2")
     sup = server.supervisor
     sup.creds.write_client("gmail", "google-client", ClientCreds("abc", "shhh"))
-    flow = sup.flows.create("gmail", "gmail", ClientCreds("abc", "shhh"))
+    flow = sup.flows.create("gmail", "gmail", ClientCreds("abc", "shhh"), ADMIN_ACTOR)
 
     called = {"finish_oauth": 0}
     real_finish = sup.finish_oauth
@@ -626,7 +647,7 @@ def test_reauth_callback_malformed_expiry_keeps_child_running(server_factory, mo
 
     sup._teardown = spy_teardown
 
-    flow = sup.flows.create("gmail", "gmail", ClientCreds("new-id", "new-secret"), reauth=True)
+    flow = sup.flows.create("gmail", "gmail", ClientCreds("new-id", "new-secret"), ADMIN_ACTOR, reauth=True)
     client = server.login()
     resp = client.get(f"/oauth/callback?state={flow.state}&code=c")
     client.close()
@@ -669,9 +690,9 @@ def test_connect_header_sink_registers_pending(server_factory):
     assert loc.startswith("https://linear.app/oauth/authorize")
     # Linear wants comma-joined scopes (provider scope_separator).
     assert parse_qs(urlsplit(loc).query)["scope"] == ["read,write"]
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    spec = reg.get("linear")
+    spec = reg.get(ServerKey(None, "linear"))
     assert spec.enabled is False and spec.oauth_pending is True and spec.headers == {}
     assert not (server.data_dir / "creds" / "linear" / "client.json").exists()
     assert server.health()["running"] == 0
@@ -680,14 +701,14 @@ def test_connect_header_sink_registers_pending(server_factory):
 def test_callback_header_sink_sets_header(server_factory, mock_token_endpoint):
     server = server_factory(seed_registry(_linear_child()), PUBLIC_URL=PUBLIC, CHILD_START_TIMEOUT="2")
     sup = server.supervisor
-    flow = sup.flows.create("linear", "linear", ClientCreds("abc", "shhh"))
+    flow = sup.flows.create("linear", "linear", ClientCreds("abc", "shhh"), ADMIN_ACTOR)
     client = server.login()
     resp = client.get(f"/oauth/callback?state={flow.state}&code=c")
     client.close()
     assert resp.status_code == 303 and resp.headers["location"] == "/servers"
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    spec = reg.get("linear")
+    spec = reg.get(ServerKey(None, "linear"))
     assert spec.headers["Authorization"] == "Bearer ACCESStoken123"
     assert spec.oauth_pending is False
     assert not (server.data_dir / "creds" / "linear").exists()
@@ -698,7 +719,7 @@ def test_pending_header_child_shows_mark(server_factory):
     server = server_factory(seed_registry(_linear_child()), PUBLIC_URL=PUBLIC, CHILD_START_TIMEOUT="2")
     client = server.login()
     # The group header on the dashboard and the head of the window both mark it.
-    page = client.get("/").text
+    page = client.get("/tools/tree").text
     window = client.get("/servers/linear").text
     client.close()
     assert "awaiting authorization" in page
@@ -742,9 +763,9 @@ def test_connect_public_client_without_secret(server_factory):
     query = parse_qs(urlsplit(loc).query)
     assert "code_challenge" in query
     assert query["scope"] == ["quote:read quote:write trade:read trade:write accid:*"]
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    spec = reg.get("moomoo")
+    spec = reg.get(ServerKey(None, "moomoo"))
     assert spec.oauth_pending is True and spec.enabled is False
     assert spec.url == "https://mcp.moomoo.com/mcp" and spec.transport == "http"
     flow = server.supervisor.flows.peek(_state_from_location(loc))
@@ -755,7 +776,7 @@ def test_public_client_callback_omits_secret_and_writes_refresh_file(
     server_factory, mock_token_endpoint
 ):
     server = server_factory(seed_registry(_moomoo_child()), PUBLIC_URL=PUBLIC, CHILD_START_TIMEOUT="2")
-    flow = server.supervisor.flows.create("moomoo", "moomoo", ClientCreds("pub", ""))
+    flow = server.supervisor.flows.create("moomoo", "moomoo", ClientCreds("pub", ""), ADMIN_ACTOR)
     client = server.login()
     resp = client.get(f"/oauth/callback?state={flow.state}&code=c")
     client.close()
@@ -772,9 +793,9 @@ def test_public_client_callback_omits_secret_and_writes_refresh_file(
     assert "expires_at" in state
     assert not (server.data_dir / "creds" / "moomoo" / "client.json").exists()
     assert not (server.data_dir / "creds" / "moomoo" / "token.json").exists()
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    assert reg.get("moomoo").headers["Authorization"] == "Bearer ACCESStoken123"
+    assert reg.get(ServerKey(None, "moomoo")).headers["Authorization"] == "Bearer ACCESStoken123"
 
 
 @pytest.mark.parametrize(
@@ -785,15 +806,15 @@ def test_public_client_callback_omits_secret_and_writes_refresh_file(
 def test_public_client_malformed_expiry_refused(server_factory, mock_token_endpoint, bad):
     server = server_factory(seed_registry(_moomoo_child()), PUBLIC_URL=PUBLIC, CHILD_START_TIMEOUT="2")
     mock_token_endpoint["json"] = {**mock_token_endpoint["json"], **bad}
-    flow = server.supervisor.flows.create("moomoo", "moomoo", ClientCreds("pub", ""))
+    flow = server.supervisor.flows.create("moomoo", "moomoo", ClientCreds("pub", ""), ADMIN_ACTOR)
     client = server.login()
     resp = client.get(f"/oauth/callback?state={flow.state}&code=c")
     client.close()
     assert resp.status_code == 400
     assert not (server.data_dir / "creds" / "moomoo" / "refresh.json").exists()
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    spec = reg.get("moomoo")
+    spec = reg.get(ServerKey(None, "moomoo"))
     assert spec.headers == {} and spec.oauth_pending is True
 
 

@@ -37,12 +37,22 @@
       <a href="/add-server?tab=npm"
          {% if not page %}hx-get="/add-server?tab=npm" hx-target="#detail" hx-swap="innerHTML"{% endif %}
          class="{{ 'active' if tab == 'npm' }}">npm</a>
+      <a href="/add-server?tab=remote"
+         {% if not page %}hx-get="/add-server?tab=remote" hx-target="#detail" hx-swap="innerHTML"{% endif %}
+         class="{{ 'active' if tab == 'remote' }}">Remote</a>
       <a href="/add-server?tab=json"
          {% if not page %}hx-get="/add-server?tab=json" hx-target="#detail" hx-swap="innerHTML"{% endif %}
          class="{{ 'active' if tab == 'json' }}">JSON</a>
     </div>
 
     {% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+    {% if current_user and not current_user.is_admin %}
+    <p class="note">Your server starts after the admin approves it. A package
+      needs an exact version (<code>name@1.2.3</code> or
+      <code>name==1.2.3</code>), or a git source pinned to a full commit
+      SHA.</p>
+    {% endif %}
 
     {% if unparsed %}
     {# htmx answers a 4xx with `swap:false`, so a parse error would render

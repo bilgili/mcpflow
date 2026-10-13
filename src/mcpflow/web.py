@@ -1,23 +1,29 @@
 """Starlette routes, Jinja2 templates, and HTMX partials.
 
 The session gate guards these routes at the app level, so a handler here may
-assume an authenticated admin, except `/login` which the gate leaves public.
+assume `request.state.user`, except `/login` and `/login/setup`, which the gate
+leaves public. The gate admits a non-admin user to the routes of `USER_ROUTES`
+only; a server route among them checks ownership through `server_key` alone.
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
+import re
 import secrets
 import shlex
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import TYPE_CHECKING, Final
 
 import httpx
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from mcp.types import TextContent
+from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import (
     HTMLResponse,
@@ -37,9 +43,11 @@ from .actions import (
     secret_keys,
     secret_literals,
 )
-from .auth import COOKIE_NAME, TokenStore, sign_session, verify_password
+from .auth import COOKIE_NAME, TokenStore, hash_password, local_path, sign_session
 from .catalog import BUILTIN_DIR, CATEGORIES, Catalog, CatalogEntry, build_spec
 from .config import Settings
+from .errors import REFUSALS, refusal
+from .identity import ADMINS_GROUP, BOOTSTRAP_ADMIN_ID, SETUP_CODE_TTL
 from .importer import parse_config_block
 from .oauth import (
     CLIENT_FORMATS,
@@ -54,16 +62,73 @@ from .oauth import (
 )
 from .registry import (
     RegistryError,
+    ServerKey,
     ServerSpec,
     redact_spec,
+    redact_url,
     spec_command,
     spec_from_dict,
 )
-from .supervisor import LeaseRefused, Supervisor
+from .registry import revision as spec_revision
+from .supervisor import LeaseRefused, RevisionConflict, Supervisor
+
+if TYPE_CHECKING:
+    from .identity import IdentityProvider
 
 logger = logging.getLogger(__name__)
 
 _TEMPLATES = Path(__file__).parent / "templates"
+
+# One path segment, the same as Starlette's default `{ref}` converter. The
+# gate only admits the shape; `server_key` owns the parse and the ownership.
+_SEG = r"[^/]+"
+
+
+def _route(methods: str, path: str) -> tuple[frozenset[str], re.Pattern[str]]:
+    return frozenset(methods.split("|")), re.compile(path)
+
+
+# The routes a non-admin user may reach: (methods, full-path pattern), the
+# exact list of design D3. The `SessionGate` role check reads this one
+# constant, so a route that no entry matches is admin-only and fails closed.
+# Every server route here takes its key from `server_key`, never the path.
+USER_ROUTES: Final[tuple[tuple[frozenset[str], re.Pattern[str]], ...]] = (
+    _route("GET", "/"),
+    _route("GET", "/tools/tree"),
+    _route("GET", "/servers"),
+    _route("GET", "/add-server"),
+    _route("POST", "/servers"),
+    _route("POST", "/import/json"),
+    _route("GET|POST", f"/servers/{_SEG}"),
+    _route("GET", f"/servers/{_SEG}/edit"),
+    _route("GET", f"/servers/{_SEG}/log"),
+    _route("POST", f"/servers/{_SEG}/(?:enable|disable|restart|delete)"),
+    _route("GET|POST", "/tokens"),
+    _route("POST", f"/tokens/{_SEG}/delete"),
+    _route("GET", "/settings"),
+    _route("POST", "/settings/password"),
+    _route("POST", "/logout"),
+)
+
+# The kinds a non-admin user may add. `custom` names host code no approval
+# can bind, so the registry refuses it for a user-owned server (D7b); the
+# form does not offer it.
+_USER_KINDS: Final = ("python", "npm", "remote")
+
+_LOGIN_ERROR = "Wrong user name or password."
+# One answer for every refusal of a setup code: an unknown user, a wrong,
+# expired, or used code, an active user, the bootstrap user, and a lost race.
+_SETUP_ERROR = "Wrong user name or setup code, or the code has expired or was used."
+_SETTINGS_RACE = "Your password changed meanwhile. Sign in again and try again."
+_BOOTSTRAP_NOTE = (
+    f"The environment variable ADMIN_PASSWORD owns the password of {BOOTSTRAP_ADMIN_ID}."
+)
+
+
+def _form_text(form, key: str, default: str = "") -> str:
+    # A multipart body can carry a file part; treat it as absent.
+    value = form.get(key, default)
+    return value if isinstance(value, str) else default
 
 
 def _kv_lines(text: str) -> dict[str, str]:
@@ -213,12 +278,26 @@ class _PageSnapshot:
     secrets: frozenset[str]
 
 
+def _err_refusal(request: Request, exc: Exception) -> Response:
+    # A refusal that leaves a route answers its status and plain text. An
+    # `errno` error is not a refusal: `refusal` raises `TypeError` and the
+    # server answers 500.
+    status, text = refusal(exc)
+    return PlainTextResponse(text, status_code=status)
+
+
+# Registered on the root app by `gateway.build_app`, so a write-time refusal
+# of any web route answers 403 without a `try` in each handler.
+WEB_EXCEPTION_HANDLERS: Final = {PermissionError: _err_refusal}
+
+
 def build_routes(
     supervisor: Supervisor,
     tokens: TokenStore,
     settings: Settings,
     creds: CredStore,
     flows: PendingFlows,
+    identity: IdentityProvider,
 ) -> list[BaseRoute]:
     env = Environment(
         loader=FileSystemLoader(str(_TEMPLATES)),
@@ -229,21 +308,48 @@ def build_routes(
     def render(
         name: str, request: Request, *, status_code: int = 200, **ctx
     ) -> HTMLResponse:
-        html = env.get_template(name).render(request=request, **ctx)
+        # `current_user` drives the header and every role-scoped control. The
+        # public `/login` page has none.
+        html = env.get_template(name).render(
+            request=request,
+            current_user=getattr(request.state, "user", None),
+            **ctx,
+        )
         return HTMLResponse(html, status_code=status_code)
 
     def is_htmx(request: Request) -> bool:
         return request.headers.get("HX-Request") == "true"
+
+    def server_key(request: Request) -> ServerKey:
+        """The key the `{ref}` path segment names, for a user who manages it.
+
+        The one ownership check of the server routes (D3): the gate admits the
+        route, this admits the server. A bad reference and a server the user
+        cannot manage raise the same 404, so a foreign server reads as a
+        missing one, and a granted shared server has no window for a user.
+        """
+        try:
+            key = ServerKey.parse(request.path_params["ref"])
+        except ValueError:
+            raise HTTPException(404, "not found") from None
+        if not supervisor.policy.can_manage(request.state.user, key):
+            raise HTTPException(404, "not found")
+        return key
+
+
+    def _refusal(exc: Exception) -> Response:
+        status, text = refusal(exc)
+        return PlainTextResponse(text, status_code=status)
 
     async def servers_response(request: Request) -> Response:
         """The answer to a successful action.
 
         An htmx caller gets the tool tree, the element the dashboard shows the
         child in. A plain caller posted from the server window, so the page
-        reload closes the dialog and shows the new state.
+        reload closes the dialog; the dashboard then loads the new tree.
         """
         if is_htmx(request):
-            return await tools_tree(request, "_tools_tree.html")
+            return await tools_tree(request)
         return RedirectResponse("/", status_code=303)
 
     # --- auth ------------------------------------------------------------
@@ -256,25 +362,15 @@ def build_routes(
             error=None,
         )
 
-    async def login_post(request: Request) -> Response:
-        form = await request.form()
-        password = form.get("password", "")
-        next_ = form.get("next", "/")
-        # Offload the 600k-iteration PBKDF2 verify off the event loop so it does
-        # not block /mcp and /health.
-        ok = await asyncio.to_thread(
-            verify_password, password, settings.admin_password_hash
-        )
-        if not ok:
-            await asyncio.sleep(1)
-            return render("login.html", request, next=next_, error="Wrong password.")
-        if not next_.startswith("/") or next_.startswith("//"):
-            next_ = "/"
+    def _signed_in(user_id: str, binding: str, target: str) -> Response:
+        """303 to `target` with a session cookie bound to `binding`.
+
+        The one issue of the cookie and its flags: the sign-in, the setup
+        sign-in, and the password change. Synchronous, so a caller that just
+        swapped the credential issues the cookie with no `await` between."""
         expires_at = int(time.time()) + settings.session_ttl
-        value = sign_session(
-            settings.secret_key, settings.admin_password_hash, expires_at
-        )
-        resp = RedirectResponse(next_, status_code=303)
+        value = sign_session(settings.secret_key, user_id, binding, expires_at)
+        resp = RedirectResponse(target, status_code=303)
         resp.set_cookie(
             COOKIE_NAME,
             value,
@@ -286,29 +382,163 @@ def build_routes(
         )
         return resp
 
+    async def login_post(request: Request) -> Response:
+        form = await request.form()
+        # An empty user name means the bootstrap user (AC-8b).
+        user_id = _form_text(form, "user").strip() or "admin"
+        password = _form_text(form, "password")
+        next_ = _form_text(form, "next", "/")
+        # Offload the 600k-iteration PBKDF2 verify off the event loop so it does
+        # not block /mcp and /health. The provider runs one verification for an
+        # unknown user too, so the time does not reveal a user name.
+        # The binding is read before AND after the verify, and the cookie
+        # signs the one read before it: a password reset, or a delete and
+        # re-create of the id, during the slow verify changes the binding,
+        # so the cookie never binds a record the password was not checked
+        # against. A race answers as a wrong password.
+        before = identity.session_binding(user_id)
+        user = await asyncio.to_thread(identity.authenticate, user_id, password)
+        after = identity.session_binding(user_id)
+        binding = before if before is not None and before == after else None
+        if user is None or binding is None:
+            # One answer for a wrong password, an unknown user, a pending
+            # user (no binding, design D5), and a race.
+            await asyncio.sleep(1)
+            return render("login.html", request, next=next_, error=_LOGIN_ERROR)
+        if not local_path(next_):
+            next_ = "/"
+        return _signed_in(user.id, binding, next_)
+
     async def logout(request: Request) -> Response:
         resp = RedirectResponse("/login", status_code=303)
         resp.delete_cookie(COOKIE_NAME, path="/")
         return resp
 
+    # --- self-service credentials (design D6) ----------------------------
+    #
+    # Neither route needs the admin role, so both call the provider that
+    # `AccessPolicy.local_identity()` returns, not a policy method. Each
+    # takes the expected state from one synchronous provider call, offloads
+    # the hash, and then swaps; a change in the gap makes the swap fail.
+
+    def _setup_page(request: Request, user_id: str, *, error=None, status_code=200):
+        # Never echoes `code`, `password`, or `confirm`.
+        return render(
+            "setup.html", request, status_code=status_code, user=user_id, error=error
+        )
+
+    async def setup_get(request: Request) -> Response:
+        return _setup_page(request, request.query_params.get("user", ""))
+
+    async def setup_post(request: Request) -> Response:
+        form = await request.form()
+        # No empty-name default here: `admin` never redeems a code.
+        user_id = _form_text(form, "user").strip()
+        password = _form_text(form, "password")
+        try:
+            local = supervisor.policy.local_identity()
+            # Refusals that use no user data, so no wait and no check.
+            if password != _form_text(form, "confirm"):
+                raise ValueError("The two passwords differ.")
+            local.check_new_password(password)
+        except ValueError as exc:
+            return _setup_page(request, user_id, error=str(exc), status_code=400)
+        # Strip: a code pasted from a chat or a mail often carries a newline.
+        state = local.check_setup_code(user_id, _form_text(form, "code").strip())
+        if state is not None:
+            # Only a valid code starts the slow hash.
+            new_hash = await asyncio.to_thread(hash_password, password)
+            # No `await` from the swap to the cookie (design D6).
+            if local.replace_credential(user_id, state, new_hash):
+                return _signed_in(user_id, new_hash, "/")
+        await asyncio.sleep(1)
+        return _setup_page(request, user_id, error=_SETUP_ERROR, status_code=400)
+
+    def _settings_page(request: Request, *, error=None, status_code=200, changed=False):
+        return render(
+            "settings.html", request, status_code=status_code, error=error,
+            changed=changed, bootstrap_note=(
+                _BOOTSTRAP_NOTE if request.state.user.id == BOOTSTRAP_ADMIN_ID else None
+            ),
+        )
+
+    async def settings_page(request: Request) -> Response:
+        return _settings_page(request, changed=request.query_params.get("changed") == "1")
+
+    async def settings_password(request: Request) -> Response:
+        # The signed-in user only; the form never names a user.
+        uid = request.state.user.id
+        if uid == BOOTSTRAP_ADMIN_ID:
+            # First, so no slow work runs for it.
+            return _settings_page(request, error=_BOOTSTRAP_NOTE, status_code=400)
+        form = await request.form()
+        password = _form_text(form, "password")
+        try:
+            local = supervisor.policy.local_identity()
+            if password != _form_text(form, "confirm"):
+                raise ValueError("The two new passwords differ.")
+            local.check_new_password(password)
+        except ValueError as exc:
+            return _settings_page(request, error=str(exc), status_code=400)
+        # The session binding is the expected state. A reset that landed
+        # after the session gate leaves `None`, and no swap matches `None`.
+        expected = local.session_binding(uid)
+        if expected is None:
+            return _settings_page(request, error=_SETTINGS_RACE, status_code=400)
+        if await asyncio.to_thread(local.authenticate, uid, _form_text(form, "current")) is None:
+            await asyncio.sleep(1)
+            return _settings_page(request, error="Wrong current password.", status_code=400)
+        new_hash = await asyncio.to_thread(hash_password, password)
+        # No `await` from the swap to the cookie (design D6). The new cookie
+        # replaces this session's; every older cookie no longer matches.
+        if not local.replace_credential(uid, expected, new_hash):
+            return _settings_page(request, error=_SETTINGS_RACE, status_code=400)
+        return _signed_in(uid, new_hash, "/settings?changed=1")
+
     # --- dashboard and servers ------------------------------------------
 
-    async def tools_tree(request: Request, name: str = "dashboard.html") -> Response:
-        """Render the tool tree.
+    async def tools_tree(request: Request) -> Response:
+        """Render the tool tree partial. It reads the tool snapshot of every
+        running child and awaits no child; a stale snapshot starts a
+        background probe, and the tree polls until that probe ends.
 
-        Every group renders collapsed, in every render: the page load, the
+        `poll=1` marks a poll answer, which starts no probe (design D7), so
+        the poll stops once the probes of the last probing render end. The
+        dashboard load and every control answer send no `poll` and can probe.
+        The parameter grants nothing: it only skips a probe.
+
+        Every group renders collapsed, in every render: the first load, the
         poll answer, and a control answer alike. The browser owns the open
         state; `dashboard.html` records it before a tree swap and restores it
         after. A server-side hint would name the group that was open when the
         admin clicked, not when the answer lands, so it would re-open a group
         the admin collapsed during the round trip.
         """
-        views = await supervisor.tools()
+        reach = supervisor.policy.keys_for(request.state.user, "dashboard")
+        views = await supervisor.tools(
+            reach, probe=request.query_params.get("poll") != "1"
+        )
+        # Right after the rows, with no await between: the poll mark sees the
+        # probe this render started, and the rows and the mark are one state.
+        probing = supervisor.probing(reach)
+        # The groups come from the same `Reach` as the rows, so a non-admin
+        # user gets no group for a key outside it: their own servers in every
+        # approval state and their CallerView, nothing else (D6).
+        keys = set(reach.keys)
+        children = [c for c in supervisor.children() if c.spec.key in keys]
         return render(
-            name,
+            "_tools_tree.html",
             request,
             tools=views,
-            children=supervisor.children(),
+            children=children,
+            probing=probing,
+            # The policy owns "may this user manage this server"; the template
+            # only reads the answer (the "Runs as" row shows on managed rows).
+            managed={
+                c.spec.key.ref
+                for c in children
+                if supervisor.policy.can_manage(request.state.user, c.spec.key)
+            },
             root_muted=supervisor.root_muted(),
             # The `mcpflow` group has no `Child`, so its namespace control reads
             # this flag instead of `c.spec.muted`.
@@ -320,11 +550,15 @@ def build_routes(
         )
 
     async def dashboard(request: Request) -> Response:
-        return await tools_tree(request)
+        # The shell only. The page loads the tree from `/tools/tree` after it
+        # paints. The tree reads the snapshots and awaits no child, and that
+        # load is a probing render: it starts the probe of a stale snapshot.
+        return render("dashboard.html", request)
 
     async def tools_tree_partial(request: Request) -> Response:
-        """The poll's route. No parameters: the tree carries no open state."""
-        return await tools_tree(request, "_tools_tree.html")
+        """The load and poll route. `poll=1` only skips a probe; the tree
+        carries no open state."""
+        return await tools_tree(request)
 
     # --- visibility ------------------------------------------------------
     #
@@ -337,18 +571,20 @@ def build_routes(
 
     async def visibility_root(request: Request) -> Response:
         form = await request.form()
-        supervisor.set_root_muted(_muted(form))
-        return await tools_tree(request, "_tools_tree.html")
+        supervisor.set_root_muted(_muted(form), request.state.user)
+        return await tools_tree(request)
 
 
 
     async def visibility_namespace(request: Request) -> Response:
         form = await request.form()
         try:
-            supervisor.set_namespace_muted(request.path_params["ns"], _muted(form))
+            supervisor.set_namespace_muted(
+                server_key(request), _muted(form), request.state.user
+            )
         except KeyError:
             return PlainTextResponse("not found", status_code=404)
-        return await tools_tree(request, "_tools_tree.html")
+        return await tools_tree(request)
 
     async def visibility_tool(request: Request) -> Response:
         # The tool name travels in the body, never in the path. A child names
@@ -362,10 +598,12 @@ def build_routes(
         if not isinstance(tool, str) or tool == "":
             return PlainTextResponse("tool is required", status_code=400)
         try:
-            supervisor.set_tool_muted(request.path_params["ns"], tool, _muted(form))
+            supervisor.set_tool_muted(
+                server_key(request), tool, _muted(form), request.state.user
+            )
         except KeyError:
             return PlainTextResponse("not found", status_code=404)
-        return await tools_tree(request, "_tools_tree.html")
+        return await tools_tree(request)
 
     async def servers(request: Request) -> Response:
         """The old servers page. The dashboard is the one page for the child
@@ -385,9 +623,13 @@ def build_routes(
         """The add-server window: the partial in the dialog, the page without.
 
         `page` forces the full page for a plain form post, which answers a
-        reload rather than a swap.
+        reload rather than a swap. A non-admin user gets the `_USER_KINDS`
+        tabs and the JSON tab only, and the note on approval and pinning.
         """
         as_page = (not is_htmx(request)) if page is None else page
+        if not request.state.user.is_admin and tab not in (*_USER_KINDS, "json"):
+            tab = "python"
+            values = {**values, "kind": tab} if values else values
         return render(
             "server_form.html" if as_page else "_server_form.html",
             request,
@@ -401,7 +643,7 @@ def build_routes(
         )
 
     async def server_new(request: Request) -> Response:
-        # `new` is a legal namespace, so `GET /servers/{ns}` owns that space
+        # `new` is a legal namespace, so `GET /servers/{ref}` owns that space
         # and the add window lives at its own path.
         return _add_window(request, tab=request.query_params.get("tab", "python"), values={})
 
@@ -409,7 +651,11 @@ def build_routes(
         form = await request.form()
         try:
             spec = _spec_from_form(form)
-            await supervisor.add(spec)
+            await supervisor.add(spec, request.state.user)
+        except PermissionError as exc:
+            # `add` re-reads the actor: a role revoked or a user deleted
+            # after the gate admitted the request is a 403, not a 500.
+            return _refusal(exc)
         except RegistryError as exc:
             # The form posts without htmx, so the answer is the full page with
             # the typed values, the same as the marketplace connect.
@@ -424,7 +670,7 @@ def build_routes(
         return RedirectResponse("/", status_code=303)
 
     async def _server_detail_ctx(
-        ns: str,
+        key: ServerKey,
         request: Request,
         values: dict | None = None,
         error: str | None = None,
@@ -433,9 +679,10 @@ def build_routes(
 
         The window reads the registry and the catalog, and nothing else. It
         does not call `Supervisor.tools()`: the child's group on the dashboard
-        owns the tool list, and that call probes every running child and marks
-        one `failed` when its probe raises, so filling a one-child page from it
-        could change an unrelated child's status.
+        owns the tool list, and that call can start a probe of any running
+        child with a stale snapshot and marks one `failed` when its probe
+        raises, so filling a one-child page from it could change an unrelated
+        child's status.
 
         The form shows `redact_spec(child.spec)`, the same outward view as the
         API: every `env`/`headers` value and the `source`/`url` credentials are
@@ -447,12 +694,13 @@ def build_routes(
         the stored spec.
         """
         try:
-            child = supervisor.get(ns)
+            child = supervisor.get(key)
         except KeyError:
             return None
         entry = _catalog().get(child.spec.catalog) if child.spec.catalog else None
         return {
-            "ns": ns,
+            # The reference: the window title and every route of the window.
+            "ns": key.ref,
             "c": child,
             "values": (
                 _form_values(redact_spec(child.spec)) if values is None else values
@@ -467,7 +715,7 @@ def build_routes(
         }
 
     async def server_detail(request: Request) -> Response:
-        ctx = await _server_detail_ctx(request.path_params["ns"], request)
+        ctx = await _server_detail_ctx(server_key(request), request)
         if ctx is None:
             return PlainTextResponse("not found", status_code=404)
         if is_htmx(request):
@@ -476,23 +724,21 @@ def build_routes(
 
     async def server_edit(request: Request) -> Response:
         """The old edit page. The window holds the edit form now."""
-        return RedirectResponse(
-            f"/servers/{request.path_params['ns']}", status_code=303
-        )
+        return RedirectResponse(f"/servers/{server_key(request).ref}", status_code=303)
 
     async def server_update(request: Request) -> Response:
-        ns = request.path_params["ns"]
+        key = server_key(request)
         try:
-            supervisor.get(ns)
+            supervisor.get(key)
         except KeyError:
             return PlainTextResponse("not found", status_code=404)
         form = await request.form()
         try:
-            spec = _spec_from_form(form, namespace=ns)
-            await supervisor.update(spec)
+            spec = _spec_from_form(form, namespace=key.namespace)
+            await supervisor.update(key, spec, request.state.user)
         except RegistryError as exc:
             ctx = await _server_detail_ctx(
-                ns, request, values=dict(form), error=str(exc)
+                key, request, values=dict(form), error=str(exc)
             )
             if ctx is None:  # pragma: no cover - a delete raced the save
                 return PlainTextResponse("not found", status_code=404)
@@ -503,9 +749,9 @@ def build_routes(
 
     def _action(op):
         async def handler(request: Request) -> Response:
-            ns = request.path_params["ns"]
+            key = server_key(request)
             try:
-                await op(ns)
+                await op(key, request.state.user)
             except KeyError:
                 return PlainTextResponse("not found", status_code=404)
             except RegistryError as exc:
@@ -514,7 +760,7 @@ def build_routes(
                 # reason on it.
                 if is_htmx(request):
                     return PlainTextResponse(str(exc), status_code=400)
-                ctx = await _server_detail_ctx(ns, request, error=str(exc))
+                ctx = await _server_detail_ctx(key, request, error=str(exc))
                 if ctx is None:  # pragma: no cover - a delete raced the action
                     return PlainTextResponse(str(exc), status_code=400)
                 return render(
@@ -525,10 +771,10 @@ def build_routes(
         return handler
 
     async def server_log(request: Request) -> Response:
-        ns = request.path_params["ns"]
+        key = server_key(request)
         lines = int(request.query_params.get("lines", "100"))
         try:
-            text = supervisor.log_tail(ns, lines)
+            text = supervisor.log_tail(key, lines)
         except KeyError:
             return PlainTextResponse("not found", status_code=404)
         return PlainTextResponse(text, media_type="text/plain")
@@ -662,11 +908,12 @@ def build_routes(
         )
 
     async def server_actions(request: Request) -> Response:
-        ns = request.path_params["ns"]
+        key = server_key(request)
+        ns = key.ref
         try:
-            child = supervisor.get(ns)
-            configured = frozenset(supervisor.child_secrets(ns))
-            views = await supervisor.actions(ns)
+            child = supervisor.get(key)
+            configured = frozenset(supervisor.child_secrets(key))
+            views = await supervisor.actions(key)
         except KeyError:
             return PlainTextResponse("not found", status_code=404)
         except RuntimeError as exc:
@@ -689,7 +936,8 @@ def build_routes(
 
     async def server_action_submit(request: Request) -> Response:
         """Restore identities, check current membership, then execute once."""
-        ns = request.path_params["ns"]
+        key = server_key(request)
+        ns = key.ref
         action = request.path_params["action"]
         posted = await request.form()
         legacy = "form_token" not in request.query_params
@@ -733,9 +981,9 @@ def build_routes(
             if isinstance(value := form.get(key), str) and value
         )
         try:
-            child = supervisor.get(ns)
-            configured = frozenset(supervisor.child_secrets(ns))
-            views = await supervisor.actions(ns)
+            child = supervisor.get(key)
+            configured = frozenset(supervisor.child_secrets(key))
+            views = await supervisor.actions(key)
         except KeyError:
             return PlainTextResponse("not found", status_code=404)
         except RuntimeError as exc:
@@ -759,9 +1007,10 @@ def build_routes(
         )
         try:
             run = await supervisor.run_action(
-                ns,
+                key,
                 action,
                 form,
+                request.state.user,
                 rendered_password_keys=password_keys,
                 rendered_secrets=rendered_secrets,
             )
@@ -853,6 +1102,13 @@ def build_routes(
                 status_code=400,
             )
         values = _form_values(specs[0])
+        if not request.state.user.is_admin and values["kind"] not in _USER_KINDS:
+            # Refuse here rather than fill a tab the user form does not offer;
+            # the registry refuses the same spec on the add (D7b).
+            return _add_window(
+                request, tab="json", values={}, paste=paste, status_code=400,
+                error=f"kind: {values['kind']} is not allowed for a user-owned server",
+            )
         return _add_window(request, tab=values["kind"], values=values)
 
     # --- marketplace -----------------------------------------------------
@@ -882,13 +1138,14 @@ def build_routes(
         )
 
     def _awaiting() -> set[str]:
-        """Namespaces awaiting their OAuth token: a file sink child with a
+        """References awaiting their OAuth token: a file sink child with a
         client file and no token file, or a header sink child whose registry
-        flag `oauth_pending` is set."""
+        flag `oauth_pending` is set. Keyed by reference, so the credential of
+        `github` never marks `github@alice`."""
         return {
-            c.spec.namespace
+            c.spec.key.ref
             for c in supervisor.children()
-            if creds.awaiting(c.spec.namespace) or c.spec.oauth_pending
+            if creds.awaiting(c.spec.key.ref) or c.spec.oauth_pending
         }
 
     def _header_authorized(entry: CatalogEntry, spec) -> bool:
@@ -897,7 +1154,7 @@ def build_routes(
         return entry.oauth.header.name in spec.headers and not spec.oauth_pending
 
     def _reauthable() -> set[str]:
-        """Namespaces whose catalog entry has an `oauth` block and whose child
+        """References whose catalog entry has an `oauth` block and whose child
         is authorized (a token file for a file sink, the header set for a header
         sink), so re-authorization applies."""
         catalog = _catalog()
@@ -912,10 +1169,10 @@ def build_routes(
             authorized = (
                 _header_authorized(entry, c.spec)
                 if entry.oauth.header is not None
-                else creds.has_token(c.spec.namespace)
+                else creds.has_token(c.spec.key.ref)
             )
             if authorized:
-                out.add(c.spec.namespace)
+                out.add(c.spec.key.ref)
         return out
 
     def _connected() -> dict[str, list[str]]:
@@ -1028,7 +1285,9 @@ def build_routes(
         values = {f.key: form.get(f"setup_{f.key}", "") for f in entry.setup}
         try:
             spec = build_spec(entry, namespace, values, args)
-            await supervisor.add(spec)
+            await supervisor.add(spec, request.state.user)
+        except PermissionError as exc:
+            return _refusal(exc)
         except RegistryError as exc:
             return _connect_error(entry, namespace, args, str(exc), request)
         return RedirectResponse("/servers", status_code=303)
@@ -1062,13 +1321,26 @@ def build_routes(
         client = ClientCreds(client_id=client_id, client_secret=client_secret)
         header_sink = entry.oauth.header is not None
         client_fmt = None if header_sink else entry.oauth.client_file.format
+        # The marketplace and the OAuth routes are admin-only, so the key is
+        # admin-owned and its reference is the namespace. `CredStore.paths`
+        # refuses a bad reference with `ValueError`, before any file access;
+        # `RegistryError` is a `ValueError`, so one handler maps both. The key
+        # is built inside the handler: `ServerKey` refuses a bad namespace with
+        # `ValueError` too, which must re-render the form, not answer 500.
         try:
-            cred_paths = None if header_sink else creds.paths(namespace)
+            key = ServerKey(None, namespace)
+            cred_paths = None if header_sink else creds.paths(key.ref)
             spec = build_spec(entry, namespace, {}, None, cred_paths)
-            await supervisor.add(spec, client_fmt, client)
-        except RegistryError as exc:
+            child = await supervisor.add(spec, request.state.user, client_fmt, client)
+        except PermissionError as exc:
+            # A refused add opens no flow: return before `flows.create`.
+            return _refusal(exc)
+        except ValueError as exc:
             return _connect_error(entry, namespace, None, str(exc), request)
-        flow = flows.create(namespace, entry.id, client)
+        # The flow names the key the supervisor stored, never the form value.
+        flow = flows.create(
+            child.spec.key.ref, entry.id, client, request.state.user
+        )
         redirect_uri = _base_url(settings, request) + "/oauth/callback"
         return RedirectResponse(
             authorize_url(provider, entry.oauth, redirect_uri, flow), status_code=303
@@ -1182,11 +1454,11 @@ def build_routes(
 
     # --- re-authorize ----------------------------------------------------
 
-    def _reauth_entry(ns: str):
+    def _reauth_entry(key: ServerKey):
         """(child, entry) when the child exists and its catalog entry carries
         an `oauth` block, else (None, None) so the route answers 404."""
         try:
-            child = supervisor.get(ns)
+            child = supervisor.get(key)
         except KeyError:
             return None, None
         entry = _catalog().get(child.spec.catalog) if child.spec.catalog else None
@@ -1205,14 +1477,16 @@ def build_routes(
         }
 
     async def reauthorize_get(request: Request) -> Response:
-        ns = request.path_params["ns"]
-        child, entry = _reauth_entry(ns)
+        key = server_key(request)
+        ns = key.ref
+        child, entry = _reauth_entry(key)
         if child is None:
             return PlainTextResponse("not found", status_code=404)
         return render("reauthorize.html", request, **_reauth_ctx(ns, entry, request))
 
     async def reauthorize_post(request: Request) -> Response:
-        ns = request.path_params["ns"]
+        key = server_key(request)
+        ns = key.ref
         # Read the form BEFORE validating, so a concurrent delete during the
         # await cannot make the child/token checks stale: everything below runs
         # on the current state and no flow is opened for a gone namespace. (The
@@ -1220,7 +1494,7 @@ def build_routes(
         # depth, and it also keeps the re-entered secret out of memory for a
         # server that was just deleted.)
         form = await request.form()
-        child, entry = _reauth_entry(ns)
+        child, entry = _reauth_entry(key)
         if child is None:
             return PlainTextResponse("not found", status_code=404)
 
@@ -1238,7 +1512,7 @@ def build_routes(
         if entry.oauth.header is not None:
             authorized = _header_authorized(entry, child.spec)
         else:
-            authorized = creds.has_token(ns)
+            authorized = creds.has_token(child.spec.key.ref)
         if not authorized:
             return bad("this server is not yet authorized; connect it first")
         provider = _providers().get(entry.oauth.provider)
@@ -1258,7 +1532,9 @@ def build_routes(
         # The client rides in the flow's memory; nothing is written until the
         # callback succeeds, so a failed re-auth leaves the old token in place.
         client = ClientCreds(client_id=client_id, client_secret=client_secret)
-        flow = flows.create(ns, entry.id, client, reauth=True)
+        flow = flows.create(
+            child.spec.key.ref, entry.id, client, request.state.user, reauth=True
+        )
         redirect_uri = _base_url(settings, request) + "/oauth/callback"
         return RedirectResponse(
             authorize_url(provider, entry.oauth, redirect_uri, flow), status_code=303
@@ -1266,77 +1542,314 @@ def build_routes(
 
     # --- tokens ----------------------------------------------------------
 
-    async def tokens_page(request: Request) -> Response:
+    def _tokens_page(request: Request, **ctx) -> Response:
+        # The policy owns who sees which token: their own for a user, every
+        # token with its user for an admin. Only an admin gets the user
+        # selector, so only an admin page lists the users.
+        user = request.state.user
         return render(
             "tokens.html",
             request,
-            tokens=tokens.list(),
-            new_token=None,
-            mcp=None,
-            curl=None,
+            tokens=supervisor.policy.tokens_for(user),
+            users=supervisor.policy.list_users(user) if user.is_admin else [],
+            **{"new_token": None, "mcp": None, "curl": None, **ctx},
         )
+
+    async def tokens_page(request: Request) -> Response:
+        return _tokens_page(request)
 
     async def token_create(request: Request) -> Response:
         form = await request.form()
+        # The posted values pass through unchanged: `mint_token` owns who may
+        # mint which scope for whom, and `TokenStore.create` owns the scope
+        # check. A user who hand-posts `scope=admin` or another `user` gets
+        # 403; an off-table scope gets 400; an unknown user gets 400.
         scope = (form.get("scope") or "mcp").strip()
-        # `TokenStore.create` owns the scope check. A hand-typed off-table
-        # scope raises `ValueError`; answer 400 rather than a rendered page.
         try:
-            _record, clear = tokens.create((form.get("name") or "").strip(), scope)
-        except ValueError as exc:
-            return PlainTextResponse(str(exc), status_code=400)
+            _record, clear = supervisor.policy.mint_token(
+                request.state.user,
+                (form.get("name") or "").strip(),
+                scope,
+                (form.get("user") or "").strip() or None,
+            )
+        except REFUSALS as exc:
+            return _refusal(exc)
         # The MCP config fits every scope. An `admin` token also authenticates
         # `/api`, so it additionally gets the `curl` example. The template owns
         # which tab opens first; the handler owns which content exists.
-        return render(
-            "tokens.html",
+        return _tokens_page(
             request,
-            tokens=tokens.list(),
             new_token=clear,
             mcp=_mcp_config(settings, request, clear),
             curl=_admin_curl(settings, request, clear) if scope == "admin" else None,
         )
 
     async def token_delete(request: Request) -> Response:
+        # A foreign token id raises `KeyError`, the same as an unknown one.
         try:
-            tokens.revoke(request.path_params["id"])
-        except KeyError:
-            return PlainTextResponse("not found", status_code=404)
+            supervisor.policy.revoke_token(request.state.user, request.path_params["id"])
+        except REFUSALS as exc:
+            return _refusal(exc)
         return RedirectResponse("/tokens", status_code=303)
+
+    # --- security page: users, groups, rules (admin-only) ----------------
+    #
+    # No route below is in `USER_ROUTES`, so the gate answers 403 to a
+    # non-admin user before a handler runs. One page, `/security`, holds the
+    # three sections. Every form posts without htmx: a success redirects with
+    # 303 to the anchor of its section, a refusal re-renders the page with 400
+    # and the reason in that section, and an unknown name in the path answers
+    # 404. A create and a reset instead render the page with the setup code
+    # once (200, no-store).
+
+    # `AccessPolicy` owns every check of these writes: the admin role and the
+    # Local-provider capability (D12). The handlers only read the form.
+
+    def _groups_of(form) -> list[str]:
+        # Checkboxes post one value each; a typed field may hold a list.
+        return [g for v in form.getlist("groups") for g in re.split(r"[,\s]+", v) if g]
+
+    def _security_page(
+        request: Request, *, section=None, error=None, status_code=200, **ctx
+    ) -> Response:
+        """The one owner of the `/security` context. `section` names the
+        section (`users`, `groups`, `rules`) that shows `error`."""
+        actor = request.state.user
+        users = supervisor.policy.list_users(actor)
+        groups = supervisor.policy.list_groups(actor)
+        return render(
+            "security.html", request, status_code=status_code, section=section, error=error,
+            users=users, groups=groups, bootstrap_id=BOOTSTRAP_ADMIN_ID, admins_group=ADMINS_GROUP,
+            members={g: sorted(u.id for u in users if g in u.groups) for g in groups},
+            rules=sorted(supervisor.policy.list_rules(actor), key=lambda r: r.created_at),
+            servers=[c.spec.key.ref for c in supervisor.children()],
+            login_setup_url=_base_url(settings, request) + "/login/setup",
+            setup_code_days=SETUP_CODE_TTL // 86400,
+            **{"issued": None, **ctx},
+        )
+
+    def _page(section: str):
+        # The security page, with a refusal shown in `section`.
+        return functools.partial(_security_page, section=section)
+
+    def _manage(page, redirect: str, op, reopen: str | None = None):
+        """One management write: run `op(request, form)`, then 303 to
+        `redirect`. `refusal` owns the status. A `ValueError` re-renders `page`
+        with the reason and `reopen`, the name of the dialog the form sits in
+        (the page shows that dialog open); any other refusal is a bare answer. An `op` that
+        returns a dict renders `page` with it instead (200): the one answer
+        that shows a setup code, so the browser must keep no copy."""
+
+        async def handler(request: Request) -> Response:
+            form = await request.form()
+            try:
+                ctx = op(request, form)
+            except REFUSALS as exc:
+                status, text = refusal(exc)
+                if isinstance(exc, ValueError):
+                    return page(request, error=text, status_code=status, reopen=reopen)
+                return PlainTextResponse(text, status_code=status)
+            if ctx is not None:
+                resp = page(request, status_code=200, **ctx)
+                resp.headers["Cache-Control"] = "no-store"
+                return resp
+            return RedirectResponse(redirect, status_code=303)
+
+        return handler
+
+    async def security_page(request: Request) -> Response:
+        return _security_page(request)
+
+    def _legacy(section: str):
+        # An old bookmark of `/users`, `/groups`, or `/rules`.
+        async def handler(request: Request) -> Response:
+            return RedirectResponse(f"/security#{section}", status_code=303)
+
+        return handler
+
+    def _create_user(request: Request, form) -> dict:
+        # No password: the user sets it with the setup code (design D3). No
+        # admin flag either: typing `admins` in the groups grants the role.
+        user, code = supervisor.policy.create_user(
+            request.state.user,
+            (form.get("id") or "").strip(),
+            name=(form.get("name") or "").strip(),
+            admin=None,
+            groups=_groups_of(form),
+        )
+        return {"issued": {"user": user.id, "code": code}}
+
+    def _reset_user(request: Request, form) -> dict:
+        # The user turns pending: the old password, every session, and every
+        # token end at once.
+        user_id = request.path_params["id"]
+        code = supervisor.policy.issue_setup_code(request.state.user, user_id)
+        return {"issued": {"user": user_id, "code": code}}
+
+    def _change_groups(request: Request, form) -> None:
+        # The picker posts a delta (design D5): `was` holds the groups it
+        # showed as checked, `groups` the boxes checked at save. A group the
+        # admin did not toggle is in neither set, so a stale picker leaves
+        # its current membership alone. `was` is never split on commas.
+        user_id = request.path_params["id"]
+        was = set(form.getlist("was"))
+        groups = set(_groups_of(form))
+        supervisor.policy.change_groups(
+            request.state.user, user_id, groups - was, was - groups
+        )
+
+    def _change_members(request: Request, form) -> None:
+        # The member picker posts a delta, like `_change_groups` (design D5):
+        # `was` holds the users it showed as checked, `members` the boxes
+        # checked at save. The provider raises KeyError for a missing group
+        # (404) and ValueError for a missing user (400); no argument is read.
+        group = request.path_params["name"]
+        was = set(form.getlist("was"))
+        members = set(form.getlist("members"))
+        supervisor.policy.change_members(
+            request.state.user, group, members - was, was - members
+        )
+
+    def _delete_user(request: Request, form) -> None:
+        supervisor.policy.delete_user(request.state.user, request.path_params["id"])
+
+    def _create_group(request: Request, form) -> None:
+        supervisor.policy.create_group(request.state.user, (form.get("name") or "").strip())
+
+    def _delete_group(request: Request, form) -> None:
+        supervisor.policy.delete_group(request.state.user, request.path_params["name"])
+
+    def _remove_member(request: Request, form) -> None:
+        supervisor.policy.remove_member(
+            request.state.user, request.path_params["name"], request.path_params["user_id"]
+        )
+
+    async def member_remove(request: Request) -> Response:
+        # `from` names the section to return to: a closed set, so it can never
+        # redirect off the page. Anything else returns to the Groups section.
+        back = request.query_params.get("from")
+        if back not in ("users", "groups"):
+            back = "groups"
+        return await _manage(_page(back), f"/security#{back}", _remove_member)(request)
+
+    # --- rules (admin-only) ---------------------------------------------
+
+    def _add_rule(request: Request, form) -> None:
+        def text(name: str) -> str:
+            value = form.get(name)
+            return value.strip() if isinstance(value, str) else ""
+
+        supervisor.policy.add_rule(
+            request.state.user,
+            subject_kind=text("subject_kind"),
+            subject=text("subject"),
+            level=text("level"),
+            server=text("server") or None,
+            tool=text("tool") or None,
+            effect=text("effect"),
+        )
+
+    def _delete_rule(request: Request, form) -> None:
+        supervisor.policy.remove_rule(request.state.user, request.path_params["id"])
+
+    # --- approvals (admin-only) -----------------------------------------
+
+    _CONFLICT = "the server changed since you opened this page"
+
+    def _approval_rows() -> list[dict]:
+        """One row per pending server: what runs and the revision the admin
+        approves. The rows carry the `env` and header key names, never a
+        value, so the template cannot render a secret."""
+        rows = []
+        for c in supervisor.children():
+            spec = c.spec
+            if spec.approval != "pending":
+                continue
+            rows.append({
+                "ref": spec.key.ref,
+                "owner": spec.owner,
+                "kind": spec.kind,
+                "command": None if spec.kind == "remote" else spec_command(spec),
+                "url": redact_url(spec.url),
+                "env_keys": sorted(spec.env),
+                "header_keys": sorted(spec.headers),
+                "revision": spec_revision(spec),
+            })
+        return rows
+
+    def _approvals_page(request: Request, *, error=None, status_code=200) -> Response:
+        return render(
+            "approvals.html", request, status_code=status_code, error=error,
+            rows=_approval_rows(),
+        )
+
+    async def approvals_page(request: Request) -> Response:
+        return _approvals_page(request)
+
+    async def approval_approve(request: Request) -> Response:
+        key = server_key(request)
+        form = await request.form()
+        posted = form.get("revision")
+        try:
+            # The revision of the row the admin read, never the stored one:
+            # a stale page must not approve code its reader did not see (F1).
+            await supervisor.approve(
+                key, posted if isinstance(posted, str) else "", request.state.user
+            )
+        except REFUSALS as exc:
+            if isinstance(exc, KeyError):
+                return _refusal(exc)
+            status, text = refusal(exc)
+            # The page names the conflict in its own words (F1).
+            error = _CONFLICT if isinstance(exc, RevisionConflict) else text
+            return _approvals_page(request, error=error, status_code=status)
+        return RedirectResponse("/approvals", status_code=303)
+
+    async def approval_reject(request: Request) -> Response:
+        try:
+            await supervisor.remove(server_key(request), request.state.user)
+        except REFUSALS as exc:
+            return _refusal(exc)
+        return RedirectResponse("/approvals", status_code=303)
 
     return [
         Route("/login", login_get, methods=["GET"]),
         Route("/login", login_post, methods=["POST"]),
+        # Public: the path starts with `/login`, a public prefix of the gate.
+        Route("/login/setup", setup_get, methods=["GET"]),
+        Route("/login/setup", setup_post, methods=["POST"]),
         Route("/logout", logout, methods=["POST"]),
+        Route("/settings", settings_page, methods=["GET"]),
+        Route("/settings/password", settings_password, methods=["POST"]),
         Route("/", dashboard, methods=["GET"]),
         # The poll's route. Not a public prefix, so the session gate covers it.
         Route("/tools/tree", tools_tree_partial, methods=["GET"]),
         Route("/visibility/root", visibility_root, methods=["POST"]),
         # Namespaces live under their own prefix: `root` is a legal namespace
-        # name, so `/visibility/{ns}` would shadow the gateway-wide route.
-        Route("/visibility/namespaces/{ns}", visibility_namespace, methods=["POST"]),
+        # name, so `/visibility/{ref}` would shadow the gateway-wide route.
+        Route("/visibility/namespaces/{ref}", visibility_namespace, methods=["POST"]),
         Route(
-            "/visibility/namespaces/{ns}/tool", visibility_tool, methods=["POST"]
+            "/visibility/namespaces/{ref}/tool", visibility_tool, methods=["POST"]
         ),
         Route("/servers", servers, methods=["GET"]),
         Route("/add-server", server_new, methods=["GET"]),
         Route("/servers", server_create, methods=["POST"]),
-        Route("/servers/{ns}/edit", server_edit, methods=["GET"]),
-        Route("/servers/{ns}", server_update, methods=["POST"]),
-        Route("/servers/{ns}/enable", _action(supervisor.enable), methods=["POST"]),
-        Route("/servers/{ns}/disable", _action(supervisor.disable), methods=["POST"]),
-        Route("/servers/{ns}/restart", _action(supervisor.restart), methods=["POST"]),
-        Route("/servers/{ns}/delete", _action(supervisor.remove), methods=["POST"]),
-        Route("/servers/{ns}/log", server_log, methods=["GET"]),
-        Route("/servers/{ns}/reauthorize", reauthorize_get, methods=["GET"]),
-        Route("/servers/{ns}/reauthorize", reauthorize_post, methods=["POST"]),
-        Route("/servers/{ns}/actions", server_actions, methods=["GET"]),
+        Route("/servers/{ref}/edit", server_edit, methods=["GET"]),
+        Route("/servers/{ref}", server_update, methods=["POST"]),
+        Route("/servers/{ref}/enable", _action(supervisor.enable), methods=["POST"]),
+        Route("/servers/{ref}/disable", _action(supervisor.disable), methods=["POST"]),
+        Route("/servers/{ref}/restart", _action(supervisor.restart), methods=["POST"]),
+        Route("/servers/{ref}/delete", _action(supervisor.remove), methods=["POST"]),
+        Route("/servers/{ref}/log", server_log, methods=["GET"]),
+        Route("/servers/{ref}/reauthorize", reauthorize_get, methods=["GET"]),
+        Route("/servers/{ref}/reauthorize", reauthorize_post, methods=["POST"]),
+        Route("/servers/{ref}/actions", server_actions, methods=["GET"]),
         Route(
-            "/servers/{ns}/actions/{action}", server_action_submit, methods=["POST"]
+            "/servers/{ref}/actions/{action}", server_action_submit, methods=["POST"]
         ),
         # Declared after the literal suffixes above so `/log`, `/edit`,
         # `/reauthorize`, and `/actions` keep matching their own routes.
-        Route("/servers/{ns}", server_detail, methods=["GET"]),
+        Route("/servers/{ref}", server_detail, methods=["GET"]),
         Route("/import/json", import_json, methods=["POST"]),
         Route("/marketplace", marketplace, methods=["GET"]),
         Route("/marketplace/grid", marketplace_grid, methods=["GET"]),
@@ -1347,4 +1860,54 @@ def build_routes(
         Route("/tokens", tokens_page, methods=["GET"]),
         Route("/tokens", token_create, methods=["POST"]),
         Route("/tokens/{id}/delete", token_delete, methods=["POST"]),
+        # Admin-only: none of these is in `USER_ROUTES`.
+        Route("/security", security_page, methods=["GET"]),
+        Route("/users", _legacy("users"), methods=["GET"]),
+        Route(
+            "/users",
+            _manage(_page("users"), "/security#users", _create_user, reopen="create"),
+            methods=["POST"],
+        ),
+        Route(
+            "/users/{id}/setup-code",
+            _manage(_page("users"), "/security#users", _reset_user),
+            methods=["POST"],
+        ),
+        Route(
+            "/users/{id}/groups",
+            _manage(_page("users"), "/security#users", _change_groups),
+            methods=["POST"],
+        ),
+        Route(
+            "/users/{id}/delete",
+            _manage(_page("users"), "/security#users", _delete_user),
+            methods=["POST"],
+        ),
+        Route("/groups", _legacy("groups"), methods=["GET"]),
+        Route(
+            "/groups",
+            _manage(_page("groups"), "/security#groups", _create_group, reopen="create-group"),
+            methods=["POST"],
+        ),
+        Route(
+            "/groups/{name}/delete",
+            _manage(_page("groups"), "/security#groups", _delete_group),
+            methods=["POST"],
+        ),
+        Route(
+            "/groups/{name}/members",
+            _manage(_page("groups"), "/security#groups", _change_members),
+            methods=["POST"],
+        ),
+        Route("/groups/{name}/members/{user_id}/remove", member_remove, methods=["POST"]),
+        Route("/rules", _legacy("rules"), methods=["GET"]),
+        Route("/rules", _manage(_page("rules"), "/security#rules", _add_rule), methods=["POST"]),
+        Route(
+            "/rules/{id}/delete",
+            _manage(_page("rules"), "/security#rules", _delete_rule),
+            methods=["POST"],
+        ),
+        Route("/approvals", approvals_page, methods=["GET"]),
+        Route("/approvals/{ref}/approve", approval_approve, methods=["POST"]),
+        Route("/approvals/{ref}/reject", approval_reject, methods=["POST"]),
     ]

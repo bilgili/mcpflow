@@ -8,6 +8,8 @@
   --ok: #3ecf8e;
   --warn: #e0b341;
   --err: #e0574b;
+  --chip-bg: color-mix(in srgb, var(--accent) 18%, transparent);
+  --chip-fg: #9ec0ff;
 }
 * { box-sizing: border-box; }
 body {
@@ -261,3 +263,68 @@ dialog.detail::backdrop { background: rgba(0, 0, 0, .6); }
 .result h3 { margin-top: 0; }
 .result pre { margin: 0; white-space: pre-wrap; word-break: break-all; font-size: .82rem; line-height: 1.45; }
 .secret-note { color: var(--muted); font-size: .8rem; margin: .25rem 0 0; }
+
+/* Membership tags (security page): a long list wraps and grows the cell in
+   height, never in width. */
+.tags { display: flex; flex-wrap: wrap; align-items: center; gap: .3rem; }
+/* A tag is a borderless pill; its x sits inside it. */
+.tag { display: inline-flex; align-items: center; gap: 4px; height: 24px; padding: 0 0 0 10px; border: 0; border-radius: 999px; background: var(--chip-bg); color: var(--chip-fg); font: .8rem/1 ui-monospace, monospace; }
+.tag code { color: inherit; background: none; }
+.tag form { margin: 0; display: inline-flex; }
+.tag.nox { padding-right: 10px; }
+.tag.admins { padding-left: 7px; }
+.tag .shield { width: 13px; height: 13px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linejoin: round; }
+.tag .lock svg, .group-list .lock svg { width: 12px; height: 12px; display: block; fill: none; stroke: currentColor; stroke-width: 1.5; }
+/* The hit target is 24 by 24 CSS px (WCAG 2.5.8). `all: unset` drops the
+   global `button` border, background, padding, and font. */
+.tag-x { all: unset; box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border-radius: 999px; color: var(--chip-fg); cursor: pointer; }
+.tag-x svg { width: 10px; height: 10px; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; }
+/* An 18 px filled circle; `border: 0` keeps `button:hover` from adding one. */
+.tag-x:hover { color: #fff; background: radial-gradient(circle closest-side, var(--accent) 75%, transparent 76%); border: 0; }
+.tag-x:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.tags-more > summary { cursor: pointer; font-size: .8rem; color: var(--accent); }
+
+/* User dialogs (create and edit): a native modal <dialog> holding one form. The
+   row menu is a native popover opened from the ⋯ button, its implicit anchor. */
+#users, #groups { display: grid; grid-template-columns: 1fr auto; column-gap: 1rem; align-items: center; }
+#users > *, #groups > * { grid-column: 1 / -1; }
+#users > h2, #groups > h2 { grid-column: 1; grid-row: 1; }
+#users > .create-btn, #groups > .create-btn { grid-column: 2; grid-row: 1; }
+dialog.userdlg, dialog.confirmdlg { background: var(--panel); color: var(--fg); border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.25rem; width: min(420px, 94vw); }
+dialog.userdlg::backdrop, dialog.confirmdlg::backdrop { background: rgba(0, 0, 0, .6); }
+.userdlg .dhead, .confirmdlg .dhead { padding: 0 0 .6rem; border: 0; }
+.userdlg .dhead h3, .confirmdlg .dhead h3 { margin: 0; font-size: 1.05rem; }
+.confirmdlg p { margin: 0 0 1rem; font-size: .9rem; }
+.confirmdlg .danger-fill { background: var(--err); border-color: var(--err); color: #fff; }
+.userdlg .field { display: flex; flex-direction: column; gap: .25rem; margin-bottom: .7rem; }
+.userdlg .field label { margin: 0; font-size: .8rem; color: var(--muted); }
+.userdlg .field input[name="name"] { margin-bottom: .1rem; }
+.group-list { max-height: 150px; overflow: auto; border: 1px solid var(--border); border-radius: 6px; margin: 4px 0; }
+.group-list label { display: flex; align-items: center; gap: 8px; margin: 0; padding: 5px 10px; border-bottom: 1px solid var(--border); color: var(--fg); cursor: pointer; font: .8rem ui-monospace, monospace; }
+/* Required: `display: flex` above overrides the `hidden` attribute. */
+.group-list label[hidden] { display: none; }
+.group-list label:hover { background: #20242c; }
+.group-list .lock { margin-left: auto; color: var(--muted); }
+.pop-foot { display: flex; justify-content: space-between; align-items: center; }
+.pop-foot .count { margin: 0; }
+td.row-end { width: 1%; text-align: right; }
+.row-menu { min-width: 10rem; padding: 4px; background: var(--panel); color: var(--fg); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.45); }
+@supports (position-area: bottom) {
+  .row-menu { inset: auto; margin: 4px 0 0; position-area: bottom span-left; }
+}
+.row-menu form { margin: 0; }
+.row-menu button { display: block; width: 100%; text-align: left; border: 0; background: none; }
+.row-menu button:hover { background: #20242c; }
+.row-menu .danger { color: var(--err); }
+
+/* Security page: one-row create forms, short table rows. A field is a label
+   over a control; the row wraps on a narrow screen. */
+.form-row { display: flex; flex-wrap: wrap; align-items: flex-end; gap: .6rem; margin: .5rem 0 .25rem; }
+.form-row .field { display: flex; flex-direction: column; flex: 1 1 8rem; min-width: 0; }
+.form-row .field.fit { flex: 0 0 auto; }
+.form-row .field.wide { flex-grow: 2; }
+.form-row label { margin: 0 0 .2rem; font-size: .8rem; }
+.form-row button { min-height: 2.3rem; }
+.btn-sm { padding: .1rem .45rem; font-size: .85rem; }
+.nowrap { white-space: nowrap; }
+.nowrap form { margin: 0; }

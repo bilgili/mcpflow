@@ -24,7 +24,7 @@ import re
 
 import pytest
 from action_browser import action_post, control
-from conftest import fake_child_spec, seed_registry
+from conftest import ADMIN_ACTOR, fake_child_spec, seed_registry
 from fastmcp.exceptions import ToolError
 from fastmcp.server.providers.addressing import hash_tool
 from test_child_actions import (
@@ -42,7 +42,7 @@ from test_supervisor import make_supervisor  # noqa: F401 -- async fixture
 from test_visibility import admin, call_log, mute, tool_path
 
 from mcpflow.actions import ActionScopeFilter, AuthorizedHashProvider
-from mcpflow.registry import Registry, ServerSpec
+from mcpflow.registry import Registry, ServerKey, ServerSpec
 from mcpflow.supervisor import (
     ActionUnavailable,  # noqa: F401 -- still exported (A4 dead)
 )
@@ -106,8 +106,8 @@ def test_f2_9_tag_on_a_non_capable_child_is_ordinary(server_factory):
     # The page seam returns nothing and refuses run_action for the child.
     # A4 F1: run_action returns an ActionRun for every renderable outcome; a
     # non-capable child yields kind "unknown" (no tool of it is an action).
-    assert run_sync(server.supervisor.actions("store")) == []
-    run = run_sync(server.supervisor.run_action("store", "set_writable", {"name": "x"}))
+    assert run_sync(server.supervisor.actions(ServerKey(None, "store"))) == []
+    run = run_sync(server.supervisor.run_action(ServerKey(None, "store"), "set_writable", {"name": "x"}, ADMIN_ACTOR))
     assert run.kind == "unknown"
 
 
@@ -124,14 +124,16 @@ def run_sync(coro):
 
 # 15.F2.10 -- scenario "A non-capable child keeps its cache TTL".
 @pytest.mark.asyncio
-async def test_f2_10_non_capable_child_keeps_its_cache_ttl(make_supervisor):  # noqa: F811
+async def test_f2_10_non_capable_child_keeps_its_cache_ttl(make_supervisor):
     sup = make_supervisor()
-    child = await sup.add(fake_child_spec("time", "good", cache_ttl=30))
+    child = await sup.add(fake_child_spec("time", "good", cache_ttl=30), ADMIN_ACTOR)
     await child.task
     assert child.status == "running"
-    # The chain is the pre-amendment chain: Namespace(Visibility(ProxyProvider)).
-    assert not isinstance(child.provider, AuthorizedHashProvider)
-    proxy = child.provider._inner._inner
+    # The inner chain is the pre-amendment chain:
+    # Namespace(Visibility(ProxyProvider)). multi-user-access D6 wraps it in
+    # AuthorizedHashProvider, so the mute also covers the hashed path.
+    assert isinstance(child.provider, AuthorizedHashProvider)
+    proxy = child.provider._chain._inner._inner
     assert proxy._cache_ttl == 30.0
     assert ActionScopeFilter not in [type(t) for t in proxy.transforms]
 
@@ -139,22 +141,22 @@ async def test_f2_10_non_capable_child_keeps_its_cache_ttl(make_supervisor):  # 
 # 15.F2.11 -- scenario "An edit save keeps the grant" (anti-revoke) plus the
 # gate's anti-self-grant audit: an update dict cannot flip the flag.
 def test_f2_11_update_keeps_the_grant_and_blocks_self_grant(tmp_path):
-    reg = Registry(tmp_path / "servers.json")
+    reg = Registry(tmp_path / "servers.json", tmp_path / "user_servers.json")
     reg.load()
     reg.add(_custom("store", actions=True))
     reg.add(_custom("time"))  # actions defaults False
     # Anti-revoke: an edit save that OMITS `actions` keeps the stored grant.
     reg.update(_custom("store", args=["z"]))
-    assert reg.get("store").actions is True
+    assert reg.get(ServerKey(None, "store")).actions is True
     # Anti-self-grant: an update dict that sets actions=True on a non-capable
     # child does NOT flip it; only a create or a catalog connect can.
     reg.update(_custom("time", args=["z"], actions=True))
-    assert reg.get("time").actions is False
+    assert reg.get(ServerKey(None, "time")).actions is False
     # The grant survives a reload.
-    again = Registry(tmp_path / "servers.json")
+    again = Registry(tmp_path / "servers.json", tmp_path / "user_servers.json")
     again.load()
-    assert again.get("store").actions is True
-    assert again.get("time").actions is False
+    assert again.get(ServerKey(None, "store")).actions is True
+    assert again.get(ServerKey(None, "time")).actions is False
 
 
 # 15.F2.12 -- scenario "A stale cache on a non-capable child is safe".
@@ -233,9 +235,9 @@ def test_f2_15_cache_ttl_field_disabled_for_capable_enabled_for_non_capable(serv
 # name a stale probe offered but that is not a conforming action on the live
 # generation is refused, and a real restart binds the call to the new generation.
 @pytest.mark.asyncio
-async def test_f4_3_run_action_rechecks_on_the_execution_generation(make_supervisor):  # noqa: F811
+async def test_f4_3_run_action_rechecks_on_the_execution_generation(make_supervisor):
     sup = make_supervisor()
-    child = await sup.add(store_spec())
+    child = await sup.add(store_spec(), ADMIN_ACTOR)
     await child.task
     # An ordinary tool, a clause violator, and an absent name: each is not a
     # conforming action on the live generation, so run_action refuses before it
@@ -243,13 +245,13 @@ async def test_f4_3_run_action_rechecks_on_the_execution_generation(make_supervi
     # A4 F1: run_action returns an ActionRun; a non-conforming name yields kind
     # "unknown" before any call_tool_mcp, so no tool runs.
     for name, args in (("list_stores", {}), ("nested", {"cfg": {}}), ("ghost", {})):
-        run = await sup.run_action("store", name, args)
+        run = await sup.run_action(ServerKey(None, "store"), name, args, ADMIN_ACTOR)
         assert run.kind == "unknown", name
     # A restart supersedes the probed generation; a conforming action still runs
     # on the new generation, never a swapped stale object.
-    await sup.restart("store")
+    await sup.restart(ServerKey(None, "store"), ADMIN_ACTOR)
     await child.task
-    run = await sup.run_action("store", "set_writable", {"name": "s3main"})
+    run = await sup.run_action(ServerKey(None, "store"), "set_writable", {"name": "s3main"}, ADMIN_ACTOR)
     assert run.kind == "ran" and not run.result.is_error
 
 
@@ -257,11 +259,11 @@ async def test_f4_3_run_action_rechecks_on_the_execution_generation(make_supervi
 # raises "muted", calling no tool. This is the second line of defence behind the
 # route's pre-call mute check.
 @pytest.mark.asyncio
-async def test_f4_run_action_refuses_a_mute_and_calls_no_tool(make_supervisor):  # noqa: F811
+async def test_f4_run_action_refuses_a_mute_and_calls_no_tool(make_supervisor):
     sup = make_supervisor()
-    child = await sup.add(store_spec())
+    child = await sup.add(store_spec(), ADMIN_ACTOR)
     await child.task
-    sup.set_tool_muted("store", "set_writable", True)
+    sup.set_tool_muted(ServerKey(None, "store"), "set_writable", True, ADMIN_ACTOR)
     # A4 F1: prove no tool call by spying the raw call primitive; run_action
     # returns kind "muted" before it reaches call_tool_mcp.
     calls = []
@@ -272,7 +274,7 @@ async def test_f4_run_action_refuses_a_mute_and_calls_no_tool(make_supervisor): 
         return await orig(*a, **k)
 
     child.session.client.call_tool_mcp = spy
-    run = await sup.run_action("store", "set_writable", {"name": "s3main"})
+    run = await sup.run_action(ServerKey(None, "store"), "set_writable", {"name": "s3main"}, ADMIN_ACTOR)
     assert run.kind == "muted"
     assert calls == []
 
@@ -282,7 +284,7 @@ async def test_f4_run_action_refuses_a_mute_and_calls_no_tool(make_supervisor): 
 def test_f4_4_unknown_action_segment_is_404_and_calls_no_tool(server_factory, monkeypatch):
     called = []
 
-    async def spy(self, ns, name, arguments, **kwargs):
+    async def spy(self, ns, name, arguments, actor, **kwargs):
         called.append((ns, name))
 
     monkeypatch.setattr("mcpflow.supervisor.Supervisor.run_action", spy)

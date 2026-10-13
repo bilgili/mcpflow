@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MCP Flow first sign-in</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  {# Public, like login.html: the user has no session yet. A re-render keeps
+     only `user`; it never echoes the code or a password. #}
+  <main style="max-width:360px">
+    <h1><img src="/static/logo.svg" alt="MCP Flow" class="logo logo-lg"></h1>
+    <p class="muted">First sign-in: enter the setup code from your admin and choose a password of at least 8 characters.</p>
+    {% if error %}<p class="error">{{ error }}</p>{% endif %}
+    <form method="post" action="/login/setup">
+      <label>User</label>
+      <input type="text" name="user" value="{{ user }}" autocomplete="username" required>
+      <label>Setup code</label>
+      <input type="text" name="code" autocomplete="one-time-code" required>
+      <label>New password</label>
+      <input type="password" name="password" autocomplete="new-password" minlength="8" required>
+      <label>Confirm new password</label>
+      <input type="password" name="confirm" autocomplete="new-password" minlength="8" required>
+      <p><button type="submit">Set password and sign in</button></p>
+    </form>
+    <p class="small"><a href="/login">Back to sign-in</a></p>
+  </main>
+</body>
+</html>

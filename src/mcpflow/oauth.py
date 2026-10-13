@@ -4,21 +4,30 @@ One generic flow serves every vendor. Vendor differences live in data files
 under `mcpflow/catalog/providers/` (and admin overrides under
 `DATA_DIR/catalog/providers/`), loaded by `ProviderRegistry`. A child's token
 file shape lives in one small function in `TOKEN_FORMATS`. The module depends
-on `catalog.py` for the `OAuthBlock` type and on nothing else in the package;
-`catalog.py` never imports this module.
+on `catalog.py` for the `OAuthBlock` type and on `registry.py` for the
+`ServerKey` reference shape, and on `identity.py` for the `User` type only
+(the opener of a flow); none of these modules imports this one.
 
 Ownership (see `design.md`):
 
 - `ProviderRegistry` owns the provider schema, the two directories, and the
   local-wins-on-id merge.
 - `CredStore` is, inside MCP Flow, the only writer and the only deleter of
-  `DATA_DIR/creds/<ns>/client.json`, `token.json`, and `refresh.json`. No
-  child is given the path of `refresh.json`. It is not the only
+  `DATA_DIR/creds/<ref>/client.json`, `token.json`, and `refresh.json`,
+  where `<ref>` is the server reference (`<ns>` admin-owned, `<ns>@<owner>`
+  user-owned). Every method validates the reference with `ServerKey.parse`
+  before it builds a path, so no call names a path outside `DATA_DIR/creds/`
+  or the directory of another reference. No child is given the path of
+  `refresh.json`. It is not the only
   writer on the host: a file sink child that refreshes its own access token
   rewrites the `token.json` MCP Flow gave it, so the store never assumes the
   file is unchanged since it wrote it. The supervisor owns the ordering that
-  keeps the file coherent against that second writer.
-- `PendingFlows` owns open flows, keyed by a one-shot, short-lived `state`.
+  keeps the file coherent against that second writer. Every write and the
+  delete of `refresh.json` (`remove_refresh`) sync the directory, so the
+  supervisor's order of the file before the registry header survives a power
+  loss.
+- `PendingFlows` owns open flows, keyed by a one-shot, short-lived `state`;
+  each flow names one server reference.
 - `authorize_url` and `token_request` build the two OAuth messages.
 
 The supervisor is the only caller of `write_client`, `write_token`,
@@ -32,6 +41,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import secrets
 import shutil
@@ -39,6 +49,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlencode
 
 import httpx
@@ -51,6 +62,10 @@ from pydantic import (
 )
 
 from .catalog import OAuthBlock
+from .registry import ServerKey
+
+if TYPE_CHECKING:
+    from .identity import User
 
 # Shared with the catalog reason formatter in spirit: one line per fault.
 _HTTPS = "https://"
@@ -193,42 +208,58 @@ def _write_private(path: Path, text: str) -> None:
 
 
 class CredStore:
-    """The one owner of `DATA_DIR/creds/<namespace>/`."""
+    """The one owner of `DATA_DIR/creds/<ref>/`.
+
+    Every method takes the server reference, never the namespace alone, so an
+    operation on `github@alice` never touches admin-owned `github`.
+    """
 
     def __init__(self, data_dir: Path) -> None:
         self.root = data_dir / "creds"
 
-    def paths(self, namespace: str) -> CredPaths:
-        base = self.root / namespace
+    def _dir(self, ref: str) -> Path:
+        # The shape check runs before any path is built: `ServerKey.parse`
+        # admits no `/`, no `.`, and no second `@`, so a traversal in the
+        # owner id raises `ValueError` here and touches nothing.
+        ServerKey.parse(ref)
+        return self.root / ref
+
+    def paths(self, ref: str) -> CredPaths:
+        base = self._dir(ref)
         return CredPaths(client=base / "client.json", token=base / "token.json")
 
-    def _ensure_dir(self, namespace: str) -> None:
-        (self.root / namespace).mkdir(parents=True, exist_ok=True, mode=0o700)
+    def _ensure_dir(self, ref: str) -> None:
+        self._dir(ref).mkdir(parents=True, exist_ok=True, mode=0o700)
 
-    def write_client(self, namespace: str, fmt: str, creds: ClientCreds) -> None:
-        self._ensure_dir(namespace)
-        _write_private(self.paths(namespace).client, CLIENT_FORMATS[fmt](creds))
+    def write_client(self, ref: str, fmt: str, creds: ClientCreds) -> None:
+        self._ensure_dir(ref)
+        _write_private(self.paths(ref).client, CLIENT_FORMATS[fmt](creds))
 
-    def write_token(self, namespace: str, fmt: str, tokens: dict) -> None:
-        self._ensure_dir(namespace)
-        _write_private(self.paths(namespace).token, TOKEN_FORMATS[fmt](tokens))
+    def write_token(self, ref: str, fmt: str, tokens: dict) -> None:
+        self._ensure_dir(ref)
+        _write_private(self.paths(ref).token, TOKEN_FORMATS[fmt](tokens))
 
-    def refresh_path(self, namespace: str) -> Path:
-        return self.root / namespace / "refresh.json"
+    def has_client(self, ref: str) -> bool:
+        return self.paths(ref).client.exists()
 
-    def write_refresh(self, namespace: str, state: dict) -> None:
+    def refresh_path(self, ref: str) -> Path:
+        return self._dir(ref) / "refresh.json"
+
+    def write_refresh(self, ref: str, state: dict) -> None:
         """Write `refresh.json`, the grant of a public client header sink.
         `state` is built by `refresh_state`."""
-        self._ensure_dir(namespace)
-        _write_private(self.refresh_path(namespace), json.dumps(state))
+        self._ensure_dir(ref)
+        _write_private(self.refresh_path(ref), json.dumps(state))
 
-    def read_refresh(self, namespace: str) -> dict | None:
+    def read_refresh(self, ref: str) -> dict | None:
         """The refresh state, or None when the file is absent. Raises
         `ValueError` for a file that is not a JSON object with the refresh
-        fields, or whose `token_url` is not https: the supervisor would POST a
-        refresh token there."""
+        fields, whose `token_url` is not https (the supervisor would POST a
+        refresh token there), or whose `expires_at` is present but not a
+        finite number (a `bool` included): a `NaN` would schedule a refresh at
+        the 30 s floor forever. Any other `OSError` of the read propagates."""
         try:
-            text = self.refresh_path(namespace).read_text(encoding="utf-8")
+            text = self.refresh_path(ref).read_text(encoding="utf-8")
         except FileNotFoundError:
             return None
         state = json.loads(text)
@@ -238,28 +269,60 @@ class CredStore:
             raise ValueError("refresh.json lacks a refresh field")
         if not state["token_url"].startswith(_HTTPS):
             raise ValueError("refresh.json token_url must use the https scheme")
+        if "expires_at" in state:
+            expires_at = state["expires_at"]
+            try:
+                # float() raises OverflowError for an int past the float range.
+                finite = (
+                    not isinstance(expires_at, bool)
+                    and isinstance(expires_at, (int, float))
+                    and math.isfinite(float(expires_at))
+                )
+            except OverflowError:
+                finite = False
+            if not finite:
+                raise ValueError("refresh.json expires_at must be a finite number")
         return state
 
-    def remove_refresh(self, namespace: str) -> None:
-        self.refresh_path(namespace).unlink(missing_ok=True)
+    def remove_refresh(self, ref: str) -> None:
+        """Delete `refresh.json`, then sync its directory (design D13), so a
+        power loss cannot bring back an old grant's file that the startup
+        reconcile would then write into the header."""
+        path = self.refresh_path(ref)
+        path.unlink(missing_ok=True)
+        if path.parent.is_dir():
+            dfd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
 
-    def namespaces(self) -> list[str]:
-        """The namespaces that hold a credential directory."""
+    def refs(self) -> list[str]:
+        """The server references that hold a credential directory. A
+        directory whose name is not a reference is skipped: no method of this
+        store may build a path from it."""
         if not self.root.is_dir():
             return []
-        return [p.name for p in self.root.iterdir() if p.is_dir()]
+        out = []
+        for p in self.root.iterdir():
+            if not p.is_dir():
+                continue
+            try:
+                ServerKey.parse(p.name)
+            except ValueError:
+                continue
+            out.append(p.name)
+        return out
 
-    def has_client(self, namespace: str) -> bool:
-        return self.paths(namespace).client.exists()
+    def has_token(self, ref: str) -> bool:
+        return self.paths(ref).token.exists()
 
-    def has_token(self, namespace: str) -> bool:
-        return self.paths(namespace).token.exists()
+    def awaiting(self, ref: str) -> bool:
+        return self.has_client(ref) and not self.has_token(ref)
 
-    def awaiting(self, namespace: str) -> bool:
-        return self.has_client(namespace) and not self.has_token(namespace)
-
-    def remove(self, namespace: str) -> None:
-        shutil.rmtree(self.root / namespace, ignore_errors=True)
+    def remove(self, ref: str) -> None:
+        """Delete the directory of `ref` only. No-op when it is absent."""
+        shutil.rmtree(self._dir(ref), ignore_errors=True)
 
 
 # The account id the Calendar child reads its token map by. `getAccountMode`
@@ -429,11 +492,14 @@ TOKEN_FORMATS: dict[str, Callable[[dict], str]] = {
 @dataclass(frozen=True)
 class PendingFlow:
     state: str
-    namespace: str
+    ref: str  # the server reference, `<ns>` or `<ns>@<owner>`
     entry_id: str
     client: ClientCreds  # in memory only, for the token exchange
     code_verifier: str
     created: float
+    # The snapshot of the admin who opened the flow. `finish_oauth` checks
+    # it at the write, so a flow never outlives its opener's right.
+    actor: User
     reauth: bool = False  # a re-authorization of an existing child
 
 
@@ -460,27 +526,35 @@ class PendingFlows:
             del self._flows[state]
 
     def create(
-        self, namespace: str, entry_id: str, client: ClientCreds, *, reauth: bool = False
+        self,
+        ref: str,
+        entry_id: str,
+        client: ClientCreds,
+        actor: User,
+        *,
+        reauth: bool = False,
     ) -> PendingFlow:
         self._sweep()
         flow = PendingFlow(
             state=secrets.token_urlsafe(32),
-            namespace=namespace,
+            ref=ref,
             entry_id=entry_id,
             client=client,
             code_verifier=secrets.token_urlsafe(64),
             created=time.time(),
+            actor=actor,
             reauth=reauth,
         )
         self._flows[flow.state] = flow
         return flow
 
-    def has_open(self, namespace: str) -> bool:
-        # True when a non-expired flow of the namespace exists. The re-auth
+    def has_open(self, ref: str) -> bool:
+        # True when a non-expired flow of the reference exists. The re-auth
         # route uses it to refuse a second re-authorization while one is open,
-        # so one namespace has at most one flow in flight.
+        # so one reference has at most one flow in flight. An exact match: the
+        # flow of `github` is not a flow of `github@alice`.
         self._sweep()
-        return any(f.namespace == namespace for f in self._flows.values())
+        return any(f.ref == ref for f in self._flows.values())
 
     def peek(self, state: str) -> PendingFlow | None:
         # Non-consuming: the callback validates the state before the token
@@ -507,8 +581,10 @@ class PendingFlows:
     def end_exchange(self, state: str) -> None:
         self._exchanging.discard(state)
 
-    def discard(self, namespace: str) -> None:
-        for state in [s for s, f in self._flows.items() if f.namespace == namespace]:
+    def discard(self, ref: str) -> None:
+        # The flows of this reference only; the same namespace under another
+        # owner keeps its flow.
+        for state in [s for s, f in self._flows.items() if f.ref == ref]:
             del self._flows[state]
             self._exchanging.discard(state)
 

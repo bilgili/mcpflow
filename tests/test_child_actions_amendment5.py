@@ -16,13 +16,17 @@ from types import SimpleNamespace
 
 import pytest
 from action_browser import control
+from conftest import ADMIN_ACTOR
 from mcp.types import CallToolResult, TextContent
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.testclient import TestClient
 from test_child_actions import PAGE, cards, store_spec
 from test_supervisor import make_supervisor  # noqa: F401
 
 from mcpflow.actions import redact
+from mcpflow.auth import _set_user
+from mcpflow.registry import ServerKey
 from mcpflow.supervisor import LeaseRefused
 from mcpflow.web import build_routes
 
@@ -58,8 +62,20 @@ def token(url):
     return url.split("form_token=")[1]
 
 
+class _AsAdmin:
+    """The `SessionGate` contract without the cookie: every dashboard route
+    reads `request.state.user`, and the actions routes are admin-only."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        _set_user(scope, ADMIN_ACTOR)
+        await self.app(scope, receive, send)
+
+
 @pytest.fixture
-def harness(make_supervisor, monkeypatch):  # noqa: F811
+def harness(make_supervisor, monkeypatch):
     spec = store_spec(env={"R5_SECRET": CONFIGURED})
     sup = make_supervisor(spec)
     child = SimpleNamespace(spec=spec, status="running")
@@ -93,10 +109,10 @@ def harness(make_supervisor, monkeypatch):  # noqa: F811
             raise state.error
 
     monkeypatch.setattr(sup, "_lease", lease)
-    routes = build_routes(sup, None, sup.settings, None, None)
+    routes = build_routes(sup, None, sup.settings, None, None, None)
     endpoint = next(r.endpoint for r in routes if r.path.endswith("/actions/{action}"))
     snapshots = inspect.getclosurevars(endpoint).nonlocals["action_snapshots"]
-    with TestClient(Starlette(routes=routes)) as client:
+    with TestClient(Starlette(routes=routes, middleware=[Middleware(_AsAdmin)])) as client:
         yield SimpleNamespace(client=client, sup=sup, state=state, snapshots=snapshots)
 
 
@@ -367,7 +383,7 @@ def test_snapshot_metadata_detached_and_never_persists_request_state(harness):
     before = repr(saved)
     raw.input_schema["properties"]["choice"]["enum"][0] = "new-option"
     raw.input_schema["properties"]["p"]["default"] = NEW
-    h.sup.get("store").spec.env["R5_SECRET"] = "changed-config-secret"
+    h.sup.get(ServerKey(None, "store")).spec.env["R5_SECRET"] = "changed-config-secret"
     assert repr(saved) == before
     # Old option still decodes to old-option, which CURRENT coercion rejects.
     response = h.client.post(url, data={"f0": POSTED, "f1": "o0"})
@@ -420,10 +436,9 @@ async def test_all_run_kinds_keep_accumulated_context(outcome, phase, harness):
         "current": "current-password",
         "count": "bad" if outcome == "coerce_error" else "12",
     }
-    run = await h.sup.run_action(
-        "store",
+    run = await h.sup.run_action(ServerKey(None, "store"),
         "absent" if outcome == "unknown" else "save",
-        form,
+        form, ADMIN_ACTOR,
         rendered_password_keys=frozenset({"p"}),
         rendered_secrets=frozenset({OLD}),
     )
@@ -449,7 +464,7 @@ async def test_actions_returns_raw_admitted_metadata(harness):
     raw.title = OLD
     raw.description = CONFIGURED
     h.state.tools = [raw]
-    [view] = await h.sup.actions("store")
+    [view] = await h.sup.actions(ServerKey(None, "store"))
     assert view.name == raw.name and view.title == OLD
     assert view.description == CONFIGURED and view.schema == raw.input_schema
     body = h.client.get(PAGE).text

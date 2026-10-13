@@ -8,25 +8,27 @@ Namespaced tool names, Only running enabled children are visible) and
 from __future__ import annotations
 
 import asyncio
+import time
 
 import httpx
 import pytest
 from conftest import fake_child_spec
 from mcp.shared.exceptions import MCPError
 
+from mcpflow import supervisor as supervisor_mod
 from mcpflow.auth import TokenStore
 from mcpflow.registry import Registry, ServerSpec
 
 
 def _seed(*specs: ServerSpec, holder: dict):
     def seed(data_dir):
-        reg = Registry(data_dir / "servers.json")
+        reg = Registry(data_dir / "servers.json", data_dir / "user_servers.json")
         reg.load()
         for spec in specs:
             reg.add(spec)
-        store = TokenStore(data_dir / "tokens.json")
+        store = TokenStore(data_dir / "tokens.json", data_dir / "user_tokens.json")
         store.load()
-        record, clear = store.create("test")
+        record, clear = store.create("test", "mcp", "admin")
         holder["clear"] = clear
         holder["id"] = record.id
 
@@ -233,13 +235,60 @@ def test_list_is_fresh_under_long_ttl(server_factory, tmp_path):
     assert "grow_extra" in tools
 
 
-def test_dashboard_probe_ignores_the_cache(server_factory, tmp_path):
+def test_dashboard_probe_ignores_the_cache(server_factory, tmp_path, monkeypatch):
     server, token, grow = _grow(server_factory, tmp_path, 300)
     mcp_call(server.base_url, token, "grow_get_current_time", {})
     client = server.login()
     try:
-        assert "grow_extra" not in client.get("/").text
+        # A poll answer starts no probe, so no early probe can dedupe away the
+        # probe of the patched load below.
+        assert "grow_extra" not in client.get("/tools/tree?poll=1").text
         grow.touch()
-        assert "grow_extra" in client.get("/").text
+        # A stale snapshot: the load below is a probing render, and its probe
+        # reads the child, not the proxy cache. The poll shows the result.
+        monkeypatch.setattr(supervisor_mod, "SNAPSHOT_MAX_AGE", 0.0)
+        client.get("/tools/tree")
+        deadline = time.monotonic() + 15
+        while "grow_extra" not in client.get("/tools/tree?poll=1").text:
+            assert time.monotonic() < deadline, "the probe never listed grow_extra"
+            time.sleep(0.1)
     finally:
         client.close()
+
+
+def test_tool_count_keeps_the_start_read_after_the_dashboard_probe(
+    server_factory, tmp_path, monkeypatch
+):
+    # Scenario: Dashboard probe ignores the cache (dashboard-tool-snapshot).
+    # `Child.tool_count` keeps the count of the start read, and a snapshot
+    # probe never writes it. Neither the tree nor `tool_count` reads the proxy
+    # cache (`cache_ttl` 300).
+    from test_admin_mcp import _seed as seed_tokens
+
+    grow = tmp_path / "grow"
+    holder: dict = {}
+    spec = fake_child_spec(
+        "grow", "grow", cache_ttl=300, env={"MCPFLOW_GROW": str(grow)}
+    )
+    server = server_factory(seed_tokens(holder, spec))
+    server.wait(running=1)
+    headers = {"Authorization": f"Bearer {holder['admin']}"}
+
+    def tool_count() -> int:
+        resp = httpx.get(server.base_url + "/api/servers/grow", headers=headers)
+        assert resp.status_code == 200
+        return resp.json()["tool_count"]
+
+    assert tool_count() == 1
+    grow.touch()  # the child now lists `extra` as well
+    monkeypatch.setattr(supervisor_mod, "SNAPSHOT_MAX_AGE", 0.0)
+    client = server.login()
+    try:
+        client.get("/tools/tree")  # a probing render starts the probe
+        deadline = time.monotonic() + 15
+        while "grow_extra" not in client.get("/tools/tree?poll=1").text:
+            assert time.monotonic() < deadline, "the probe never listed grow_extra"
+            time.sleep(0.1)
+    finally:
+        client.close()
+    assert tool_count() == 1  # still the count of the start read

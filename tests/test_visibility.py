@@ -16,16 +16,16 @@ import contextlib
 import json
 
 import pytest
-from conftest import fake_child_spec
+from conftest import ADMIN_ACTOR, fake_child_spec
 from fastmcp.exceptions import ToolError
 
 from mcpflow.auth import TokenStore
-from mcpflow.registry import Registry, ServerSpec
+from mcpflow.registry import Registry, ServerKey, ServerSpec
 
 
 def _seed(*specs: ServerSpec, holder: dict):
     def seed(data_dir):
-        reg = Registry(data_dir / "servers.json")
+        reg = Registry(data_dir / "servers.json", data_dir / "user_servers.json")
         reg.load()
         for spec in specs:
             # The child appends one line per tool call, so a test can prove a
@@ -41,9 +41,9 @@ def _seed(*specs: ServerSpec, holder: dict):
                     }
                 )
             )
-        store = TokenStore(data_dir / "tokens.json")
+        store = TokenStore(data_dir / "tokens.json", data_dir / "user_tokens.json")
         store.load()
-        _record, clear = store.create("test")
+        _record, clear = store.create("test", "mcp", "admin")
         holder["clear"] = clear
 
     return seed
@@ -264,10 +264,10 @@ def test_mute_keeps_the_child_running_and_enabled(server_factory):
         mute(client, ns_path("time"))
 
     assert server.health()["running"] == 1
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    assert reg.get("time").enabled is True
-    assert reg.get("time").muted is True
+    assert reg.get(ServerKey(None, "time")).enabled is True
+    assert reg.get(ServerKey(None, "time")).muted is True
     # The subprocess is still alive: unmuting publishes again with no restart.
     with admin(server) as client:
         unmute(client, ns_path("time"))
@@ -306,13 +306,13 @@ def test_registry_file_matches_after_each_operation(server_factory):
 
     with admin(server) as client:
         mute(client, tool_path("time"), tool="get_current_time")
-        reg = Registry(server.data_dir / "servers.json")
+        reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
         reg.load()
-        assert reg.get("time").disabled_tools == ["get_current_time"]
+        assert reg.get(ServerKey(None, "time")).disabled_tools == ["get_current_time"]
         assert reg.root_muted() is False
 
         mute(client, ROOT)
-        reg = Registry(server.data_dir / "servers.json")
+        reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
         reg.load()
         assert reg.root_muted() is True
 
@@ -338,7 +338,7 @@ def test_a_started_gateway_honours_a_persisted_root_mute(server_factory):
 
     def seed(data_dir):
         _seed(fake_child_spec("time", "two"), holder=holder)(data_dir)
-        reg = Registry(data_dir / "servers.json")
+        reg = Registry(data_dir / "servers.json", data_dir / "user_servers.json")
         reg.load()
         reg.set_root_muted(True)
 
@@ -361,7 +361,7 @@ def test_a_mute_during_starting_is_not_lost(server_factory):
     assert server.health()["starting"] == 1
     with admin(server) as client:
         mute(client, tool_path("time"), tool="get_current_time")
-        assert server.supervisor.get("time").status == "starting"
+        assert server.supervisor.get(ServerKey(None, "time")).status == "starting"
 
     (server.data_dir / "release").write_text("go")
     server.wait(running=1)
@@ -387,9 +387,9 @@ def test_file_without_the_new_fields_loads_fully_visible(tmp_path):
             }
         )
     )
-    reg = Registry(path)
+    reg = Registry(path, path.with_name("user_servers.json"))
     reg.load()
-    spec = reg.get("time")
+    spec = reg.get(ServerKey(None, "time"))
     assert reg.root_muted() is False
     assert spec.muted is False
     assert spec.disabled_tools == []
@@ -416,10 +416,10 @@ def test_update_through_the_web_form_keeps_the_visibility_state(server_factory):
         )
         assert resp.status_code == 303, resp.text
 
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    assert reg.get("time").description == "edited"
-    assert reg.get("time").disabled_tools == ["get_current_time"]
+    assert reg.get(ServerKey(None, "time")).description == "edited"
+    assert reg.get(ServerKey(None, "time")).disabled_tools == ["get_current_time"]
 
 
 def test_a_muted_name_the_child_no_longer_publishes_is_inert(server_factory):
@@ -436,9 +436,9 @@ def test_a_muted_name_the_child_no_longer_publishes_is_inert(server_factory):
     assert "time_get_current_time" in tools
     assert "time_convert_time" in tools
 
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    assert reg.get("time").disabled_tools == ["gone_tool"]
+    assert reg.get(ServerKey(None, "time")).disabled_tools == ["gone_tool"]
 
 
 # --- Routes ------------------------------------------------------------------
@@ -467,7 +467,7 @@ def test_dashboard_renders_the_three_controls(server_factory):
     server.wait(running=1)
 
     with admin(server) as client:
-        body = client.get("/").text
+        body = client.get("/tools/tree").text
 
     assert 'hx-post="/visibility/root"' in body
     assert 'hx-post="/visibility/namespaces/time"' in body
@@ -484,7 +484,7 @@ def test_dashboard_keeps_the_row_of_a_muted_tool(server_factory):
 
     with admin(server) as client:
         mute(client, tool_path("time"), tool="get_current_time")
-        body = client.get("/").text
+        body = client.get("/tools/tree").text
 
     # The row survives, marked, so the admin can unmute it from the same page.
     assert "time_get_current_time" in body
@@ -508,7 +508,7 @@ def test_a_control_answer_renders_every_group_collapsed(server_factory):
 
     with admin(server) as client:
         # The page itself opens nothing.
-        assert "open>" not in client.get("/").text
+        assert "open>" not in client.get("/tools/tree").text
         body = client.post(
             tool_path("time"), data={"tool": "get_current_time"}
         ).text
@@ -523,7 +523,7 @@ def test_a_form_edit_does_not_republish_a_muted_tool(server_factory):
     holder: dict = {}
     server = server_factory(_seed(fake_child_spec("time", "two"), holder=holder))
     server.wait(running=1)
-    spec = server.supervisor.get("time").spec
+    spec = server.supervisor.get(ServerKey(None, "time")).spec
 
     with admin(server) as client:
         mute(client, tool_path("time"), tool="get_current_time")
@@ -567,9 +567,9 @@ def test_a_namespace_named_root_is_addressable(server_factory):
     assert not any(t.startswith("root_") for t in tools)
     assert "other_get_current_time" in tools
 
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    assert reg.get("root").muted is True
+    assert reg.get(ServerKey(None, "root")).muted is True
     assert reg.root_muted() is False
 
 
@@ -586,7 +586,7 @@ def test_a_failed_child_still_offers_its_namespace_control(server_factory):
     server.wait(running=1, failed=1)
 
     with admin(server) as client:
-        body = client.get("/").text
+        body = client.get("/tools/tree").text
 
     assert 'hx-post="/visibility/namespaces/broken"' in body
     assert 'hx-post="/visibility/namespaces/other"' in body
@@ -604,9 +604,9 @@ def test_the_tool_control_keeps_the_name_verbatim(server_factory):
         # An empty name is a bad request, not a silent no-op.
         assert client.post(tool_path("time"), data={"tool": ""}).status_code == 400
 
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    assert reg.get("time").disabled_tools == ["  spaced  "]
+    assert reg.get(ServerKey(None, "time")).disabled_tools == ["  spaced  "]
 
 
 def test_a_failed_write_leaves_the_published_set_unchanged(server_factory,
@@ -632,8 +632,97 @@ def test_a_failed_write_leaves_the_published_set_unchanged(server_factory,
         assert resp.status_code >= 500
 
     # File, memory and live transform all still agree on the old policy.
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    assert reg.get("time").disabled_tools == []
-    assert server.supervisor.registry.get("time").disabled_tools == []
+    assert reg.get(ServerKey(None, "time")).disabled_tools == []
+    assert server.supervisor.registry.get(ServerKey(None, "time")).disabled_tools == []
     assert tool_names(server.base_url, holder["clear"]) == before
+
+
+# --- 10.17 The global mute covers every caller (multi-user-access) ------------
+#
+# Fixture `router_live.py`: admin-owned `time` (`get_current_time`,
+# `convert_time`) and `github`; user-owned `github@alice` (`x`, `alice_only`)
+# and `github@bob`. Each docstring names the TLA+ invariant of
+# `specs/tla/multi_user_access.tla` that the test guards.
+
+import httpx
+from router_live import start_live
+
+
+@pytest.fixture(scope="module")
+def live(tmp_path_factory):
+    lv, stop = start_live(tmp_path_factory.mktemp("visibility"))
+    yield lv
+    stop()
+
+
+@pytest.fixture
+def env(live):
+    live.reset()
+    yield live
+    live.reset()
+
+
+@contextlib.contextmanager
+def _tool_muted(env, ns: str, tool: str):
+    """The admin mutes `tool` of admin-owned `ns` on the dashboard."""
+    client = httpx.Client(base_url=env.base_url, follow_redirects=False)
+    try:
+        resp = client.post("/login", data={"password": "secret", "next": "/"})
+        assert resp.status_code == 303
+        mute(client, tool_path(ns), tool=tool)
+        yield
+    finally:
+        unmute(client, tool_path(ns), tool=tool)
+        client.close()
+
+
+def _refused(env, uid: str, name: str) -> None:
+    with pytest.raises(ToolError, match="Unknown tool"):
+        env.call(uid, name)
+
+
+def test_a_mute_hides_a_tool_from_the_admin_ac3(env):
+    """A mute hides a tool from the admin (AC-3). Invariant: MutedHiddenForAll."""
+    assert "time_get_current_time" in env.names("admin")  # control
+    with _tool_muted(env, "time", "get_current_time"):
+        for uid in ("admin", "root"):
+            names = env.names(uid)
+            assert "time_get_current_time" not in names
+            assert "time_convert_time" in names
+            _refused(env, uid, "time_get_current_time")
+        assert env.calls("time") == []
+
+
+def test_a_mute_beats_a_grant(env):
+    """A mute beats a grant. Invariant: MutedHiddenForAll."""
+    env.grant("user", "alice", "tool", "allow", "time", "get_current_time")
+    assert "time_get_current_time" in env.names("alice")  # control
+    with _tool_muted(env, "time", "get_current_time"):
+        assert "time_get_current_time" not in env.names("alice")
+        _refused(env, "alice", "time_get_current_time")
+        assert env.calls("time") == []
+
+
+def test_a_mute_covers_a_user_owned_server(env):
+    """A mute covers a user-owned server. Invariant: MutedHiddenForAll.
+
+    The dashboard control for a user-owned reference arrives in section 7, so
+    the test sets the mute through `Supervisor.set_namespace_muted(key, ...)`.
+    """
+    key = ServerKey("alice", "github")
+    assert {"github_x", "github_alice_only"} <= env.names("alice")  # control
+
+    async def set_muted(muted: bool) -> None:
+        env.supervisor.set_namespace_muted(key, muted, ADMIN_ACTOR)
+
+    env.run(set_muted(True))
+    try:
+        assert not [n for n in env.names("alice") if n.startswith("github_")]
+        _refused(env, "alice", "github_alice_only")
+        assert env.calls("github@alice") == []
+        assert env.supervisor.get(key).status == "running"
+        assert env.health()["running"] == 4
+    finally:
+        env.run(set_muted(False))

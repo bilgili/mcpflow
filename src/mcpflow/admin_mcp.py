@@ -32,11 +32,13 @@ from fastmcp.server.transforms import (
 )
 
 from .api import child_json, tools_json
-from .registry import spec_from_dict
+from .registry import ServerKey, spec_from_dict
 
 if TYPE_CHECKING:
     from mcp.types import Prompt, Resource, ResourceTemplate, Tool
 
+    from .identity import User
+    from .policy import Reach
     from .supervisor import Supervisor
 
 
@@ -65,6 +67,18 @@ def _map_errors(
             raise ToolError(f"{exc.args[0]} not found") from exc
 
     return wrapper
+
+
+def _key(namespace: str) -> ServerKey:
+    """The admin-owned key of `namespace` (D11). A reference with an owner
+    names no admin-owned child, so it answers `<namespace> not found` through
+    `_map_errors`, before any store sees it."""
+    try:
+        return ServerKey(None, namespace)
+    except ValueError:
+        # A reference with an owner, or any other bad shape, names no
+        # admin-owned child.
+        raise KeyError(namespace) from None
 
 
 class ScopeFilter(Transform):
@@ -149,60 +163,81 @@ def build_admin_server(supervisor: Supervisor) -> FastMCP:
     """Build the `mcpflow-admin` server with the fourteen admin tools.
 
     `mask_error_details=True` because a mounted server masks its own errors;
-    the gateway's mask does not reach it. No tool sets `meta.ui.visibility`:
-    the hashed-name path `get_tool_by_hash` skips transforms, so a visibility
-    key on an admin tool would let an `mcp` session resolve it. That rule now
-    guards the tool visibility too: the same bypass would answer a call to a
-    `mcpflow_*` tool that the admin muted.
+    the gateway's mask does not reach it. No tool sets `meta.ui.visibility`, so
+    no admin tool is reachable by a hashed name at all. Since FastMCP 4.0.11 the
+    `get_tool_by_hash` template runs this chain's transforms (`ScopeFilter`,
+    the mute mark, the pin), so an app-visible admin tool would still meet
+    them on that path; the rule is defense in depth. On FastMCP
+    4.0.10 and older the hashed path skipped every transform, and the rule was
+    the only guard.
     """
     admin = FastMCP("mcpflow-admin", mask_error_details=True)
 
+    def _user() -> User:
+        # The resolved caller. `ScopeFilter` admits only an admin-scope token,
+        # which the verifier grants an admin user only; no user fails closed.
+        user = supervisor.policy.current_user()
+        if user is None:
+            raise PermissionError("no user")
+        return user
+
+    def _mcp_reach() -> Reach:
+        # D6: the one `Reach` of every tool body, the `mcp` surface of the
+        # caller, never `dashboard` (TLA+ `adminlisttools`), so a user-owned
+        # server never shows here (AC-4).
+        return supervisor.policy.keys_for(_user(), "mcp")
+
     async def _tools_body() -> dict:
-        views = await supervisor.tools()
+        views = await supervisor.tools(_mcp_reach())
         return tools_json(supervisor.root_muted(), supervisor.mcpflow_muted(), views)
 
     async def list_servers() -> list[dict]:
-        """List every child server with its live status."""
-        return [child_json(c) for c in supervisor.children()]
+        """List every admin-owned child server with its live status."""
+        return [child_json(c) for c in supervisor.children_of(None)]
 
     async def get_server(namespace: str) -> dict:
         """Get one child server by namespace."""
-        return child_json(supervisor.get(namespace))
+        return child_json(supervisor.get(_key(namespace)))
 
     async def add_server(spec: dict) -> dict:
         """Add a child server from a spec and start it."""
-        child = await supervisor.add(spec_from_dict(spec))
+        child = await supervisor.add(spec_from_dict(spec), _user())
         return child_json(child)
 
     async def update_server(namespace: str, spec: dict) -> dict:
         """Replace a child server's spec. The namespace argument names the
         resource and wins over any `namespace` in the body."""
         spec = {**spec, "namespace": namespace}
-        child = await supervisor.update(spec_from_dict(spec))
+        child = await supervisor.update(
+            _key(namespace), spec_from_dict(spec), _user()
+        )
         return child_json(child)
 
     async def remove_server(namespace: str) -> None:
         """Remove a child server and stop it."""
-        await supervisor.remove(namespace)
+        await supervisor.remove(_key(namespace), _user())
 
     async def enable_server(namespace: str) -> dict:
         """Enable a child server."""
-        await supervisor.enable(namespace)
-        return child_json(supervisor.get(namespace))
+        key = _key(namespace)
+        await supervisor.enable(key, _user())
+        return child_json(supervisor.get(key))
 
     async def disable_server(namespace: str) -> dict:
         """Disable a child server."""
-        await supervisor.disable(namespace)
-        return child_json(supervisor.get(namespace))
+        key = _key(namespace)
+        await supervisor.disable(key, _user())
+        return child_json(supervisor.get(key))
 
     async def restart_server(namespace: str) -> dict:
         """Restart a child server."""
-        await supervisor.restart(namespace)
-        return child_json(supervisor.get(namespace))
+        key = _key(namespace)
+        await supervisor.restart(key, _user())
+        return child_json(supervisor.get(key))
 
     async def server_log(namespace: str, lines: int = 100) -> str:
         """Read the tail of a child server's log, capped at 1000 lines."""
-        return supervisor.log_tail(namespace, min(lines, 1000))
+        return supervisor.log_tail(_key(namespace), min(lines, 1000))
 
     async def list_tools() -> dict:
         """List every child tool with its visibility, the dashboard view."""
@@ -210,17 +245,17 @@ def build_admin_server(supervisor: Supervisor) -> FastMCP:
 
     async def set_root_muted(muted: bool) -> dict:
         """Mute or unmute the root. A muted root hides every child tool."""
-        supervisor.set_root_muted(muted)
+        supervisor.set_root_muted(muted, _user())
         return await _tools_body()
 
     async def set_namespace_muted(namespace: str, muted: bool) -> dict:
         """Mute or unmute every tool of one child."""
-        supervisor.set_namespace_muted(namespace, muted)
+        supervisor.set_namespace_muted(_key(namespace), muted, _user())
         return await _tools_body()
 
     async def set_tool_muted(namespace: str, tool: str, muted: bool) -> dict:
         """Mute or unmute one child tool. `tool` is the bare child tool name."""
-        supervisor.set_tool_muted(namespace, tool, muted)
+        supervisor.set_tool_muted(_key(namespace), tool, muted, _user())
         return await _tools_body()
 
     async def write_source(namespace: str, files: dict[str, str]) -> dict:
@@ -236,7 +271,7 @@ def build_admin_server(supervisor: Supervisor) -> FastMCP:
         the restart step, the files are already written; call
         `mcpflow_restart_server`.
         """
-        result = await supervisor.write_source(namespace, files)
+        result = await supervisor.write_source(_key(namespace), files, _user())
         return {
             "namespace": result.namespace,
             "path": str(result.path),

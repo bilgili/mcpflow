@@ -21,7 +21,7 @@ from test_visibility import admin, call, mute, ns_path, tool_path
 
 from mcpflow.auth import TokenStore
 from mcpflow.instructions import render_instructions
-from mcpflow.registry import Registry, ServerSpec
+from mcpflow.registry import Registry, ServerKey, ServerSpec
 
 CHILD = str(Path(__file__).parent / "fake_instructions_child.py")
 CAP = 16384
@@ -43,14 +43,14 @@ def start(server_factory, *specs, running: int):
     tokens: dict = {}
 
     def seed(data_dir):
-        reg = Registry(data_dir / "servers.json")
+        reg = Registry(data_dir / "servers.json", data_dir / "user_servers.json")
         reg.load()
         for spec in specs:
             reg.add(spec)
-        store = TokenStore(data_dir / "tokens.json")
+        store = TokenStore(data_dir / "tokens.json", data_dir / "user_tokens.json")
         store.load()
-        tokens["mcp"] = store.create("mcp")[1]
-        tokens["admin"] = store.create("admin", scope="admin")[1]
+        tokens["mcp"] = store.create("mcp", "mcp", "admin")[1]
+        tokens["admin"] = store.create("admin", "admin", "admin")[1]
 
     server = server_factory(seed)
     counts = server.wait(running=running)
@@ -146,7 +146,7 @@ def test_raising_read_scrubs_the_secret_and_keeps_status(server_factory, caplog)
     bad = child("bad", "raise", API_TOKEN=SECRET)
     server, base, tokens = start(server_factory, bad, running=1)
     sup = server.supervisor
-    before = sup.get("bad").last_error
+    before = sup.get(ServerKey(None, "bad")).last_error
 
     assert initialize(base, tokens["mcp"]) is None
 
@@ -155,8 +155,8 @@ def test_raising_read_scrubs_the_secret_and_keeps_status(server_factory, caplog)
     assert "bad" in lines[0]
     assert SECRET not in lines[0]
     assert all(SECRET not in r.getMessage() for r in caplog.records)
-    assert sup.get("bad").status == "running"
-    assert sup.get("bad").last_error == before
+    assert sup.get(ServerKey(None, "bad")).status == "running"
+    assert sup.get(ServerKey(None, "bad")).last_error == before
     assert call(base, tokens["mcp"], "bad_echo", {"text": "ok"}) == "ok"
 
 
@@ -166,7 +166,7 @@ def test_non_text_read_contributes_no_block_and_logs_once(server_factory, caplog
 
     assert initialize(base, tokens["mcp"]) is None
     assert len(warnings_for(caplog, "bin")) == 1
-    assert server.supervisor.get("bin").status == "running"
+    assert server.supervisor.get(ServerKey(None, "bin")).status == "running"
 
 
 def test_blank_read_contributes_no_block_and_does_not_log(server_factory, caplog):
@@ -175,7 +175,7 @@ def test_blank_read_contributes_no_block_and_does_not_log(server_factory, caplog
 
     assert initialize(base, tokens["mcp"]) is None
     assert warnings_for(caplog, "empty") == []
-    assert server.supervisor.get("empty").status == "running"
+    assert server.supervisor.get(ServerKey(None, "empty")).status == "running"
 
 
 def test_every_failure_shape_at_once_still_delivers_the_good_block(

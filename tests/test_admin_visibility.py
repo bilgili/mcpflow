@@ -24,7 +24,7 @@ from conftest import fake_child_spec
 from fastmcp.exceptions import ToolError
 
 from mcpflow.auth import TokenStore
-from mcpflow.registry import PINNED_ADMIN_TOOLS, Registry, ServerSpec
+from mcpflow.registry import PINNED_ADMIN_TOOLS, Registry, ServerKey, ServerSpec
 
 PINNED_NAMES = {f"mcpflow_{t}" for t in PINNED_ADMIN_TOOLS}
 ADMIN_TOOL_COUNT = 14
@@ -35,16 +35,16 @@ ADMIN_TOOL_COUNT = 14
 
 def _seed(holder: dict, *specs: ServerSpec, admin_setup=None):
     def seed(data_dir):
-        reg = Registry(data_dir / "servers.json")
+        reg = Registry(data_dir / "servers.json", data_dir / "user_servers.json")
         reg.load()
         for spec in specs:
             reg.add(spec)
         if admin_setup is not None:
             admin_setup(reg)
-        store = TokenStore(data_dir / "tokens.json")
+        store = TokenStore(data_dir / "tokens.json", data_dir / "user_tokens.json")
         store.load()
-        _a, admin_token = store.create("admin", "admin")
-        _m, mcp_token = store.create("mcp", "mcp")
+        _a, admin_token = store.create("admin", "admin", "admin")
+        _m, mcp_token = store.create("mcp", "mcp", "admin")
         holder["admin"] = admin_token
         holder["mcp"] = mcp_token
 
@@ -124,14 +124,14 @@ def mute_namespace(client) -> None:
 
 @pytest.fixture
 def registry(tmp_path):
-    reg = Registry(tmp_path / "servers.json")
+    reg = Registry(tmp_path / "servers.json", tmp_path / "user_servers.json")
     reg.load()
     reg.add(fake_child_spec("time", "two"))
     return reg
 
 
 def reread(reg) -> Registry:
-    fresh = Registry(reg._path)
+    fresh = Registry(reg._path, reg._user_path)
     fresh.load()
     return fresh
 
@@ -139,7 +139,7 @@ def reread(reg) -> Registry:
 def test_a_file_without_the_admin_object_loads_as_nothing_muted(tmp_path):
     path = tmp_path / "servers.json"
     path.write_text(json.dumps({"version": 1, "muted": False, "servers": []}))
-    reg = Registry(path)
+    reg = Registry(path, path.with_name("user_servers.json"))
     reg.load()
     assert reg.admin_muted() is False
     assert reg.admin_visibility() == (False, set())
@@ -154,7 +154,7 @@ def test_an_admin_mute_writes_the_admin_object(registry):
 
 def test_a_child_mutation_preserves_the_admin_object(registry):
     registry.set_admin_tool_muted("write_source", True)
-    registry.set_enabled("time", False)
+    registry.set_enabled(ServerKey(None, "time"), False)
     registry.set_root_muted(True)
     data = json.loads(registry._path.read_text())
     assert data["admin"]["disabled_tools"] == ["write_source"]
@@ -244,7 +244,7 @@ def test_a_pinned_tool_cannot_be_muted_away(server_factory):
     with admin(server) as client:
         mute_tool(client, "set_tool_muted")
 
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
     assert "set_tool_muted" in reg.admin_visibility()[1]
     assert "mcpflow_set_tool_muted" in list_tools(server.base_url, holder["admin"])
@@ -298,7 +298,7 @@ def test_an_mcp_session_cannot_call_a_pinned_tool(server_factory):
             call_tool(server.base_url, holder["mcp"], name, args)
 
     # The refused calls changed no policy: the namespace is still muted.
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
     assert reg.admin_muted() is True
     assert mcpflow_tools(list_tools(server.base_url, holder["admin"])) == PINNED_NAMES
@@ -437,7 +437,7 @@ def test_the_dashboard_renders_the_mcpflow_group_first(server_factory):
     server = server_factory(_seed(holder, fake_child_spec("time", "two")))
     server.wait(running=1)
     with admin(server) as client:
-        body = client.get("/").text
+        body = client.get("/tools/tree").text
 
     headers = re.findall(r"<summary>(.*?)</summary>", body, re.DOTALL)
     assert len(headers) == 2
@@ -452,7 +452,7 @@ def test_the_dashboard_renders_a_pinned_row_as_disabled(server_factory):
     holder: dict = {}
     server = server_factory(_seed(holder))
     with admin(server) as client:
-        body = client.get("/").text
+        body = client.get("/tools/tree").text
 
     row = _row(body, "mcpflow_set_tool_muted")
     assert "checked disabled" in row
@@ -478,9 +478,9 @@ def test_the_mcpflow_tool_control_posts_to_the_mcpflow_route(server_factory):
     holder: dict = {}
     server = server_factory(_seed(holder))
     with admin(server) as client:
-        body = client.get("/").text
+        body = client.get("/tools/tree").text
         mute_tool(client, "write_source")
-        after = client.get("/").text
+        after = client.get("/tools/tree").text
 
     assert 'hx-post="/visibility/namespaces/mcpflow/tool"' in body
     assert "hidden-tool" in _row(after, "mcpflow_write_source")

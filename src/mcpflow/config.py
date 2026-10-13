@@ -1,7 +1,7 @@
 """Process settings from environment variables and CLI overrides.
 
-`config.py` imports `hash_password` from `auth.py`. `auth.py` takes no
-`Settings`, so there is no import cycle.
+`config.py` imports `hash_password` and the cap defaults from `auth.py` and
+`registry.py`. Neither takes a `Settings`, so there is no import cycle.
 """
 
 from __future__ import annotations
@@ -13,7 +13,8 @@ import secrets
 from dataclasses import dataclass
 from pathlib import Path
 
-from .auth import hash_password
+from .auth import DEFAULT_MAX_USER_TOKENS, hash_password
+from .registry import DEFAULT_MAX_USER_SERVERS
 
 # A usable hash needs a positive iteration count, a salt of at least 16 hex
 # chars, and a full 64-hex-char SHA-256 digest. Checked with fullmatch, so a
@@ -38,6 +39,9 @@ class Settings:
     child_cache_ttl: float
     log_level: str
     public_url: str | None = None
+    # Per-user caps on stored servers and tokens; the admin is exempt (D2).
+    max_user_servers: int = DEFAULT_MAX_USER_SERVERS
+    max_user_tokens: int = DEFAULT_MAX_USER_TOKENS
 
 
 def _get(overrides: dict[str, str], name: str, default: str | None) -> str | None:
@@ -61,6 +65,16 @@ def _resolve_secret_key(data_dir: Path, env_value: str | None) -> bytes:
         f.write(key)
     os.replace(tmp, path)
     return key.encode()
+
+
+def _get_limit(overrides: dict[str, str], name: str, default: int) -> int:
+    """A per-user cap: an integer >= 0. `0` allows no write."""
+    raw = _get(overrides, name, str(default))
+    # ASCII digits only: `int()` alone also takes "+5", " 5 ", "1_0", and
+    # non-ASCII digits, and its 4300-digit limit raises for a huge value.
+    if raw is None or not re.fullmatch(r"[0-9]{1,9}", raw):
+        raise ConfigError(f"{name} must be an integer >= 0")
+    return int(raw)
 
 
 def load_settings(overrides: dict[str, str] | None = None) -> Settings:
@@ -95,6 +109,10 @@ def load_settings(overrides: dict[str, str] | None = None) -> Settings:
     log_level = _get(overrides, "LOG_LEVEL", "INFO")
     public_url = _get(overrides, "PUBLIC_URL", None)
     public_url = public_url.rstrip("/") if public_url else None
+    max_user_servers = _get_limit(
+        overrides, "MAX_USER_SERVERS", DEFAULT_MAX_USER_SERVERS
+    )
+    max_user_tokens = _get_limit(overrides, "MAX_USER_TOKENS", DEFAULT_MAX_USER_TOKENS)
 
     return Settings(
         data_dir=data_dir,
@@ -108,4 +126,6 @@ def load_settings(overrides: dict[str, str] | None = None) -> Settings:
         child_cache_ttl=child_cache_ttl,
         log_level=log_level,
         public_url=public_url,
+        max_user_servers=max_user_servers,
+        max_user_tokens=max_user_tokens,
     )

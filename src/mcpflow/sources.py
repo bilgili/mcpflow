@@ -1,32 +1,52 @@
 """The inline source store under `DATA_DIR/servers/`.
 
 `SourceStore` is the one writer and the one deleter under its root. A write
-stages every file into a fresh `<namespace>.tmp` directory and then swaps it
-in, so a reader (a `uvx --from` or `npx --package=` spawn) sees either the old
-tree or the new tree, never a mix. The store never follows or creates a
-symlink, and it never awaits, so two concurrent tool calls for one namespace
-serialise on the event loop.
+stages every file into a fresh `<ref>.tmp` directory and then swaps it in, so
+a reader (a `uvx --from` or `npx --package=` spawn) sees either the old tree or
+the new tree, never a mix. The store never follows or creates a symlink, and it
+never awaits, so two concurrent tool calls for one reference serialise on the
+event loop.
+
+Every method takes the server reference: `<namespace>` for an admin-owned
+child, `<namespace>@<owner>` for a user-owned one. An operation on one
+reference touches only `<ref>`, `<ref>.tmp`, and `<ref>.old`, so the removal of
+`github@alice` never touches admin-owned `github`.
 """
 
 from __future__ import annotations
 
 import os
-import re
 import shutil
 from pathlib import Path
 
-from .registry import RESERVED_NAMESPACE
+from .registry import RESERVED_NAMESPACE, ServerKey
 
 MAX_FILES = 200
 MAX_TOTAL_BYTES = 1024 * 1024  # 1 MiB
 MAX_FILE_BYTES = 512 * 1024  # 512 KiB
 
-# The store validates the namespace itself, so it is safe when called alone.
-# Same shape and the same reserved rule as the registry: no dot, no slash, no
-# leading dot, so the name is a safe path segment and `<ns>.tmp` / `<ns>.old`
-# never collide with a name; and `mcpflow`/`mcpflow_*` are rejected, so the store
-# never holds a tree no child could ever register.
-_NAMESPACE_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+# The store validates the reference itself, so it is safe when called alone.
+# `ServerKey.parse` owns the shape, which is exactly this pattern: no dot, no
+# slash, no second `@`, so the reference is one safe path segment, `<ref>.tmp`
+# / `<ref>.old` never collide with a reference, and no reference names a path
+# outside the root or the directory of another reference. The reserved rule
+# for `mcpflow`/`mcpflow_*` applies to the namespace part, so the store never
+# holds a tree no child could ever register.
+REF_PATTERN = r"^[a-z][a-z0-9_]{0,31}(@[a-z0-9][a-z0-9_-]{0,63})?$"
+
+
+def _check_ref(ref: str) -> None:
+    """Raise `ValueError` for a bad reference. No filesystem access."""
+    try:
+        key = ServerKey.parse(ref)
+    except ValueError:
+        raise ValueError(f"reference {ref!r} must match {REF_PATTERN}") from None
+    if key.namespace == RESERVED_NAMESPACE or key.namespace.startswith(
+        RESERVED_NAMESPACE + "_"
+    ):
+        raise ValueError(
+            f"namespace {key.namespace} is reserved: mcpflow and mcpflow_* are reserved"
+        )
 
 
 def total_bytes(files: dict[str, str]) -> int:
@@ -64,16 +84,9 @@ def _unlink_or_rmtree(path: Path) -> None:
         path.unlink()
 
 
-def _validate(namespace: str, files: dict[str, str]) -> None:
+def _validate(ref: str, files: dict[str, str]) -> None:
     """Raise `ValueError` on the first fault. The message names the fault."""
-    if not _NAMESPACE_RE.match(namespace):
-        raise ValueError(f"namespace {namespace} must match ^[a-z][a-z0-9_]{{0,31}}$")
-    if namespace == RESERVED_NAMESPACE or namespace.startswith(
-        RESERVED_NAMESPACE + "_"
-    ):
-        raise ValueError(
-            f"namespace {namespace} is reserved: mcpflow and mcpflow_* are reserved"
-        )
+    _check_ref(ref)
     if not files:
         raise ValueError("files is empty")
     if len(files) > MAX_FILES:
@@ -106,15 +119,16 @@ class SourceStore:
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
 
-    def path_for(self, namespace: str) -> Path:
-        """`root / namespace`. No filesystem access."""
-        return self.root / namespace
+    def path_for(self, ref: str) -> Path:
+        """`root / ref`. Validates `ref` first; no filesystem access."""
+        _check_ref(ref)
+        return self.root / ref
 
-    def write(self, namespace: str, files: dict[str, str]) -> Path:
-        _validate(namespace, files)
-        final = self.path_for(namespace)
-        tmp = self.root / f"{namespace}.tmp"
-        old = self.root / f"{namespace}.old"
+    def write(self, ref: str, files: dict[str, str]) -> Path:
+        _validate(ref, files)
+        final = self.path_for(ref)
+        tmp = self.root / f"{ref}.tmp"
+        old = self.root / f"{ref}.old"
 
         if final.is_symlink():
             # A rename would move the link, not its target, but refuse rather
@@ -154,32 +168,42 @@ class SourceStore:
         _unlink_or_rmtree(old)
         return final
 
-    def remove(self, namespace: str) -> None:
-        """Delete the final, `.tmp`, and `.old` paths. No-op when all absent."""
-        if not _NAMESPACE_RE.match(namespace):
-            # Defence in depth: `Supervisor.remove` only passes a validated,
-            # existing namespace, but the store must never rmtree a crafted
-            # path like `../x` if a future caller reaches it directly.
-            raise ValueError(f"namespace {namespace} must match ^[a-z][a-z0-9_]{{0,31}}$")
+    def remove(self, ref: str) -> None:
+        """Delete `<ref>`, `<ref>.tmp`, and `<ref>.old`. No-op when all absent.
+
+        The reference is validated before any filesystem access, so a crafted
+        `github@../x` raises and deletes nothing, and no reference names the
+        directory of another reference.
+        """
+        final = self.path_for(ref)
         if self.root.is_symlink():
             raise ValueError(f"{self.root} is a symlink")
-        _unlink_or_rmtree(self.path_for(namespace))
-        _unlink_or_rmtree(self.root / f"{namespace}.tmp")
-        _unlink_or_rmtree(self.root / f"{namespace}.old")
+        _unlink_or_rmtree(final)
+        _unlink_or_rmtree(self.root / f"{ref}.tmp")
+        _unlink_or_rmtree(self.root / f"{ref}.old")
 
-    def owns(self, source: str | None, namespace: str) -> bool:
-        """True when `source` is a local path equal to this namespace's dir."""
+    def owns(self, source: str | None, ref: str) -> bool:
+        """True when `source` is a local path that resolves to this ref's dir.
+
+        Symlinks and `..` in `source` resolve first. The own directory is
+        the resolved root joined with `ref`, NOT resolved itself, so a symlink
+        planted at `servers/<ref>` that points at another reference's tree
+        never makes that tree count as this reference's.
+        """
+        own = self.path_for(ref)
         if not isinstance(source, str) or not source.startswith("/"):
             return False
-        return Path(source).resolve() == self.path_for(namespace).resolve()
+        return Path(source).resolve() == self.root.resolve() / own.name
 
     def owner_of(self, source: str | None) -> str | None:
-        """The first path segment under `root` when `source` resolves inside it.
+        """The reference whose directory holds `source`, after resolution.
 
-        `owner_of(str(root))` returns `""` (root itself owns no namespace), so
-        the ownership rule rejects a source of `DATA_DIR/servers`. A source
+        Symlinks and `..` resolve first, so `servers/tool@alice/../github`
+        names `github`. The result is the first path segment under the root.
+        `owner_of(str(root))` returns `""` (the root itself owns no reference),
+        so the ownership rule rejects a source of `DATA_DIR/servers`. A source
         outside the root, or not a local path, returns `None`. `a.tmp` and
-        `a.old` come back as-is and match no namespace.
+        `a.old` come back as-is and match no reference.
         """
         if not isinstance(source, str) or not source.startswith("/"):
             return None

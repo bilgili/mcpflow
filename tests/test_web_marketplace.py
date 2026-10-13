@@ -13,7 +13,7 @@ import re
 import httpx
 from conftest import fake_child_spec, seed_registry
 
-from mcpflow.registry import Registry, ServerSpec
+from mcpflow.registry import Registry, ServerKey, ServerSpec
 
 HX = {"HX-Request": "true"}
 
@@ -37,8 +37,10 @@ def test_nav_order(server_factory):
     client = server_factory().login()
     html = client.get("/marketplace").text
     client.close()
-    names = re.findall(r'<nav>.*?</nav>', html, re.S)[0]
-    assert re.findall(r">([A-Za-z]+)</a>", names) == ["Dashboard", "Marketplace", "Tokens"]
+    names = re.findall(r'<nav>.*?</nav>', html, re.DOTALL)[0]
+    assert re.findall(r">([A-Za-z]+)</a>", names) == [
+        "Dashboard", "Marketplace", "Approvals", "Security", "Tokens", "Settings"
+    ]
 
 
 def test_marketplace_without_session(server_factory):
@@ -224,12 +226,12 @@ def test_connect_registers_and_starts(server_factory):
     client = server.login()
     resp = client.post("/marketplace/time/connect", data={"namespace": "time"})
     assert resp.status_code == 303 and resp.headers["location"] == "/servers"
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    spec = reg.get("time")
+    spec = reg.get(ServerKey(None, "time"))
     assert spec.kind == "python" and spec.package == "mcp-server-time"
     assert spec.catalog == "time"
-    assert server.supervisor.get("time").status in ("starting", "running", "failed")
+    assert server.supervisor.get(ServerKey(None, "time")).status in ("starting", "running", "failed")
     client.close()
 
 
@@ -247,7 +249,7 @@ def test_connect_required_secret_missing_echoes_no_secret(server_factory):
     assert "T1SECRET" not in resp.text
     assert _masked("SLACK_TEAM_ID", resp.text) and _masked("SLACK_BOT_TOKEN", resp.text)
     assert re.search(r'name="setup_[A-Z_]+"[^>]*value=', resp.text) is None
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
     assert not [s for s in reg.list() if s.namespace == "slack"]
 
@@ -258,9 +260,9 @@ def test_connect_posted_args_win(server_factory):
     resp = client.post("/marketplace/fs/connect", data={"namespace": "fs", "args": "/mnt/a /mnt/b"})
     client.close()
     assert resp.status_code == 303
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    assert reg.get("fs").args == ["/mnt/a", "/mnt/b"]
+    assert reg.get(ServerKey(None, "fs")).args == ["/mnt/a", "/mnt/b"]
 
 
 def test_400_shows_posted_args_in_preview_and_run_command(server_factory):
@@ -281,9 +283,9 @@ def test_connect_entry_args_when_form_posts_none(server_factory):
     resp = client.post("/marketplace/fs/connect", data={"namespace": "fs"})
     client.close()
     assert resp.status_code == 303
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    assert reg.get("fs").args == ["/data"]
+    assert reg.get(ServerKey(None, "fs")).args == ["/data"]
 
 
 def test_connect_duplicate_namespace(server_factory):
@@ -293,7 +295,7 @@ def test_connect_duplicate_namespace(server_factory):
     client.close()
     assert resp.status_code == 400
     assert "already exists" in resp.text
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
     assert len([s for s in reg.list() if s.namespace == "time"]) == 1
 
@@ -313,10 +315,10 @@ def test_connect_second_account(server_factory):
     )
     client.close()
     assert resp.status_code == 303
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    assert reg.get("slack").catalog == "slack" and reg.get("slack_work").catalog == "slack"
-    assert reg.get("slack_work").env == {"SLACK_BOT_TOKEN": "xoxb-work", "SLACK_TEAM_ID": "T123"}
+    assert reg.get(ServerKey(None, "slack")).catalog == "slack" and reg.get(ServerKey(None, "slack_work")).catalog == "slack"
+    assert reg.get(ServerKey(None, "slack_work")).env == {"SLACK_BOT_TOKEN": "xoxb-work", "SLACK_TEAM_ID": "T123"}
 
 
 def test_connect_header_lands_in_headers(server_factory):
@@ -328,9 +330,9 @@ def test_connect_header_lands_in_headers(server_factory):
     )
     client.close()
     assert resp.status_code == 303
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    spec = reg.get("gh")
+    spec = reg.get(ServerKey(None, "gh"))
     assert spec.kind == "remote" and spec.headers == {"Authorization": "Bearer x"}
     assert spec.env == {}
 

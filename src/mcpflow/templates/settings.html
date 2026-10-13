@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block content %}
+{# Any signed-in user. The form changes the password of the signed-in user
+   only; it names no user. The environment owns the password of the
+   bootstrap user, so its page shows a note and no form. #}
+<h1>Settings</h1>
+<h2>Change password</h2>
+{% if changed %}<p class="muted">Password changed. Your other sessions are signed out.</p>{% endif %}
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+{% if bootstrap_note %}
+<p class="muted">{{ bootstrap_note }}</p>
+{% else %}
+<form method="post" action="/settings/password">
+  <label>Current password</label>
+  <input type="password" name="current" autocomplete="current-password" required>
+  <label>New password (at least 8 characters)</label>
+  <input type="password" name="password" autocomplete="new-password" minlength="8" required>
+  <label>Confirm new password</label>
+  <input type="password" name="confirm" autocomplete="new-password" minlength="8" required>
+  <p><button type="submit">Change password</button></p>
+</form>
+{% endif %}
+{% endblock %}

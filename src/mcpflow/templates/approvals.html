@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block content %}
+{# Admin-only. Each row carries the revision the admin reads; approve posts
+   it back, so a server that changed after this page rendered answers 409 and
+   stays pending (F1). The handler builds the rows: they hold the `env` and
+   header key names, never a value. Every form posts without htmx. #}
+<h1>Approvals</h1>
+<div class="note">
+  <p>An approved server runs as the gateway process, with the gateway
+    environment. Its code can read <code>DATA_DIR</code>, which holds every
+    stored credential, token digest, and password hash.</p>
+  <p>Pinning binds the top-level package only. The transitive dependencies
+    are not pinned: <code>uvx</code> and <code>npx</code> resolve them at each
+    start, and a new release of a dependency can run under an approved
+    revision. A Python package version can also gain a new wheel file after
+    the approval.</p>
+</div>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<table>
+  <thead>
+    <tr><th>Server</th><th>Owner</th><th>Kind</th><th>Runs</th><th>Env keys</th><th>Revision</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td><code>{{ r.ref }}</code></td>
+      <td>{{ r.owner }}</td>
+      <td>{{ r.kind }}</td>
+      <td>
+        {% if r.command %}<code class="cmd">{{ r.command }}</code>{% endif %}
+        {% if r.url %}<code class="cmd">{{ r.url }}</code>{% endif %}
+        {% if r.header_keys %}<div class="small muted">headers: {{ r.header_keys | join(', ') }}</div>{% endif %}
+      </td>
+      <td>{% if r.env_keys %}{{ r.env_keys | join(', ') }}{% else %}<span class="muted">none</span>{% endif %}</td>
+      <td><code class="revision">{{ r.revision }}</code></td>
+      <td>
+        <form class="inline" method="post" action="/approvals/{{ r.ref }}/approve">
+          <input type="hidden" name="revision" value="{{ r.revision }}">
+          <button class="primary">approve</button>
+        </form>
+        <form class="inline" method="post" action="/approvals/{{ r.ref }}/reject">
+          <button class="danger">reject</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+    {% if not rows %}
+    <tr><td colspan="7" class="muted">No server awaits approval.</td></tr>
+    {% endif %}
+  </tbody>
+</table>
+{% endblock %}

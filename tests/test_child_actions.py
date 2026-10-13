@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 from action_browser import action_post, control
-from conftest import fake_child_spec
+from conftest import ADMIN_ACTOR, fake_child_spec
 from fastmcp import FastMCP
 from fastmcp.exceptions import NotFoundError, ToolError
 from fastmcp.server.providers.addressing import hash_tool
@@ -41,6 +41,7 @@ from mcpflow.actions import (
     is_tagged,
 )
 from mcpflow.auth import TokenStore
+from mcpflow.registry import ServerKey
 
 SECRET = "S3CRET-verifier-0123456789"
 PAGE = "/servers/store/actions"
@@ -80,10 +81,10 @@ def start(server_factory, *specs, running: int = 1):
 
     def seed(data_dir: Path) -> None:
         inner(data_dir)
-        store = TokenStore(data_dir / "tokens.json")
+        store = TokenStore(data_dir / "tokens.json", data_dir / "user_tokens.json")
         store.load()
         holder["mcp"] = holder["clear"]
-        holder["admin"] = store.create("admin", "admin")[1]
+        holder["admin"] = store.create("admin", "admin", "admin")[1]
 
     server = server_factory(seed)
     counts = server.wait(running=running)
@@ -281,11 +282,11 @@ def test_submit_runs_the_action_against_one_generation(server_factory, monkeypat
     seen = []
     real = supervisor_mod.Supervisor.run_action
 
-    async def spy(self, ns, name, form, **kwargs):
+    async def spy(self, ns, name, form, actor, **kwargs):
         # A4 F1: run_action now takes the RAW posted form (a Mapping), not the
         # coerced arguments dict. Normalise it for the equality assert.
-        seen.append((ns, name, dict(form)))
-        return await real(self, ns, name, form, **kwargs)
+        seen.append((ns.ref, name, dict(form)))
+        return await real(self, ns, name, form, actor, **kwargs)
 
     monkeypatch.setattr("mcpflow.supervisor.Supervisor.run_action", spy)
     server, _h = start(server_factory, store_spec())
@@ -393,7 +394,7 @@ def test_build_provider_installs_the_filter_innermost(server_factory):
     # `AuthorizedHashProvider` (outermost). Inside it the order is unchanged:
     # ActionScopeFilter innermost, then the visibility and namespace transforms.
     server, _h = start(server_factory, store_spec())
-    outer = server.supervisor.get("store").provider
+    outer = server.supervisor.get(ServerKey(None, "store")).provider
     assert isinstance(outer, AuthorizedHashProvider)
     provider = outer._chain
     assert [type(t) for t in provider._transforms] == [Namespace]
@@ -562,7 +563,7 @@ def test_probe_failure_renders_the_scrubbed_page_error(server_factory, tmp_path)
         assert "Could not read actions from store: " in resp.text
         assert SECRET not in resp.text
         assert "<form method=\"post\"" not in resp.text
-    assert server.supervisor.get("store").status == "running"
+    assert server.supervisor.get(ServerKey(None, "store")).status == "running"
 
 
 def test_a_failing_tools_list_renders_the_error_frame(server_factory, tmp_path):
@@ -574,7 +575,7 @@ def test_a_failing_tools_list_renders_the_error_frame(server_factory, tmp_path):
     assert resp.status_code == 200
     assert '<p class="error">Could not read actions from store: ' in resp.text
     assert "<form method=\"post\"" not in resp.text
-    assert server.supervisor.get("store").status == "running"
+    assert server.supervisor.get(ServerKey(None, "store")).status == "running"
 
 
 def test_server_window_links_to_the_page(server_factory):
@@ -669,7 +670,7 @@ def test_path_segment_never_names_a_gateway_tool(server_factory, monkeypatch):
     # return answers 404 before `run_action` runs, and calls no tool.
     called = []
 
-    async def spy(self, ns, name, arguments, **kwargs):
+    async def spy(self, ns, name, arguments, actor, **kwargs):
         called.append((ns, name))
 
     monkeypatch.setattr("mcpflow.supervisor.Supervisor.run_action", spy)
@@ -694,7 +695,7 @@ async def test_call_tool_as_admin_passes_the_filter_outside_a_request():
 
     with pytest.raises(NotFoundError):
         await gateway.call_tool("act", {"name": "x"})
-    result = await call_tool_as_admin(gateway, "act", {"name": "x"})
+    result = await call_tool_as_admin(gateway, "act", {"name": "x"}, ADMIN_ACTOR)
     assert result.content[0].text == "ran x"
     assert auth_context_var.get() is None
 
@@ -705,12 +706,13 @@ async def test_call_tool_as_admin_resets_the_token_on_error():
 
     class Gateway:
         async def call_tool(self, name, arguments):
-            seen.append(auth_context_var.get().access_token.scopes)
+            token = auth_context_var.get().access_token
+            seen.append((token.scopes, token.subject))
             raise ToolError("boom")
 
     with pytest.raises(ToolError):
-        await call_tool_as_admin(Gateway(), "x", {})
-    assert seen == [["admin"]]
+        await call_tool_as_admin(Gateway(), "x", {}, ADMIN_ACTOR)
+    assert seen == [(["admin"], "admin")]
     assert auth_context_var.get() is None
 
 

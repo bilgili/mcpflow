@@ -1,24 +1,38 @@
 """The persisted list of child MCP servers.
 
-`Registry` owns `DATA_DIR/servers.json`. Every mutator validates, builds a
-candidate state, writes the file atomically, and only then adopts the
-candidate in memory. A failed write therefore leaves the file and the memory
-equal, so no caller can act on a state that was never persisted.
+`Registry` owns `DATA_DIR/servers.json` (admin-owned servers) and
+`DATA_DIR/user_servers.json` (user-owned servers). The class of a key selects
+the file: a mutator writes the one file of the key it changes. Every mutator
+validates, builds a candidate state, writes the file atomically, and only then
+adopts the candidate in memory. A failed write therefore leaves the file and
+the memory equal, so no caller can act on a state that was never persisted.
+
+An earlier build reads only `servers.json`, whose shape is unchanged, so a
+downgrade starts no user-owned server.
 """
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
+import logging
 import math
+import operator
 import os
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Final, Literal
 from urllib.parse import unquote, unquote_plus, urlsplit, urlunsplit
 
 import httpx
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+
+from .identity import USER_ID_RE
+
+logger = logging.getLogger(__name__)
 
 Kind = Literal["python", "npm", "remote", "custom"]
 
@@ -430,6 +444,114 @@ class RegistryError(ValueError):
     """Raised on a duplicate namespace or an invalid spec. Names the field."""
 
 
+@dataclass(frozen=True, order=True)
+class ServerKey:
+    """The registry key of a child. `owner` is `None` for an admin-owned child.
+
+    The reference is `<namespace>` for an admin-owned child and
+    `<namespace>@<owner>` for a user-owned one. `@` is outside both patterns,
+    so the key and the reference map one to one, and every per-server store
+    keys by the reference. For an admin-owned child the reference is the
+    namespace, so no existing path moves.
+    """
+
+    owner: str | None
+    namespace: str
+
+    def __post_init__(self) -> None:
+        # The one-to-one map is the type's invariant, not `parse`'s: without
+        # it `ServerKey(None, "github@alice")` would share alice's reference,
+        # and so her credential, source, and log paths. A shape check only;
+        # the reserved-namespace rule belongs to `validate_namespace`.
+        if not isinstance(self.namespace, str) or not _NAMESPACE_RE.fullmatch(
+            self.namespace
+        ):
+            raise ValueError(f"bad server namespace {self.namespace!r}")
+        if self.owner is not None and (
+            not isinstance(self.owner, str) or not USER_ID_RE.fullmatch(self.owner)
+        ):
+            raise ValueError(f"bad server owner {self.owner!r}")
+
+    @property
+    def ref(self) -> str:
+        if self.owner is None:
+            return self.namespace
+        return f"{self.namespace}@{self.owner}"
+
+    @classmethod
+    def parse(cls, ref: str) -> ServerKey:
+        """The key a reference names. `ValueError` for any other shape.
+
+        A shape check only: the reserved-namespace rule belongs to
+        `validate_namespace`, and the built-in `mcpflow` reference must parse.
+        """
+        if not isinstance(ref, str):
+            raise ValueError(f"bad server reference {ref!r}")  # noqa: TRY004 -- one error type for every bad shape
+        namespace, sep, owner = ref.partition("@")
+        if not _NAMESPACE_RE.fullmatch(namespace) or (
+            sep and not USER_ID_RE.fullmatch(owner)
+        ):
+            raise ValueError(
+                f"bad server reference {ref!r}: expected <namespace> or "
+                "<namespace>@<owner>"
+            )
+        return cls(owner if sep else None, namespace)
+
+
+# The fields that decide what code runs and where it connects. An edit of one
+# of them changes `revision`, so it un-approves a user-owned server by
+# construction. `description`, `enabled`, `cache_ttl`, and the mute state are
+# not here: an edit of them keeps the approval.
+REVISION_FIELDS: Final = (
+    "kind",
+    "package",
+    "args",
+    "url",
+    "transport",
+    "headers",
+    "command",
+    "env",
+    "source",
+)
+
+# The declared shape of each `REVISION_FIELDS` value, for the type guard of
+# the approval memo (D6, gate R3-A). A field missing here keeps no memo, so a
+# new revision field fails closed until it is added.
+_REVISION_SHAPES: Final = {
+    "kind": str,
+    "package": str,
+    "args": list,
+    "url": str,
+    "transport": str,
+    "headers": dict,
+    "command": str,
+    "env": dict,
+    "source": str,
+}
+_revision_values: Final = operator.attrgetter(*REVISION_FIELDS)
+
+
+def _typed_revision_value(name: str, value: object) -> bool:
+    """True when `value` has the exact declared type of revision field `name`."""
+    shape = _REVISION_SHAPES.get(name)
+    if shape is str:
+        return type(value) is str or value is None
+    if shape is list:
+        return type(value) is list and all(type(x) is str for x in value)
+    if shape is dict:
+        return type(value) is dict and all(
+            type(k) is str and type(x) is str for k, x in value.items()
+        )
+    return False
+
+
+def revision(spec: ServerSpec) -> str:
+    """SHA-256 hex digest of the canonical JSON of `REVISION_FIELDS`."""
+    fields = spec.model_dump(mode="json", include=set(REVISION_FIELDS))
+    canonical = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 def validate_namespace(value: str) -> str:
     """The one namespace rule: the shape and the reserved prefix.
 
@@ -481,11 +603,63 @@ class ServerSpec(BaseModel):
     # atomic write; plain `update` preserves it (remote-oauth).
     oauth_pending: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    # Registry-owned, never read from a caller body: `Supervisor.add` stamps
+    # `owner` from the actor and `Registry.update` keeps both stored values.
+    # `None` owner is admin-owned. No field stores an approval flag; the state
+    # is derived in `approval` (F7a).
+    owner: str | None = None
+    approved_revision: str | None = None
+
+    @property
+    def key(self) -> ServerKey:
+        return ServerKey(self.owner, self.namespace)
+
+    @property
+    def approval(self) -> Literal["pending", "approved"]:
+        """Derived: admin-owned is always approved; a user-owned spec is
+        approved only while its stored approval covers its current revision."""
+        if self.owner is None or self.approved_revision == self._current_revision():
+            return "approved"
+        return "pending"
+
+    def _current_revision(self) -> str:
+        """`revision(self)`, reused while the `REVISION_FIELDS` values equal
+        the kept snapshot, so `keys_for` hashes each stored record once, not
+        once per request (D6).
+
+        The only reader and writer of `__dict__["_revision_memo"]`, a
+        `(snapshot, digest)` pair. Dumps and `==` ignore a non-field
+        `__dict__` key, and a copy that carries the pair either equals it or
+        misses, so no hook has to drop it. The snapshot is a `copy.copy` of
+        each value, so an in-place change through a shared container cannot
+        reach it.
+        """
+        try:
+            current = _revision_values(self)
+        except AttributeError:  # a deleted field: keep no pair
+            return revision(self)
+        pair = self.__dict__.get("_revision_memo")
+        if pair is not None and pair[0] == current:
+            return pair[1]
+        digest = revision(self)
+        snapshot = tuple(copy.copy(v) for v in current)
+        # An out-of-type value can equal one with another digest (`1 == True`),
+        # so keep a pair only for the declared exact types (gate R3-A).
+        if all(map(_typed_revision_value, REVISION_FIELDS, snapshot)):
+            self.__dict__["_revision_memo"] = (snapshot, digest)
+        return digest
 
     @field_validator("namespace")
     @classmethod
     def _check_namespace(cls, value: str) -> str:
         return validate_namespace(value)
+
+    @field_validator("owner")
+    @classmethod
+    def _check_owner(cls, value: str | None) -> str | None:
+        if value is not None and not USER_ID_RE.fullmatch(value):
+            raise ValueError(f"owner must match {USER_ID_RE.pattern}")
+        return value
 
     @field_validator("cache_ttl")
     @classmethod
@@ -506,9 +680,130 @@ class ServerSpec(BaseModel):
         return self
 
 
+# The two fields that only `user_servers.json` carries. `servers.json` keeps
+# the shape an earlier build reads.
+_USER_FIELDS = frozenset(("owner", "approved_revision"))
+
+# --- pinning of a user-owned server (D7b, gate condition C4) ----------------
+#
+# The revision binds the spec text, so an approval is only as strong as the
+# code that text names. A user-owned spec must therefore name immutable code.
+# `Registry.add` and `Registry.update` are the single owner of the rule; no
+# route holds a copy.
+
+_SHA = r"[0-9a-fA-F]{40}"
+_NPM_PINNED_RE = re.compile(
+    r"^(?:@[a-z0-9][a-z0-9._~-]*/)?[a-z0-9][a-z0-9._~-]*"
+    r"@\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
+)
+_PYTHON_PINNED_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*"
+    r"==\d+(?:\.\d+)*(?:(?:a|b|rc)\d+)?(?:\.post\d+)?(?:\.dev\d+)?$"
+)
+# `git+https://[userinfo@]host/o/r`: no `@`, `#`, or `?` in the path, so the
+# ref after it is the whole tail.
+_GIT_URL = r"git\+https://(?:[^/@\s]+@)?[^/@\s]+(?:/[^/@#?\s]+)+"
+_PYTHON_SOURCE_RE = re.compile(rf"^{_GIT_URL}@{_SHA}$")
+_NPM_SOURCE_RE = re.compile(
+    rf"^(?:github:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+|{_GIT_URL})#{_SHA}$"
+)
+_PINNED_FORMS = {
+    "npm": (
+        "name@X.Y.Z or @scope/name@X.Y.Z",
+        "github:o/r#<sha> or git+https://host/o/r#<sha>",
+    ),
+    "python": ("name==X.Y.Z", "git+https://host/o/r@<sha>"),
+}
+# With a pinned `source`, `package` is the entry point inside that source. It
+# sits in the launcher's own argv (`uvx --from <source> <package> ...`), so it
+# must be a bare name: a leading `-` would be read as a launcher option such as
+# `--with <unpinned>` or npx `-c <shell>`.
+_PYTHON_ENTRY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_NPM_ENTRY_RE = re.compile(r"^(?:@[a-z0-9][a-z0-9._~-]*/)?[a-z0-9][a-z0-9._~-]*$")
+# `env` keys that change which code a child loads or where it fetches it. The
+# launcher (`uvx`, `npx`) runs with this env, so a proxy plus a trusted CA could
+# serve other bytes for a pinned version. Compared upper-cased, so
+# `npm_config_registry` and `https_proxy` are refused as well.
+_CODE_ENV_NAMES = frozenset((
+    "PATH", "HOME", "NPX",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+))
+_CODE_ENV_PREFIXES = (
+    "LD_", "DYLD_", "PYTHON", "NODE_", "NPM_CONFIG_", "UV_", "PIP_", "GIT_",
+    "XDG_", "BUN_",
+)
+
+
+def _check_pinned(spec: ServerSpec) -> None:
+    """Refuse an unpinned user-owned spec with `RegistryError` naming the field.
+
+    Admin-owned specs and kind `remote` pass: mcpflow runs no host code for a
+    remote child, and the approval binds its URL and headers. The error never
+    echoes the source, which may carry a credential.
+    """
+    if spec.owner is None or spec.kind == "remote":
+        return
+    if spec.kind == "custom":
+        # No digest of the spec covers the content of a host executable, so
+        # no approval can bind it (D7b, "The `custom` decision").
+        raise RegistryError("kind: a user-owned server cannot be kind custom")
+    for name in spec.env:
+        upper = name.upper()
+        if upper in _CODE_ENV_NAMES or upper.startswith(_CODE_ENV_PREFIXES):
+            raise RegistryError(
+                f"env: {name} changes which code the child loads; a user-owned "
+                "server cannot set it"
+            )
+    package_form, source_form = _PINNED_FORMS[spec.kind]
+    if spec.source is not None:
+        # A branch, a tag, a short SHA, an https archive, and a local path all
+        # fail here: only a full commit SHA names immutable code.
+        pattern = _PYTHON_SOURCE_RE if spec.kind == "python" else _NPM_SOURCE_RE
+        if not pattern.fullmatch(spec.source):
+            raise RegistryError(
+                f"source: a user-owned {spec.kind} server needs a git source "
+                f"pinned to a full commit SHA: {source_form}"
+            )
+        entry = _PYTHON_ENTRY_RE if spec.kind == "python" else _NPM_ENTRY_RE
+        if not entry.fullmatch(spec.package or ""):
+            raise RegistryError(
+                f"package: with a source, a user-owned {spec.kind} server names "
+                "its entry point as a bare name, not an option"
+            )
+        return
+    pattern = _PYTHON_PINNED_RE if spec.kind == "python" else _NPM_PINNED_RE
+    if not pattern.fullmatch(spec.package or ""):
+        raise RegistryError(
+            f"package: a user-owned {spec.kind} server needs an exact version: "
+            f"{package_form}"
+        )
+
+
+def _prefix_conflict(a: str, b: str) -> bool:
+    """D5b: `github` and `github_create` can publish one tool name."""
+    return a.startswith(b + "_") or b.startswith(a + "_")
+
+
+# The default count of servers one user may own. `config.py` imports it for
+# the `MAX_USER_SERVERS` default, so a registry built without the setting is
+# capped too (D3).
+DEFAULT_MAX_USER_SERVERS: Final = 20
+
+
 class Registry:
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        user_path: Path,
+        *,
+        max_user_servers: int = DEFAULT_MAX_USER_SERVERS,
+    ) -> None:
         self._path = path
+        self._user_path = user_path
+        self._max_user_servers = max_user_servers
+        # Both classes in one list, in insertion order. `ServerSpec.owner`
+        # names the class, and so the file a record lives in.
         self._specs: list[ServerSpec] = []
         # Set before any load: a mutator can run before `load` on a fresh dir.
         self._root_muted = False
@@ -518,41 +813,70 @@ class Registry:
         self._admin_disabled_tools: list[str] = []
 
     def load(self) -> None:
-        if not self._path.exists():
-            self._specs = []
-            self._root_muted = False
-            self._admin_muted = False
-            self._admin_disabled_tools = []
-            return
-        data = json.loads(self._path.read_text())
-        self._root_muted = bool(data.get("muted", False))
-        # A file written before the admin object existed loads as "nothing
-        # muted", which is the behaviour that file had.
-        admin = data.get("admin") or {}
-        self._admin_muted = bool(admin.get("muted", False))
-        self._admin_disabled_tools = [str(t) for t in admin.get("disabled_tools", [])]
-        specs = [ServerSpec(**s) for s in data.get("servers", [])]
-        seen: set[str] = set()
+        """Read both files. Writes nothing, so an old file keeps version 1."""
+        root_muted = admin_muted = False
+        admin_tools: list[str] = []
+        specs: list[ServerSpec] = []
+        if self._path.exists():
+            data = json.loads(self._path.read_text())
+            root_muted = bool(data.get("muted", False))
+            # A file written before the admin object existed loads as "nothing
+            # muted", which is the behaviour that file had.
+            admin = data.get("admin") or {}
+            admin_muted = bool(admin.get("muted", False))
+            admin_tools = [str(t) for t in admin.get("disabled_tools", [])]
+            for raw in data.get("servers", []):
+                spec = ServerSpec(**raw)
+                if spec.owner is not None:
+                    raise ValueError(
+                        f"servers.json: {spec.namespace} carries an owner; "
+                        "user-owned servers live in user_servers.json"
+                    )
+                specs.append(spec.model_copy(update={"approved_revision": None}))
+        if self._user_path.exists():
+            data = json.loads(self._user_path.read_text())
+            for raw in data.get("servers", []):
+                if not raw.get("owner"):
+                    raise ValueError(
+                        f"user_servers.json: {raw.get('namespace')!r} has no owner"
+                    )
+                specs.append(ServerSpec(**raw))
+        seen: set[ServerKey] = set()
         for spec in specs:
-            if spec.namespace in seen:
-                raise RegistryError(f"namespace {spec.namespace} already exists")
-            seen.add(spec.namespace)
+            if spec.key in seen:
+                raise RegistryError(f"namespace {spec.key.ref} already exists")
+            seen.add(spec.key)
+        # An existing install can hold a colliding pair from before the
+        # write-time check. Refusing it would stop the start; the router's
+        # backstop refuses the shared names at request time instead (D5b).
+        names = sorted({s.namespace for s in specs})
+        for i, a in enumerate(names):
+            for b in names[i + 1 :]:
+                if _prefix_conflict(a, b):
+                    logger.warning(
+                        "namespace %s conflicts with %s: a tool name could "
+                        "resolve to both",
+                        b,
+                        a,
+                    )
         self._specs = specs
+        self._root_muted = root_muted
+        self._admin_muted = admin_muted
+        self._admin_disabled_tools = admin_tools
 
     def list(self) -> list[ServerSpec]:
         return list(self._specs)
 
-    def get(self, namespace: str) -> ServerSpec:
-        for spec in self._specs:
-            if spec.namespace == namespace:
-                return spec
-        raise KeyError(namespace)
+    def get(self, key: ServerKey) -> ServerSpec:
+        return self._specs[self._index(key)]
 
     def _commit(
         self,
         specs: list[ServerSpec],
         root_muted: bool | None = None,
         admin: tuple[bool, list[str]] | None = None,
+        *,
+        user: bool = False,
     ) -> None:
         """Persist a candidate state, then adopt it in memory.
 
@@ -565,29 +889,76 @@ class Registry:
         The admin state travels as a third candidate field. Every mutator
         rewrites the whole file, so a mutator that dropped it here would erase
         the built-in policy from disk on the next unrelated child change.
+
+        `user` selects the file: the mutator of a user-owned key writes
+        `user_servers.json` only, every other mutator `servers.json` only.
         """
         root = self._root_muted if root_muted is None else root_muted
         admin_muted, admin_tools = (
             (self._admin_muted, self._admin_disabled_tools) if admin is None else admin
         )
-        self._write(specs, root, admin_muted, admin_tools)
+        if user:
+            self._write_user(specs)
+        else:
+            self._write(specs, root, admin_muted, admin_tools)
         self._specs = specs
         self._root_muted = root
         self._admin_muted = admin_muted
         self._admin_disabled_tools = admin_tools
 
     def add(self, spec: ServerSpec) -> None:
-        if any(s.namespace == spec.namespace for s in self._specs):
-            raise RegistryError(f"namespace {spec.namespace} already exists")
+        if any(s.key == spec.key for s in self._specs):
+            raise RegistryError(f"namespace {spec.key.ref} already exists")
+        # The cap: an admin-owned record is exempt, and `load` never refuses
+        # a file above it (D2, D4). No `await` before `_commit`, so two
+        # concurrent adds cannot both pass the count (D1).
+        if spec.owner is not None:
+            owned = sum(1 for s in self._specs if s.owner == spec.owner)
+            if owned >= self._max_user_servers:
+                raise RegistryError(
+                    f"limit: {spec.owner} owns {owned} servers; "
+                    f"MAX_USER_SERVERS is {self._max_user_servers}"
+                )
         # A new record has no stored value to echo against, so any mask here
         # is a clone of a read record and would persist as the credential.
         _refuse_mask(spec)
-        self._commit([*self._specs, spec])
+        _check_pinned(spec)
+        self._check_prefix(spec)
+        self._commit([*self._specs, spec], user=spec.owner is not None)
+
+    def _check_prefix(self, spec: ServerSpec) -> None:
+        """Refuse a namespace that can publish a tool name another can (D5b).
+
+        A user write only: it compares with the admin-owned namespaces and the
+        user's own, never a foreign one, so the error never reveals a private
+        namespace. An admin write is exempt, so the marketplace can connect a
+        second account under `<ns>_<suffix>` (D5b, user decision 2026-10-02).
+        The router's request-time backstop refuses a name two tools really
+        share, for every caller.
+        """
+        if spec.owner is None:
+            return
+        for other in self._specs:
+            if other.owner not in (None, spec.owner):
+                continue
+            if _prefix_conflict(spec.namespace, other.namespace):
+                raise RegistryError(
+                    f"namespace {spec.namespace} conflicts with "
+                    f"{other.namespace}: a tool name could resolve to both"
+                )
 
     def update(self, spec: ServerSpec) -> None:
+        """Replace the caller-owned fields of the record that `spec.key` names.
+
+        The caller states the key through `spec.owner`; `Supervisor.update`
+        stamps it from the key it was given, so no body chooses it.
+        """
         merged = self.merge(spec)
-        i = self._index(spec.namespace)
-        self._commit([*self._specs[:i], merged, *self._specs[i + 1 :]])
+        i = self._index(spec.key)
+        self._commit(
+            [*self._specs[:i], merged, *self._specs[i + 1 :]],
+            user=merged.owner is not None,
+        )
 
     def merge(self, spec: ServerSpec) -> ServerSpec:
         """The record `update(spec)` would store, validated, without storing it.
@@ -597,7 +968,7 @@ class Registry:
         discard derived state that the new record cannot scrub (the child log)
         BEFORE the record is persisted.
         """
-        existing = self._specs[self._index(spec.namespace)]
+        existing = self._specs[self._index(spec.key)]
         # The web form builds a fresh spec and carries neither the visibility
         # state nor the creation time. Merge here, in the one owner, so no
         # caller has to remember to preserve them.
@@ -634,6 +1005,11 @@ class Registry:
                 # and a caller partial dict cannot self-grant it. Only a
                 # create-time write or a catalog connect sets it (F2 revised).
                 "actions": existing.actions,
+                # Registry-owned. The approval is derived from the stored
+                # `approved_revision`, so an edit of a revision field
+                # un-approves by construction and no body can approve.
+                "owner": existing.owner,
+                "approved_revision": existing.approved_revision,
                 "url": url,
                 "env": _keep_echoed(spec.env, existing.env),
                 "headers": _keep_echoed(spec.headers, existing.headers),
@@ -642,9 +1018,21 @@ class Registry:
         # After the merge, no mask may remain: it would persist as the
         # credential and lose the real one.
         _refuse_mask(merged)
+        # On the merged, unmasked record, before the write: an edit cannot
+        # unpin an approved server, and a refusal leaves the stored spec and
+        # its approval unchanged (C4). An echoed mask is restored above, so
+        # `revision(merged)` equals the stored revision and keeps approval.
+        _check_pinned(merged)
         return merged
 
-    def set_oauth_header(self, namespace: str, name: str, value: str) -> None:
+    def set_approved_revision(self, key: ServerKey, revision: str) -> None:
+        """Record the revision the admin approved. User-owned keys only: an
+        admin-owned server is always approved and stores no revision."""
+        if key.owner is None:
+            raise RegistryError(f"{key.ref} is admin-owned and needs no approval")
+        self._replace(key, {"approved_revision": revision})
+
+    def set_oauth_header(self, key: ServerKey, name: str, value: str) -> None:
         """Set the child's `name` header to `value` and clear `oauth_pending`
         in one atomic write.
 
@@ -655,24 +1043,23 @@ class Registry:
         so they are never inconsistent. `update` preserves
         `oauth_pending` for every other edit; only this method clears it.
         """
-        i = self._index(namespace)
-        existing = self._specs[i]
+        existing = self.get(key)
         headers = dict(existing.headers)
         headers[name] = value
-        updated = existing.model_copy(
-            update={"headers": headers, "oauth_pending": False}
-        )
+        update = {"headers": headers, "oauth_pending": False}
         # A token response that carries the mask would persist it as the
         # credential; the no-mask rule holds for this writer too.
-        _refuse_mask(updated)
-        self._commit([*self._specs[:i], updated, *self._specs[i + 1 :]])
+        _refuse_mask(existing.model_copy(update=update))
+        self._replace(key, update)
 
-    def remove(self, namespace: str) -> None:
-        i = self._index(namespace)
-        self._commit([*self._specs[:i], *self._specs[i + 1 :]])
+    def remove(self, key: ServerKey) -> None:
+        i = self._index(key)
+        self._commit(
+            [*self._specs[:i], *self._specs[i + 1 :]], user=key.owner is not None
+        )
 
-    def set_enabled(self, namespace: str, enabled: bool) -> None:
-        self._replace(namespace, {"enabled": enabled})
+    def set_enabled(self, key: ServerKey, enabled: bool) -> None:
+        self._replace(key, {"enabled": enabled})
 
     # --- visibility ------------------------------------------------------
 
@@ -682,25 +1069,24 @@ class Registry:
     def set_root_muted(self, muted: bool) -> None:
         self._commit(list(self._specs), root_muted=muted)
 
-    def set_muted(self, namespace: str, muted: bool) -> None:
-        self._replace(namespace, {"muted": muted})
+    def set_muted(self, key: ServerKey, muted: bool) -> None:
+        self._replace(key, {"muted": muted})
 
-    def set_tool_muted(self, namespace: str, tool: str, muted: bool) -> None:
+    def set_tool_muted(self, key: ServerKey, tool: str, muted: bool) -> None:
         """Mute or unmute one tool.
 
         `tool` is the bare child tool name, taken verbatim. The child owns
         that string and visibility matching is exact, so the registry must
         not trim or normalise it.
         """
-        i = self._index(namespace)
-        names = list(self._specs[i].disabled_tools)
+        names = list(self.get(key).disabled_tools)
         if muted and tool not in names:
             names.append(tool)
         elif not muted and tool in names:
             names.remove(tool)
         else:
             return
-        self._replace(namespace, {"disabled_tools": names})
+        self._replace(key, {"disabled_tools": names})
 
     # --- built-in admin visibility ---------------------------------------
 
@@ -742,10 +1128,13 @@ class Registry:
             return True, set()
         return False, set(self._admin_disabled_tools)
 
-    def _replace(self, namespace: str, update: dict) -> None:
-        i = self._index(namespace)
+    def _replace(self, key: ServerKey, update: dict) -> None:
+        i = self._index(key)
         changed = self._specs[i].model_copy(update=update)
-        self._commit([*self._specs[:i], changed, *self._specs[i + 1 :]])
+        self._commit(
+            [*self._specs[:i], changed, *self._specs[i + 1 :]],
+            user=key.owner is not None,
+        )
 
     def visibility(self, spec: ServerSpec) -> tuple[bool, set[str]]:
         """The resolution rule. The only place that reads the levels together.
@@ -757,11 +1146,11 @@ class Registry:
             return True, set()
         return False, set(spec.disabled_tools)
 
-    def _index(self, namespace: str) -> int:
+    def _index(self, key: ServerKey) -> int:
         for i, spec in enumerate(self._specs):
-            if spec.namespace == namespace:
+            if spec.key == key:
                 return i
-        raise KeyError(namespace)
+        raise KeyError(key.ref)
 
     def _write(
         self,
@@ -777,15 +1166,34 @@ class Registry:
                 "muted": admin_muted,
                 "disabled_tools": list(admin_disabled_tools),
             },
-            "servers": [json.loads(s.model_dump_json()) for s in specs],
+            # The admin-owned records only, in the shape an earlier build
+            # reads: no `owner`, no `approved_revision`.
+            "servers": [
+                json.loads(s.model_dump_json(exclude=set(_USER_FIELDS)))
+                for s in specs
+                if s.owner is None
+            ],
         }
-        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-        # Create the file already-private (0600); child secrets in `env` never
-        # sit at 0644 in the write window.
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(json.dumps(payload, indent=2))
-        os.replace(tmp, self._path)
+        _atomic_write(self._path, payload)
+
+    def _write_user(self, specs: list[ServerSpec]) -> None:
+        payload = {
+            "version": 1,
+            "servers": [
+                json.loads(s.model_dump_json()) for s in specs if s.owner is not None
+            ],
+        }
+        _atomic_write(self._user_path, payload)
+
+
+def _atomic_write(path: Path, payload: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    # Create the file already-private (0600); child secrets in `env` never
+    # sit at 0644 in the write window.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(payload, indent=2))
+    os.replace(tmp, path)
 
 
 def spec_from_dict(data: dict) -> ServerSpec:

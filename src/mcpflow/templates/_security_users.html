@@ -1,0 +1,191 @@
+{% from "_tags.html" import member_tags, lock_icon with context %}
+{# One dialog for both writes: it creates a user (`u` is none) or edits the
+   groups of one. The group list is the same filterable checkbox list in both.
+   The edit form posts a delta (D5): `was` lists the boxes it rendered checked,
+   `groups` the boxes checked at save. The bootstrap user keeps `admins`: its
+   box is disabled and left out of `was`, so the delta never names it. #}
+{% macro user_dialog(dom_id, title, action, submit, u=none, open=false, err=none) %}
+<dialog id="{{ dom_id }}" class="userdlg"{{ ' open' if open }}>
+  <form method="post" action="{{ action }}">
+    <div class="dhead">
+      <h3>{{ title }}</h3>
+      <button type="button" class="btn-sm close" commandfor="{{ dom_id }}" command="close" aria-label="Close">×</button>
+    </div>
+    {% if err %}<p class="error" role="alert">{{ err }}</p>{% endif %}
+    <div class="field">
+      {% if u %}
+      <label>User id</label>
+      <code>{{ u.id }}</code>
+      {% else %}
+      <label for="{{ dom_id }}-id">User id</label>
+      <input id="{{ dom_id }}-id" name="id" required placeholder="alice" autocapitalize="off" autocomplete="off"
+             pattern="[a-z0-9][a-z0-9_\-]{0,63}" title="Lowercase letters, digits, - and _, up to 64 characters">
+      <label for="{{ dom_id }}-name">Name (optional)</label>
+      <input id="{{ dom_id }}-name" name="name">
+      {% endif %}
+    </div>
+    <div class="field">
+      <label for="{{ dom_id }}:filter">Groups</label>
+      {# No element has the id `<dialog id>:detached`, so the filter box has no
+         form owner: Enter in it submits nothing and it posts no field. #}
+      <input id="{{ dom_id }}:filter" type="search" class="group-filter" form="{{ dom_id }}:detached" placeholder="Filter groups">
+      <div class="group-list">
+        {% for g in groups | sort %}
+        {% set locked = u and u.id == bootstrap_id and g == admins_group %}
+        <label><input type="checkbox" name="groups" value="{{ g }}"{{ ' checked' if u and g in u.groups }}{{ ' disabled' if locked }}> {{ g }}{% if locked %}{{ lock_icon() }}{% endif %}</label>
+        {% endfor %}
+      </div>
+      {% if u %}{% for g in u.groups | sort %}{% if not (u.id == bootstrap_id and g == admins_group) %}
+      <input type="hidden" name="was" value="{{ g }}">
+      {% endif %}{% endfor %}{% endif %}
+    </div>
+    <div class="pop-foot">
+      <span class="count muted small">{{ u.groups | length if u else 0 }} selected</span>
+      <span>
+        <button type="button" class="btn-sm" commandfor="{{ dom_id }}" command="close">Cancel</button>
+        <button type="submit" class="btn-sm">{{ submit }}</button>
+      </span>
+    </div>
+  </form>
+</dialog>
+{% endmacro %}
+<section id="users">
+{# Every form posts without htmx: a success redirects with 303, a refusal of
+   the provider renders the page again with 400 and the reason. A create or a
+   reset renders the page with `issued`, the one-time setup code (200,
+   no-store). The admin never sets a password: the user sets it with the
+   code. A `User` carries no password hash and no code. The admin role is
+   membership of `admins_group`: tick it in a group list. A refused create
+   sets `reopen`: the create dialog renders open and shows the reason. #}
+<h2>Users</h2>
+<button type="button" class="create-btn" commandfor="create-user" command="show-modal">+ Create user</button>
+{% if error and section == 'users' and not reopen %}<p class="error">{{ error }}</p>{% endif %}
+{% if issued %}
+<div class="newtoken">
+  <p class="once">⚠ Setup code for <code>{{ issued.user }}</code> — copy it now, it is shown once.</p>
+  <div class="row">
+    <span class="token" id="setup-code">{{ issued.code }}</span>
+    <button class="btn" type="button" onclick="mcpflowCopy('setup-code', this)">Copy</button>
+  </div>
+  <p class="muted small">Give it to the user with the address <code>{{ login_setup_url }}</code>.
+    The code is valid {{ setup_code_days }} days, single use.</p>
+</div>
+<script>
+function mcpflowCopy(id, btn) {
+  const text = document.getElementById(id).innerText;
+  if (navigator.clipboard) navigator.clipboard.writeText(text);
+  const old = btn.textContent;
+  btn.textContent = 'Copied';
+  setTimeout(() => { btn.textContent = old; }, 1200);
+}
+</script>
+{% endif %}
+
+<table>
+  <thead>
+    <tr><th>User</th><th>Name</th><th>Groups</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for u in users %}
+    <tr>
+      <td><code>{{ u.id }}</code>{% if u.pending %} <span class="muted">pending</span>{% endif %}</td>
+      <td>{{ u.name }}</td>
+      <td>{{ member_tags(u.groups, user=u.id, back="users") }}</td>
+      <td class="nowrap row-end">
+        {# The menu forms and the dialogs are siblings: no form holds another
+           form. The bootstrap user has no reset and no delete. #}
+        {% if u.id == bootstrap_id %}<span class="muted small">set by ADMIN_PASSWORD</span>{% endif %}
+        <button type="button" class="btn-sm menu-btn" popovertarget="menu-of-{{ u.id }}" aria-label="Actions for {{ u.id }}">⋯</button>
+        <div popover id="menu-of-{{ u.id }}" class="row-menu">
+          <button type="button" commandfor="edit-{{ u.id }}" command="show-modal">Edit user</button>
+          {% if u.id != bootstrap_id %}
+          <form method="post" action="/users/{{ u.id }}/setup-code">
+            <button type="submit">Reset password</button>
+          </form>
+          <button type="button" class="danger" commandfor="delete-{{ u.id }}" command="show-modal">Delete</button>
+          {% endif %}
+        </div>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+{{ user_dialog("create-user", "Create user", "/users", "Create user", open=(reopen == 'create'), err=(error if reopen == 'create' else none)) }}
+{% for u in users %}
+{{ user_dialog("edit-" ~ u.id, "Edit user", "/users/" ~ u.id ~ "/groups", "Save", u=u) }}
+{% if u.id != bootstrap_id %}
+{# Delete asks first. The form is the same POST the menu item used to hold;
+   `confirmdlg` is not `userdlg`, so the reset script below leaves it alone. #}
+<dialog id="delete-{{ u.id }}" class="confirmdlg">
+  <form method="post" action="/users/{{ u.id }}/delete">
+    <div class="dhead">
+      <h3>Delete user</h3>
+      <button type="button" class="btn-sm close" commandfor="delete-{{ u.id }}" command="close" aria-label="Close">×</button>
+    </div>
+    <p>Delete <code>{{ u.id }}</code>? The user loses access and leaves every group. This cannot be undone.</p>
+    <div class="pop-foot">
+      <span></span>
+      <span>
+        <button type="button" class="btn-sm" commandfor="delete-{{ u.id }}" command="close">Cancel</button>
+        <button type="submit" class="btn-sm danger-fill">Delete</button>
+      </span>
+    </div>
+  </form>
+</dialog>
+{% endif %}
+{% endfor %}
+<script>
+// The dialogs and menus open without this script (native commands and
+// popovers; the script covers a browser without them). It filters the list, keeps the count live, closes a menu when its
+// item opens a dialog, upgrades a dialog rendered open to a modal, and
+// discards unsaved input when a dialog closes. It is the one script of the
+// page: it listens on `main`, so it serves the dialogs of the Users and the
+// Groups sections. A dialog may have no filter and no count (create group).
+(() => {
+  const section = document.querySelector("main");
+  const count = (form) => {
+    const n = form.querySelector(".count");
+    if (n) n.textContent = form.querySelectorAll(".group-list input:checked").length + " selected";
+  };
+  section.addEventListener("input", (e) => {
+    if (!e.target.matches(".group-filter")) return;
+    const q = e.target.value.trim().toLowerCase();
+    e.target.closest("form").querySelectorAll(".group-list label").forEach((label) => {
+      label.hidden = !label.textContent.toLowerCase().includes(q);
+    });
+  });
+  section.addEventListener("change", (e) => {
+    if (e.target.closest(".group-list")) count(e.target.closest("form"));
+  });
+  section.addEventListener("click", (e) => {
+    const item = e.target.closest(".row-menu button[commandfor]");
+    if (item) item.closest("[popover]").hidePopover();
+    // A browser without Invoker Commands: do what `command` would do.
+    const cmd = e.target.closest("button[commandfor]");
+    if (cmd && !("command" in HTMLButtonElement.prototype)) {
+      const dlg = document.getElementById(cmd.getAttribute("commandfor"));
+      if (cmd.getAttribute("command") === "show-modal") dlg.showModal(); else dlg.close();
+    }
+  });
+  // `close` does not bubble: listen in the capture phase.
+  section.addEventListener("close", (e) => {
+    const form = e.target.querySelector("form");
+    if (!e.target.matches("dialog.userdlg") || !form) return;
+    // The upgrade below closes and reopens a dialog rendered open; that
+    // close must not wipe the reason the page shows in it.
+    if (e.target.open) return;
+    form.reset();
+    e.target.querySelector(".error")?.remove();
+    if (form.querySelector(".group-filter")) form.querySelector(".group-filter").value = "";
+    form.querySelectorAll(".group-list label").forEach((label) => { label.hidden = false; });
+    count(form);
+  }, true);
+  // The Groups section is not parsed yet when this script runs.
+  addEventListener("DOMContentLoaded", () => {
+    const open = section.querySelector("dialog.userdlg[open]");
+    if (open) { open.close(); open.showModal(); }
+  });
+})();
+</script>
+</section>

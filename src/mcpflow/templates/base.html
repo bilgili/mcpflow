@@ -11,13 +11,21 @@
 <body>
   <header>
     <a class="brand" href="/"><img src="/static/logo.svg" alt="MCP Flow" class="logo"></a>
+    {# The admin-only pages answer 403 to a non-admin user, so the header
+       links them for an admin only. #}
     <nav>
       <a href="/">Dashboard</a>
+      {% if current_user and current_user.is_admin %}
       <a href="/marketplace">Marketplace</a>
+      <a href="/approvals">Approvals</a>
+      <a href="/security">Security</a>
+      {% endif %}
       <a href="/tokens">Tokens</a>
+      {% if current_user %}<a href="/settings">Settings</a>{% endif %}
     </nav>
     <form class="inline" method="post" action="/logout" style="margin-left:auto">
-      <button type="submit">Log out</button>
+      {% if current_user %}<span class="user">{{ current_user.id }}{% if current_user.name and current_user.name != current_user.id %} ({{ current_user.name }}){% endif %}</span>{% endif %}
+      <button type="submit">Sign out</button>
     </form>
   </header>
   <main>

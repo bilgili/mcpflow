@@ -38,9 +38,9 @@ def _spy_admin_call(monkeypatch) -> list:
     seen: list = []
     real = supervisor_mod.Supervisor.run_action
 
-    async def spy(self, ns, name, arguments, **kwargs):
-        seen.append(f"{ns}_{name}")
-        return await real(self, ns, name, arguments, **kwargs)
+    async def spy(self, ns, name, arguments, actor, **kwargs):
+        seen.append(f"{ns.ref}_{name}")
+        return await real(self, ns, name, arguments, actor, **kwargs)
 
     monkeypatch.setattr("mcpflow.supervisor.Supervisor.run_action", spy)
     return seen
@@ -371,7 +371,7 @@ def test_template_values_never_hold_a_password_key(server_factory, monkeypatch):
         assert fields["name"]["value"] in {"s3main", "fail", "n"}
         assert fields["secret_key"]["control"] == "password"
         assert fields["secret_key"]["value"] == ""
-        presentation = {k: v for k, v in ctx.items() if k not in ("request", "c")}
+        presentation = {k: v for k, v in ctx.items() if k not in ("request", "c", "current_user")}
         assert SECRET not in json.dumps(presentation)
 
 

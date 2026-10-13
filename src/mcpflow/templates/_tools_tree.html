@@ -21,10 +21,12 @@
     inherits the poll's swap, sync, or trigger. Every control declares its own
     `hx-target` and `hx-swap`; the `Details` control targets the dialog and
     inherits no sync, so a poll never drops it.
-  - The root carries the poll only while a child is `starting`. The poll sends
-    no parameters and this partial renders every group collapsed. The browser
-    owns the open state: `dashboard.html` records it on `htmx:beforeSwap` and
-    restores it on `htmx:afterSwap`.
+  - The root carries the poll only while a child is `starting` or a snapshot
+    probe runs (`probing`, read right after the rows). The poll sends
+    `poll=1`, so a poll answer starts no probe and the poll stops once the
+    probes of the last load or control answer end. This partial renders every
+    group collapsed. The browser owns the open state: `dashboard.html` records
+    it on `htmx:beforeSwap` and restores it on `htmx:afterSwap`.
   - The namespace control sits below the server row, not inside the
     `<summary>`. Clicking any child of a `<summary>` toggles the group, so a
     control placed there could not be operated without JavaScript.
@@ -35,11 +37,21 @@
     controls. A pinned row carries a checked, disabled control: visibility
     never hides that tool, so the admin cannot lock themselves out of the MCP
     admin surface.
+  - Every group is one server key: `data-ns`, the title, and the links carry
+    the reference (`github@alice`), and the rows match on `t.ref`, so a user
+    server never borrows the rows of the admin server of the same namespace.
+    The handler passes only the children of the `dashboard` Reach.
+  - A non-admin user sees no visibility control at all: the routes are
+    admin-only. The server row (the command, the error, and `Details`) shows
+    only on a server the user manages; a granted shared server has no window
+    for them and shows its allowed tools only.
 #}
-{% set polling = children | selectattr('status', 'equalto', 'starting') | list | length > 0 %}
+{% set admin = current_user is not none and current_user.is_admin %}
+{% set polling = probing or (children | selectattr('status', 'equalto', 'starting') | list | length > 0) %}
 <div id="tools-tree" hx-disinherit="*"
-     {% if polling %}hx-get="/tools/tree" hx-trigger="every 3s"
+     {% if polling %}hx-get="/tools/tree?poll=1" hx-trigger="every 3s"
      hx-target="#tools-tree" hx-swap="outerHTML" hx-sync="this:drop"{% endif %}>
+{% if admin %}
 <form class="vis-root" hx-post="/visibility/root" hx-target="#tools-tree"
       hx-swap="outerHTML" hx-sync="#tools-tree:replace">
   <label class="vis">
@@ -49,6 +61,7 @@
   </label>
   {% if root_muted %}<span class="muted">All tools are hidden from /mcp.</span>{% endif %}
 </form>
+{% endif %}
 {% set mcpflow_tools = tools | selectattr('namespace', 'equalto', 'mcpflow') | list %}
 {% if mcpflow_tools %}
 {% set mcpflow_shown = mcpflow_tools | selectattr('visible') | list | length %}
@@ -98,20 +111,27 @@
 </details>
 {% endif %}
 {% for c in children %}
-{% set ns = c.spec.namespace %}
-{% set ns_tools = tools | selectattr('namespace', 'equalto', ns) | list %}
+{% set ns = c.spec.key.ref %}
+{% set ns_tools = tools | selectattr('ref', 'equalto', ns) | list %}
 {% set shown = ns_tools | selectattr('visible') | list | length %}
+{% set manages = ns in managed %}
 <details class="ns-group" data-ns="{{ ns }}">
   <summary>
     <span class="ns">{{ ns }}</span>
     <span class="kind">{{ c.spec.kind }}</span>
+    {% if admin and c.spec.owner %}<span class="owner">owner {{ c.spec.owner }}</span>{% endif %}
     <span class="count">{{ shown }} of {{ ns_tools | length }} tools</span>
     <span class="status status-{{ c.status }}">{{ c.status }}</span>
-    {% if ns in awaiting %}<span class="awaiting" title="Delete this server and connect again to retry.">awaiting authorization</span>{% endif %}
+    {% if c.spec.approval == 'pending' %}<span class="awaiting">awaiting approval</span>{% endif %}
+    {% if c.spec.key.ref in awaiting %}<span class="awaiting" title="Delete this server and connect again to retry.">awaiting authorization</span>{% endif %}
   </summary>
   {# The server row. The command shows the source redacted; the raw value
      lives in the window's form input only. The row holds no action other
-     than `Details`, which targets the dialog outside this tree. #}
+     than `Details`, which targets the dialog outside this tree. Only the
+     manager of the server gets the row: the command line and the error of a
+     granted shared server are its admin's configuration, and its arguments
+     can name a tool the policy hides from this user. #}
+  {% if manages %}
   <div class="server-row">
     <span class="small muted">Runs as</span>
     <code class="cmd">{{ spec_command(c.spec) }}</code>
@@ -122,6 +142,8 @@
     <a class="btn" href="/servers/{{ ns }}" hx-get="/servers/{{ ns }}"
        hx-target="#detail" hx-swap="innerHTML">Details ›</a>
   </div>
+  {% endif %}
+  {% if admin %}
   <form class="vis-ns" hx-post="/visibility/namespaces/{{ ns }}"
         hx-target="#tools-tree" hx-swap="outerHTML"
         hx-sync="#tools-tree:replace">
@@ -132,16 +154,18 @@
       <span>Publish this namespace</span>
     </label>
   </form>
+  {% endif %}
   {% if ns_tools %}
   <table>
     <thead>
-      <tr><th>Publish</th><th>Tool</th><th>Description</th><th>Schema</th></tr>
+      <tr>{% if admin %}<th>Publish</th>{% endif %}<th>Tool</th><th>Description</th><th>Schema</th></tr>
     </thead>
     <tbody>
       {% for t in ns_tools %}
       <tr class="{% if not t.visible %}hidden-tool{% endif %}">
+        {% if admin %}
         <td>
-          <form hx-post="/visibility/namespaces/{{ t.namespace }}/tool"
+          <form hx-post="/visibility/namespaces/{{ ns }}/tool"
                 hx-target="#tools-tree" hx-swap="outerHTML"
                 hx-sync="#tools-tree:replace">
             <input type="hidden" name="tool" value="{{ t.tool }}">
@@ -150,6 +174,7 @@
                    onchange="this.form.requestSubmit()">
           </form>
         </td>
+        {% endif %}
         <td><code>{{ t.name }}</code></td>
         <td>{{ t.description }}</td>
         <td>{{ t.schema_summary }}</td>

@@ -132,7 +132,8 @@ def test_write_rejects_reserved_namespace(tmp_path, namespace):
     store = _store(tmp_path)
     with pytest.raises(ValueError, match="reserved"):
         store.write(namespace, {"main.py": "x"})
-    assert not store.path_for(namespace).exists()
+    # `path_for` validates too, so look the path up under the root directly.
+    assert not (store.root / namespace).exists()
 
 
 def test_write_rejects_empty_map(tmp_path):
@@ -196,3 +197,136 @@ def test_owner_of(tmp_path):
     assert store.owner_of(None) is None
     # A path outside the root.
     assert store.owner_of(str(tmp_path / "elsewhere")) is None
+
+
+# --- 10E (10.20): the source store under a server reference -----------------
+#
+# Guarded invariant: OpTouchesOnlyOwnPaths
+# (specs/tla/multi_user_access_lifecycle.tla, negative config
+# multi_user_access_lifecycle_nskeyed.cfg).
+
+from keyed_stores import BAD_REFS, tree
+
+REF = "demo@alice"
+
+
+def test_directory_and_file_modes_under_a_user_reference(tmp_path):
+    """Directory and file modes, for reference `demo@alice`."""
+    store = _store(tmp_path)
+    path = store.write(REF, {"pkg/__init__.py": "", "pkg/server.py": "..."})
+    assert path == tmp_path / "servers" / REF
+    assert _mode(path) == 0o700 and _mode(path / "pkg") == 0o700
+    assert _mode(path / "pkg" / "__init__.py") == 0o600
+    assert _mode(path / "pkg" / "server.py") == 0o600
+
+
+def test_a_symlink_at_the_final_path_is_refused_under_a_user_reference(tmp_path):
+    """A symlink at the final path is refused: the link target is unchanged
+    and no `.tmp` directory remains."""
+    store = _store(tmp_path)
+    root = tmp_path / "servers"
+    root.mkdir(mode=0o700)
+    target = tmp_path / "outside"
+    target.mkdir()
+    (target / "keep.py").write_text("keep")
+    os.symlink(target, root / REF)
+    before = tree(target)
+    with pytest.raises(ValueError):
+        store.write(REF, {"main.py": "x"})
+    assert tree(target) == before
+    assert not (root / f"{REF}.tmp").exists()
+
+
+def test_remove_of_an_absent_directory_under_a_user_reference(tmp_path):
+    """Remove of an absent directory returns without error."""
+    _store(tmp_path).remove(REF)
+
+
+def test_leftover_staging_directory_is_replaced_under_a_user_reference(tmp_path):
+    """Leftover staging directory is replaced: the final directory holds
+    exactly the new files."""
+    store = _store(tmp_path)
+    stale = tmp_path / "servers" / f"{REF}.tmp"
+    stale.mkdir(parents=True)
+    (stale / "stray.py").write_text("stale")
+    path = store.write(REF, {"main.py": "ok"})
+    assert sorted(p.name for p in path.iterdir()) == ["main.py"]
+
+
+def test_second_write_replaces_the_tree_under_a_user_reference(tmp_path):
+    """Second write replaces the tree: `b.py` is gone."""
+    store = _store(tmp_path)
+    store.write(REF, {"a.py": "1", "b.py": "2"})
+    path = store.write(REF, {"a.py": "3"})
+    assert sorted(p.name for p in path.iterdir()) == ["a.py"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory modes")
+def test_failed_staging_leaves_the_old_tree_under_a_user_reference(tmp_path):
+    """Failed staging leaves the old tree: a filesystem error during staging
+    (the store root is read-only) keeps `servers/demo@alice` unchanged."""
+    store = _store(tmp_path)
+    store.write(REF, {"a.py": "1", "b.py": "2"})
+    root = tmp_path / "servers"
+    before = tree(root / REF)
+    os.chmod(root, 0o500)
+    try:
+        with pytest.raises(OSError):
+            store.write(REF, {"c.py": "3"})
+    finally:
+        os.chmod(root, 0o700)
+    assert tree(root / REF) == before
+
+
+def test_remove_of_a_user_server_keeps_the_admin_tree(tmp_path):
+    """Remove of a user server keeps the admin tree (F2): `github`,
+    `github.tmp`, and `github.old` do not change.
+    Invariant: OpTouchesOnlyOwnPaths."""
+    store = _store(tmp_path)
+    store.write("github", {"main.py": "admin"})
+    store.write("github@alice", {"main.py": "alice"})
+    root = tmp_path / "servers"
+    for suffix in (".tmp", ".old"):
+        (root / f"github{suffix}").mkdir(mode=0o700)
+        (root / f"github{suffix}" / "f.py").write_text(suffix)
+    admin = {n: tree(root / n) for n in ("github", "github.tmp", "github.old")}
+    store.remove("github@alice")
+    assert not (root / "github@alice").exists()
+    assert {n: tree(root / n) for n in admin} == admin
+
+
+def test_a_user_reference_is_accepted(tmp_path):
+    """A user reference is accepted: its path is `servers/github@alice`."""
+    store = _store(tmp_path)
+    assert store.path_for("github@alice") == tmp_path / "servers" / "github@alice"
+
+
+@pytest.mark.parametrize("ref", BAD_REFS)
+def test_path_traversal_in_the_owner_id_is_refused(tmp_path, ref):
+    """Path traversal in the owner id is refused: `remove`, `write`, and
+    `path_for` raise `ValueError`, and no path under or above `servers/`
+    changes. Invariant: OpTouchesOnlyOwnPaths."""
+    store = _store(tmp_path)
+    store.write("github", {"main.py": "admin"})
+    for rel in ("servers/x/f.py", "servers/github@alice/x/f.py",
+                "servers/%2f/f.py", "tokens/keep.json", "x/f.py"):
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text(rel)
+    before = tree(tmp_path)
+    for call in (lambda: store.remove(ref),
+                 lambda: store.write(ref, {"main.py": "x"}),
+                 lambda: store.path_for(ref)):
+        with pytest.raises(ValueError):
+            call()
+    assert tree(tmp_path) == before
+
+
+def test_a_symlinked_user_directory_is_not_owned_by_the_user(tmp_path):
+    """A symlink at `servers/x@alice` that points at `servers/github` is not
+    the directory of `x@alice`: `owns` resolves it and refuses."""
+    store = _store(tmp_path)
+    store.write("github", {"main.py": "admin"})
+    link = tmp_path / "servers" / "x@alice"
+    os.symlink(tmp_path / "servers" / "github", link)
+    assert store.owns(str(link), "x@alice") is False
+    assert store.owner_of(str(link)) == "github"

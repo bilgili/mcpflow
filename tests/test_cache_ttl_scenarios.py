@@ -22,7 +22,7 @@ from test_visibility import call_log
 
 from mcpflow.catalog import SpecTemplate
 from mcpflow.config import ConfigError
-from mcpflow.registry import Registry, RegistryError, spec_from_dict
+from mcpflow.registry import Registry, RegistryError, ServerKey, spec_from_dict
 
 
 def _custom(ns: str, **extra) -> dict:
@@ -62,12 +62,12 @@ def test_every_accepted_cache_ttl_survives_a_restart(tmp_path, value):
     except RegistryError:
         return
     path = tmp_path / "servers.json"
-    reg = Registry(path)
+    reg = Registry(path, path.with_name("user_servers.json"))
     reg.load()
     reg.add(spec)
-    again = Registry(path)
+    again = Registry(path, path.with_name("user_servers.json"))
     again.load()
-    assert again.get("skills").cache_ttl == spec.cache_ttl
+    assert again.get(ServerKey(None, "skills")).cache_ttl == spec.cache_ttl
 
 
 def test_negative_zero_is_not_below_zero(tmp_path):
@@ -78,25 +78,25 @@ def test_negative_zero_is_not_below_zero(tmp_path):
 
 
 def test_update_takes_a_new_caller_value(tmp_path):
-    reg = Registry(tmp_path / "servers.json")
+    reg = Registry(tmp_path / "servers.json", tmp_path / "user_servers.json")
     reg.load()
     reg.add(spec_from_dict(_custom("skills")))
     reg.update(spec_from_dict(_custom("skills", cache_ttl=5)))
-    assert reg.get("skills").cache_ttl == 5.0
+    assert reg.get(ServerKey(None, "skills")).cache_ttl == 5.0
 
 
 def test_registry_owned_mutators_keep_cache_ttl(tmp_path):
     # design.md path table: `_replace` preserves the field.
     path = tmp_path / "servers.json"
-    reg = Registry(path)
+    reg = Registry(path, path.with_name("user_servers.json"))
     reg.load()
     reg.add(spec_from_dict(_custom("skills", cache_ttl=0)))
-    reg.set_enabled("skills", False)
-    reg.set_muted("skills", True)
-    reg.set_tool_muted("skills", "get_current_time", True)
-    again = Registry(path)
+    reg.set_enabled(ServerKey(None, "skills"), False)
+    reg.set_muted(ServerKey(None, "skills"), True)
+    reg.set_tool_muted(ServerKey(None, "skills"), "get_current_time", True)
+    again = Registry(path, path.with_name("user_servers.json"))
     again.load()
-    assert again.get("skills").cache_ttl == 0.0
+    assert again.get(ServerKey(None, "skills")).cache_ttl == 0.0
 
 
 def test_catalog_entry_can_set_cache_ttl():
@@ -109,7 +109,7 @@ def test_catalog_entry_can_set_cache_ttl():
 # --- Admin API: PUT ---------------------------------------------------------
 
 
-def test_put_sets_and_omitted_resets_to_null(api):  # noqa: F811
+def test_put_sets_and_omitted_resets_to_null(api):
     a = api()
     body = _custom("skills", enabled=False)
     assert a.client.post("/api/servers", json=body, headers=a.headers).status_code == 201
@@ -124,7 +124,7 @@ def test_put_sets_and_omitted_resets_to_null(api):  # noqa: F811
     assert disk["cache_ttl"] is None
 
 
-def test_put_negative_400_names_cache_ttl(api):  # noqa: F811
+def test_put_negative_400_names_cache_ttl(api):
     a = api()
     body = _custom("skills", enabled=False)
     a.client.post("/api/servers", json=body, headers=a.headers)
@@ -182,9 +182,9 @@ def test_edit_form_blank_clears_to_inherit(server_factory):
         assert client.post("/servers/skills", data=form).status_code == 303
     finally:
         client.close()
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    assert reg.get("skills").cache_ttl is None
+    assert reg.get(ServerKey(None, "skills")).cache_ttl is None
 
 
 @pytest.mark.parametrize("bad", ["-1", "abc", "nan"])
@@ -200,7 +200,7 @@ def test_add_form_bad_value_400_names_cache_ttl(server_factory, bad):
         client.close()
     assert resp.status_code == 400
     assert "cache_ttl" in resp.text
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
     assert [s.namespace for s in reg.list()] == []
 

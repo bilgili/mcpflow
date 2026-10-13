@@ -22,7 +22,7 @@ import re
 
 import pytest
 from action_browser import action_post, control
-from conftest import fake_child_spec
+from conftest import ADMIN_ACTOR, fake_child_spec
 from test_child_actions import (
     PAGE,
     SECRET,
@@ -37,6 +37,7 @@ from test_child_actions import (
 from test_supervisor import make_supervisor  # noqa: F401 -- async fixture
 
 from mcpflow.actions import redact, redact_schema, secret_literals
+from mcpflow.registry import ServerKey
 from mcpflow.supervisor import ActionRun, LeaseRefused, Supervisor
 
 VIS_OFF = {"fastmcp": {"_internal": {"visibility": False}}}
@@ -73,12 +74,12 @@ def _result_text(body: str) -> str:
 
 
 @pytest.mark.asyncio
-async def test_f1_run_action_single_listing(make_supervisor):  # noqa: F811
+async def test_f1_run_action_single_listing(make_supervisor):
     """One submit does exactly one listing and one call on one lease, and it
     calls the raw result API (`call_tool_mcp`), never the parsing `call_tool`,
     so no second name resolution runs."""
     sup = make_supervisor()
-    child = await sup.add(store_spec())
+    child = await sup.add(store_spec(), ADMIN_ACTOR)
     await child.task
     client = child.session.client
     assert client is not None, "stdio generation must own a client"
@@ -106,7 +107,7 @@ async def test_f1_run_action_single_listing(make_supervisor):  # noqa: F811
     client.call_tool_mcp = w_mcp
     client.call_tool = w_call
 
-    run = await sup.run_action("store", "set_writable", {"name": "s3main"})
+    run = await sup.run_action(ServerKey(None, "store"), "set_writable", {"name": "s3main"}, ADMIN_ACTOR)
     # A4 F1: run_action returns an ActionRun; kind "ran" carries the raw result.
     assert run.kind == "ran" and not run.result.is_error
     # One listing, one raw call, and never the parsing call_tool.
@@ -119,16 +120,16 @@ async def test_f1_run_action_single_listing(make_supervisor):  # noqa: F811
 
 
 @pytest.mark.asyncio
-async def test_f2_parse_failure_logs_no_posted_secret(make_supervisor, caplog):  # noqa: F811
+async def test_f2_parse_failure_logs_no_posted_secret(make_supervisor, caplog):
     """Scenario "A parse failure logs no posted secret": the child returns the
     posted password in a field whose declared type fails the structured-result
     parser. `run_action` uses the raw API that runs no parser, so no log line
     holds the secret, and it returns the raw result carrying it."""
     sup = make_supervisor()
-    child = await sup.add(more_spec())
+    child = await sup.add(more_spec(), ADMIN_ACTOR)
     await child.task
     with caplog.at_level(logging.DEBUG):
-        run = await sup.run_action("store", "parse_fail", {"secret_key": SECRET})
+        run = await sup.run_action(ServerKey(None, "store"), "parse_fail", {"secret_key": SECRET}, ADMIN_ACTOR)
     # A4 F1: kind "ran"; the raw result carries the secret (no parser ran, no
     # exception logged it).
     assert run.kind == "ran"
@@ -141,7 +142,7 @@ def test_f2_transport_error_web_renders_redacted_400(server_factory, monkeypatch
     `RuntimeError` from `run_action` whose text carries a posted secret becomes
     a redacted 400 page error, not a 500, and no log line holds the secret."""
 
-    async def boom(self, ns, name, form, **kwargs):
+    async def boom(self, ns, name, form, actor, **kwargs):
         # A4 F1: run_action returns an ActionRun for every renderable outcome. A
         # transport failure carries RAW detail plus the full secret set; the web
         # boundary scrubs detail ONCE with run.secrets, so the secret masks.
@@ -172,7 +173,7 @@ def test_f2_lease_refusal_web_answers_503(server_factory, monkeypatch):
     """Scenario "A lease refusal answers 503": a `LeaseRefused` from
     `run_action` becomes a 503 redacted page error and runs no tool."""
 
-    async def refuse(self, ns, name, form, **kwargs):
+    async def refuse(self, ns, name, form, actor, **kwargs):
         # A4 F1: run_action catches LeaseRefused and returns kind "lease_refused".
         return ActionRun("lease_refused", frozenset(), frozenset(), None, "at capacity")
 
@@ -190,13 +191,13 @@ def test_f2_lease_refusal_web_answers_503(server_factory, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_f2_run_action_lease_refused_becomes_a_kind(make_supervisor, monkeypatch):  # noqa: F811
+async def test_f2_run_action_lease_refused_becomes_a_kind(make_supervisor, monkeypatch):
     """A4 F1: run_action catches a `LeaseRefused` at the lease and returns kind
     "lease_refused" carrying the RAW reason text (which holds no argument). The
     submit maps that kind to 503. Every renderable outcome is a returned
     ActionRun; only an unknown namespace raises (KeyError)."""
     sup = make_supervisor()
-    child = await sup.add(store_spec())
+    child = await sup.add(store_spec(), ADMIN_ACTOR)
     await child.task
 
     @contextlib.asynccontextmanager
@@ -205,7 +206,7 @@ async def test_f2_run_action_lease_refused_becomes_a_kind(make_supervisor, monke
         yield  # pragma: no cover
 
     monkeypatch.setattr(sup, "_lease", refuse)
-    run = await sup.run_action("store", "set_writable", {"name": "s3main"})
+    run = await sup.run_action(ServerKey(None, "store"), "set_writable", {"name": "s3main"}, ADMIN_ACTOR)
     assert run.kind == "lease_refused"
     assert "at capacity" in run.detail
     assert run.result is None
@@ -213,7 +214,7 @@ async def test_f2_run_action_lease_refused_becomes_a_kind(make_supervisor, monke
 
 @pytest.mark.asyncio
 async def test_f2_run_action_carries_raw_detail_and_full_set_on_transport_error(
-    make_supervisor,  # noqa: F811
+    make_supervisor,
     monkeypatch,
 ):
     """A4 F1/F3: the scrub moves to the WEB boundary. A transport failure carrying
@@ -221,7 +222,7 @@ async def test_f2_run_action_carries_raw_detail_and_full_set_on_transport_error(
     the configured secret in `secrets`, so the handler scrubs it ONCE with the
     full set. run_action no longer scrubs detail itself (no two-stage scrub)."""
     sup = make_supervisor()
-    child = await sup.add(store_spec(env={"API_KEY": SECRET}))
+    child = await sup.add(store_spec(env={"API_KEY": SECRET}), ADMIN_ACTOR)
     await child.task
     client = child.session.client
 
@@ -229,7 +230,7 @@ async def test_f2_run_action_carries_raw_detail_and_full_set_on_transport_error(
         raise RuntimeError(f"connection reset, token {SECRET}")
 
     monkeypatch.setattr(client, "call_tool_mcp", boom)
-    run = await sup.run_action("store", "set_writable", {"name": "s3main"})
+    run = await sup.run_action(ServerKey(None, "store"), "set_writable", {"name": "s3main"}, ADMIN_ACTOR)
     assert run.kind == "transport"
     # detail is RAW: the secret is present, unscrubbed, in run_action's return.
     assert SECRET in run.detail
@@ -394,14 +395,14 @@ def _mark_set_writable_disabled(client):
 
 
 @pytest.mark.asyncio
-async def test_f6_visibility_mark_disables_the_view(make_supervisor):  # noqa: F811
+async def test_f6_visibility_mark_disables_the_view(make_supervisor):
     """The page marks a child-disabled conforming action disabled with reason
     `muted`, even though no registry mute is set."""
     sup = make_supervisor()
-    child = await sup.add(store_spec())
+    child = await sup.add(store_spec(), ADMIN_ACTOR)
     await child.task
     _mark_set_writable_disabled(child.session.client)
-    views = {v.name: v for v in await sup.actions("store")}
+    views = {v.name: v for v in await sup.actions(ServerKey(None, "store"))}
     assert views["set_writable"].disabled is True
     assert views["set_writable"].reason == "muted"
     # A sibling with no mark stays enabled.
@@ -409,11 +410,11 @@ async def test_f6_visibility_mark_disables_the_view(make_supervisor):  # noqa: F
 
 
 @pytest.mark.asyncio
-async def test_f6_visibility_mark_refused_by_run_action(make_supervisor):  # noqa: F811
+async def test_f6_visibility_mark_refused_by_run_action(make_supervisor):
     """`run_action` refuses a child-disabled action with reason `muted` and
     calls no tool: the direct route runs only what the chain permits."""
     sup = make_supervisor()
-    child = await sup.add(store_spec())
+    child = await sup.add(store_spec(), ADMIN_ACTOR)
     await child.task
     _mark_set_writable_disabled(child.session.client)
     calls = []
@@ -425,7 +426,7 @@ async def test_f6_visibility_mark_refused_by_run_action(make_supervisor):  # noq
 
     child.session.client.call_tool_mcp = spy
     # A4 F1: run_action returns kind "muted" before it reaches call_tool_mcp.
-    run = await sup.run_action("store", "set_writable", {"name": "s3main"})
+    run = await sup.run_action(ServerKey(None, "store"), "set_writable", {"name": "s3main"}, ADMIN_ACTOR)
     assert run.kind == "muted"
     assert calls == []
 
@@ -434,7 +435,7 @@ def test_f6_marked_action_submit_answers_400_muted(server_factory, monkeypatch):
     """The submit of a child-disabled action answers 400 with
     `form_error = "muted"` and calls no tool (the run_action `muted` mapping)."""
 
-    async def muted(self, ns, name, form, **kwargs):
+    async def muted(self, ns, name, form, actor, **kwargs):
         # A4 F1: run_action returns kind "muted"; the handler maps it to 400 with
         # form_error "muted" and calls no tool.
         return ActionRun("muted", frozenset(), frozenset(), None, "")
@@ -455,15 +456,15 @@ def test_f6_marked_action_submit_answers_400_muted(server_factory, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_f7_malformed_root_no_view_and_run_action_unknown(make_supervisor, caplog):  # noqa: F811
+async def test_f7_malformed_root_no_view_and_run_action_unknown(make_supervisor, caplog):
     """A tagged tool with `required: [{}]` gets no view, logs one WARNING naming
     `schema`, and `run_action` returns kind `unknown` — the page and the submit
     never touch `set(required)`, so neither crashes."""
     sup = make_supervisor()
-    child = await sup.add(more_spec())
+    child = await sup.add(more_spec(), ADMIN_ACTOR)
     await child.task
     with caplog.at_level(logging.WARNING):
-        views = {v.name for v in await sup.actions("store")}
+        views = {v.name for v in await sup.actions(ServerKey(None, "store"))}
     assert "bad_root" not in views
     warnings = [
         r.getMessage()
@@ -473,7 +474,7 @@ async def test_f7_malformed_root_no_view_and_run_action_unknown(make_supervisor,
     assert len(warnings) == 1 and "schema" in warnings[0]
     # A4 F1: run_action returns kind "unknown" (a clause violator is not a
     # conforming action), never touching `set(required)`.
-    run = await sup.run_action("store", "bad_root", {"name": "x"})
+    run = await sup.run_action(ServerKey(None, "store"), "bad_root", {"name": "x"}, ADMIN_ACTOR)
     assert run.kind == "unknown"
 
 

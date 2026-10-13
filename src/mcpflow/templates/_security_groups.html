@@ -1,0 +1,110 @@
+{% from "_tags.html" import member_tags with context %}
+{# Create, edit members, and delete are dialogs opened from a `+ Create group`
+   button and a per-row menu, as in the Users section. The menu forms and the
+   dialogs are siblings: no form holds another form. The member picker posts
+   a delta (D5): `was` lists the boxes it rendered checked, `members` the
+   boxes checked at save. The reserved group `admins_group` has no menu: its
+   members change from the user list. A delete drops the grant rules of the
+   group first. A refused create sets `reopen`: the create dialog renders open
+   and shows the reason. #}
+<section id="groups">
+<h2>Groups</h2>
+<button type="button" class="create-btn" commandfor="create-group" command="show-modal">+ Create group</button>
+{% if error and section == 'groups' and not reopen %}<p class="error">{{ error }}</p>{% endif %}
+
+<table>
+  <thead>
+    <tr><th>Group</th><th>Members</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for g, ids in members.items() %}
+    <tr>
+      <td><code>{{ g }}</code></td>
+      <td>{{ member_tags(ids, group=g, back="groups") }}</td>
+      <td class="nowrap row-end">
+        {% if g == admins_group %}
+        <span class="muted small">reserved</span>
+        {% else %}
+        <button type="button" class="btn-sm menu-btn" popovertarget="group:{{ g }}:menu" aria-label="Actions for {{ g }}">⋯</button>
+        <div popover id="group:{{ g }}:menu" class="row-menu">
+          <button type="button" commandfor="group:{{ g }}:members" command="show-modal">Edit members</button>
+          <button type="button" class="danger" commandfor="group:{{ g }}:delete" command="show-modal">Delete</button>
+        </div>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+    {% if not members %}
+    <tr><td colspan="3" class="muted">No groups yet.</td></tr>
+    {% endif %}
+  </tbody>
+</table>
+
+<dialog id="create-group" class="userdlg"{{ ' open' if reopen == 'create-group' }}>
+  <form method="post" action="/groups">
+    <div class="dhead">
+      <h3>Create group</h3>
+      <button type="button" class="btn-sm close" commandfor="create-group" command="close" aria-label="Close">×</button>
+    </div>
+    {% if error and reopen == 'create-group' %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+    <div class="field">
+      <label for="g-name">Group name</label>
+      <input id="g-name" name="name" required placeholder="eng" autocapitalize="off" autocomplete="off">
+    </div>
+    <div class="pop-foot">
+      <span></span>
+      <span>
+        <button type="button" class="btn-sm" commandfor="create-group" command="close">Cancel</button>
+        <button type="submit" class="btn-sm">Create group</button>
+      </span>
+    </div>
+  </form>
+</dialog>
+
+{% for g, ids in members.items() if g != admins_group %}
+<dialog id="group:{{ g }}:members" class="userdlg">
+  <form method="post" action="/groups/{{ g }}/members">
+    <div class="dhead">
+      <h3>Edit members of <code>{{ g }}</code></h3>
+      <button type="button" class="btn-sm close" commandfor="group:{{ g }}:members" command="close" aria-label="Close">×</button>
+    </div>
+    <div class="field">
+      <label for="group:{{ g }}:members:filter">Users</label>
+      {# No element has the id `group:<name>:members:detached`, so the filter box has no
+         form owner: Enter in it submits nothing and it posts no field. #}
+      <input id="group:{{ g }}:members:filter" type="search" class="group-filter" form="group:{{ g }}:members:detached" placeholder="Filter users">
+      <div class="group-list">
+        {% for u in users | sort(attribute='id') %}
+        <label><input type="checkbox" name="members" value="{{ u.id }}"{{ ' checked' if u.id in ids }}> {{ u.id }}</label>
+        {% endfor %}
+      </div>
+      {% for uid in ids %}<input type="hidden" name="was" value="{{ uid }}">{% endfor %}
+    </div>
+    <div class="pop-foot">
+      <span class="count muted small">{{ ids | length }} selected</span>
+      <span>
+        <button type="button" class="btn-sm" commandfor="group:{{ g }}:members" command="close">Cancel</button>
+        <button type="submit" class="btn-sm">Save</button>
+      </span>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="group:{{ g }}:delete" class="confirmdlg">
+  <form method="post" action="/groups/{{ g }}/delete">
+    <div class="dhead">
+      <h3>Delete group</h3>
+      <button type="button" class="btn-sm close" commandfor="group:{{ g }}:delete" command="close" aria-label="Close">×</button>
+    </div>
+    <p>Delete <code>{{ g }}</code>? Its grant rules go with it and its {{ ids | length }} member{{ '' if ids | length == 1 else 's' }} leave{{ 's' if ids | length == 1 }} it. This cannot be undone.</p>
+    <div class="pop-foot">
+      <span></span>
+      <span>
+        <button type="button" class="btn-sm" commandfor="group:{{ g }}:delete" command="close">Cancel</button>
+        <button type="submit" class="btn-sm danger-fill">Delete</button>
+      </span>
+    </div>
+  </form>
+</dialog>
+{% endfor %}
+</section>

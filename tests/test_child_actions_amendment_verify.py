@@ -18,6 +18,7 @@ Fixture child: `fake_actions_sweep_child.py`.
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import logging
@@ -574,3 +575,40 @@ def test_result_shapes_follow_the_mirror_rule(server_factory):
             assert resp.status_code == 200, (tool, resp.text[:500])
             got[tool] = _result_pres(resp.text)
     assert got == RESULTS
+
+
+# --- the mute at the provider seam (fastmcp-4-0-11-hashed-lookup, gate finding 1) ---
+
+
+@pytest.mark.parametrize("capable", [False, True], ids=["plain-child", "action-child"])
+def test_hashed_lookup_of_a_muted_tool_is_none_at_the_provider_seam(capable):
+    """`AuthorizedHashProvider.get_tool_by_hash` with NO router and NO gateway,
+    on a child chain built as `Supervisor._build_provider` builds it. The admin
+    mute (`Visibility.names`, rewritten live by the supervisor) makes the lookup
+    answer `None`; clearing it brings the namespaced tool back. This is the D6
+    kill switch of the provider; `CallerRouter._passes` hides it above.
+    """
+    child = FastMCP("child")
+    ident = hash_tool("child", "x")
+
+    @child.tool(name="x", meta={"fastmcp": {"tool_hash": ident}, "ui": APP})
+    def x() -> str:
+        return "x"
+
+    provider = ProxyProvider(lambda: Client(child), cache_ttl=0)
+    if capable:
+        provider.add_transform(ActionScopeFilter())
+    vis = Visibility(False, names=set())
+    chain = provider.wrap_transform(vis).wrap_transform(Namespace("c"))
+    outer = AuthorizedHashProvider(chain, "c")
+
+    async def lookup():
+        return await outer.get_tool_by_hash(ident, "x")
+
+    found = asyncio.run(lookup())
+    assert found is not None and found.name == "c_x"  # control: unmuted
+    vis.names = {"x"}  # the admin mutes `x`
+    assert asyncio.run(lookup()) is None
+    vis.names = set()  # the admin clears the mute
+    cleared = asyncio.run(lookup())
+    assert cleared is not None and cleared.name == "c_x"

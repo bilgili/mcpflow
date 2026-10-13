@@ -7,6 +7,8 @@ real `uvx`/`npx` child, so no test needs the network.
 
 from __future__ import annotations
 
+import asyncio
+import os
 import sys
 import threading
 import time
@@ -17,10 +19,52 @@ import httpx
 import pytest
 import uvicorn
 
+from mcpflow.auth import hash_password
 from mcpflow.config import Settings, load_settings
+from mcpflow.identity import ADMINS_GROUP, BOOTSTRAP_ADMIN_ID, User
 from mcpflow.registry import Registry, ServerSpec
 
 FAKE_SERVER = str(Path(__file__).parent / "fake_mcp_server.py")
+
+
+def pytest_configure(config) -> None:
+    # Informational only: a `slow` test runs in the normal suite.
+    config.addinivalue_line("markers", "slow: a slow test; it still runs by default")
+
+# The bootstrap admin as an actor, for a test that calls an owner directly.
+# Production code passes the user of the request; only tests build one.
+ADMIN_ACTOR = User(
+    id=BOOTSTRAP_ADMIN_ID,
+    name=BOOTSTRAP_ADMIN_ID,
+    groups=frozenset({ADMINS_GROUP}),
+    provider="local",
+)
+
+
+def make_user(
+    owner, uid: str, password: str = "pw-for-tests", *, iterations: int = 1000, **kw
+) -> User:
+    """Create an ACTIVE local user that signs in with `password`.
+
+    `owner` is a `LocalIdentityProvider` or an `AccessPolicy` (the policy
+    path creates the user as `ADMIN_ACTOR`). The helper redeems the setup
+    code the way the setup page does: `check_setup_code`, then
+    `replace_credential` with a hash of `iterations` rounds (the production
+    default is 600000; a test of the verify cost passes it). `kw` is `name`,
+    `admin`, `groups`.
+    """
+    if hasattr(owner, "local_identity"):
+        local = owner.local_identity()
+        _, code = owner.create_user(ADMIN_ACTOR, uid, **kw)
+    else:
+        local = owner
+        _, code = local._create_user(uid, **kw)
+    state = local.check_setup_code(uid, code)
+    assert state is not None, f"fresh setup code for {uid} must verify"
+    assert local.replace_credential(uid, state, hash_password(password, iterations=iterations))
+    user = local.get_user(uid)
+    assert user is not None
+    return user
 
 
 def fake_child_spec(
@@ -147,9 +191,69 @@ def server_factory(tmp_path: Path):
 
 def seed_registry(*specs: ServerSpec) -> Callable[[Path], None]:
     def _seed(data_dir: Path) -> None:
-        reg = Registry(data_dir / "servers.json")
+        reg = Registry(data_dir / "servers.json", data_dir / "user_servers.json")
         reg.load()
         for spec in specs:
             reg.add(spec)
 
     return _seed
+
+
+def make_policy(data_dir: Path, registry: Registry):
+    """An `AccessPolicy` over `registry` with the bootstrap `admin` only.
+
+    For a test that builds a `Supervisor` by hand. The stores live in
+    `data_dir`, beside the registry files.
+    """
+    from mcpflow.auth import TokenStore, hash_password
+    from mcpflow.identity import LocalIdentityProvider
+    from mcpflow.policy import AccessPolicy, RuleStore
+
+    identity = LocalIdentityProvider(
+        data_dir / "users.json", hash_password("secret", iterations=1000)
+    )
+    identity.load()
+    tokens = TokenStore(data_dir / "tokens.json", data_dir / "user_tokens.json")
+    tokens.load()
+    rules = RuleStore(data_dir / "rules.json")
+    rules.load()
+    return AccessPolicy(identity, rules, tokens, registry)
+
+
+def admin_reach(sup, surface: str = "dashboard"):
+    """The `Reach` of the bootstrap admin on `surface`, for a hand-built
+    supervisor. `tools` and `instructions_blocks` require one."""
+    return sup.policy.keys_for(ADMIN_ACTOR, surface)
+
+
+async def run_stale_probe(sup, reach, session) -> None:
+    """Make the snapshot of `session` stale, render once, and await the probe
+    that render started, with a 15 s bound (dashboard-tool-snapshot D3/D4).
+
+    The render pass has no await after `_schedule_probe`, so the task is still
+    in `session.probe` when `tools` returns."""
+    session.probed_at = None
+    await sup.tools(reach)
+    task = session.probe
+    assert task is not None, "the stale render started no probe"
+    await asyncio.wait_for(task, 15)
+
+
+@pytest.fixture
+def users_writes(monkeypatch):
+    """Count the writes of `users.json`: each `os.replace` onto it.
+
+    `{"n": <count>}`; a test resets `n` to 0 after its setup. The count rests
+    on the write contract (temporary file plus `os.replace`), not on a
+    private name.
+    """
+    log = {"n": 0}
+    real = os.replace
+
+    def replace(src, dst, *a, **k):
+        if Path(dst).name == "users.json":
+            log["n"] += 1
+        return real(src, dst, *a, **k)
+
+    monkeypatch.setattr(os, "replace", replace)
+    return log

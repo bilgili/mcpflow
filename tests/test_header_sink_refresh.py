@@ -12,12 +12,15 @@ waits on a real timer. The D8 pin test runs a real FastMCP HTTP server.
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
+import math
 import os
 import stat
 import threading
 import time
+import types
 from pathlib import Path
 from urllib.parse import parse_qsl
 
@@ -25,7 +28,7 @@ import httpx
 import pytest
 import pytest_asyncio
 import uvicorn
-from conftest import make_settings
+from conftest import ADMIN_ACTOR, make_policy, make_settings
 
 from mcpflow import oauth as oauth_mod
 from mcpflow.oauth import (
@@ -37,7 +40,7 @@ from mcpflow.oauth import (
     check_token_response,
     refresh_state,
 )
-from mcpflow.registry import Registry, ServerSpec
+from mcpflow.registry import Registry, ServerKey, ServerSpec
 from mcpflow.supervisor import Supervisor
 
 TOKEN_URL = "https://webapi.moomoo.com/oauth2/token"
@@ -45,6 +48,8 @@ HEADER = HeaderSpec("Authorization", "Bearer", TOKEN_URL)
 CLIENT = ClientCreds("moomoo-client", "")
 T0 = 1_000_000.0
 PROVIDERS = Path(oauth_mod.__file__).parent / "catalog" / "providers"
+# The admin-owned key; its reference, the credential directory, is `moomoo`.
+MOO = ServerKey(None, "moomoo")
 
 
 class FakeTime:
@@ -121,12 +126,15 @@ async def make_sup(tmp_path):
     def _make(*specs: ServerSpec, data_dir=None) -> Supervisor:
         data_dir = data_dir or tmp_path / f"sup{len(created)}"
         data_dir.mkdir(exist_ok=True)
-        reg = Registry(data_dir / "servers.json")
+        reg = Registry(data_dir / "servers.json", data_dir / "user_servers.json")
         reg.load()
         for spec in specs:
             if spec.namespace not in {s.namespace for s in reg.list()}:
                 reg.add(spec)
-        sup = Supervisor(reg, make_settings(data_dir), CredStore(data_dir), PendingFlows())
+        sup = Supervisor(
+            reg, make_settings(data_dir), CredStore(data_dir), PendingFlows(),
+            make_policy(data_dir, reg),
+        )
         created.append(sup)
         return sup
 
@@ -183,11 +191,11 @@ async def _until(pred, rounds: int = 2000) -> None:
 
 
 def _header(sup: Supervisor) -> str | None:
-    return sup.registry.get("moomoo").headers.get("Authorization")
+    return sup.registry.get(MOO).headers.get("Authorization")
 
 
 async def _connect(sup: Supervisor, tokens: dict, reauth: bool = False) -> bool:
-    flow = sup.flows.create("moomoo", "moomoo", CLIENT, reauth=reauth)
+    flow = sup.flows.create("moomoo", "moomoo", CLIENT, ADMIN_ACTOR, reauth=reauth)
     return await sup.finish_oauth(flow, None, tokens, reauth=reauth, header=HEADER)
 
 
@@ -196,7 +204,7 @@ async def _connected(make_sup, fake_time, enabled: bool = False) -> Supervisor:
     sup = make_sup(_moomoo())
     assert await _connect(sup, _tokens(1))
     if not enabled:
-        await sup.disable("moomoo")
+        await sup.disable(MOO, ADMIN_ACTOR)
     await _until(lambda: len(fake_time.sleeps) == 1)
     return sup
 
@@ -233,7 +241,7 @@ def test_builtin_providers_public_client_flags():
 
 
 def _flow(secret: str):
-    return PendingFlows().create("ns", "e", ClientCreds("cid", secret))
+    return PendingFlows().create("ns", "e", ClientCreds("cid", secret), ADMIN_ACTOR)
 
 
 def test_token_request_omits_the_empty_secret():
@@ -313,8 +321,8 @@ async def test_public_client_callback_writes_the_refresh_file(make_sup, fake_tim
     assert not sup.creds.paths("moomoo").client.exists()
     assert not sup.creds.paths("moomoo").token.exists()
     assert _header(sup) == "Bearer ACCESS1xyz"
-    assert "moomoo" in sup._refresh_tasks
-    assert sup.get("moomoo").grant == 1
+    assert MOO in sup._refresh_tasks
+    assert sup.get(MOO).grant == 1
 
 
 @pytest.mark.asyncio
@@ -322,26 +330,26 @@ async def test_no_refresh_token_means_no_file(make_sup, fake_time):
     sup = make_sup(_moomoo())
     assert await _connect(sup, _tokens(1, refresh=False))
     assert not sup.creds.refresh_path("moomoo").exists()
-    assert "moomoo" not in sup._refresh_tasks
+    assert MOO not in sup._refresh_tasks
     assert _header(sup) == "Bearer ACCESS1xyz"
 
 
 @pytest.mark.asyncio
 async def test_reauth_without_refresh_token_deletes_the_refresh_file(make_sup, fake_time):
     sup = await _connected(make_sup, fake_time)
-    old_task = sup._refresh_tasks["moomoo"]
+    old_task = sup._refresh_tasks[MOO]
     assert await _connect(sup, _tokens(2, refresh=False), reauth=True)
     assert not sup.creds.refresh_path("moomoo").exists()
     assert _header(sup) == "Bearer ACCESS2xyz"
     await asyncio.sleep(0)
     assert old_task.cancelled() or old_task.done()
-    assert "moomoo" not in sup._refresh_tasks
+    assert MOO not in sup._refresh_tasks
 
 
 @pytest.mark.asyncio
 async def test_confidential_header_sink_writes_no_file(make_sup, fake_time):
     sup = make_sup(_moomoo())
-    flow = sup.flows.create("moomoo", "moomoo", ClientCreds("c", "s"))
+    flow = sup.flows.create("moomoo", "moomoo", ClientCreds("c", "s"), ADMIN_ACTOR)
     assert await sup.finish_oauth(flow, None, _tokens(1), header=HeaderSpec("Authorization", "Bearer"))
     assert not (sup.creds.root / "moomoo").exists()
     assert not sup._refresh_tasks
@@ -382,14 +390,14 @@ async def test_no_expiry_schedules_no_refresh(make_sup, fake_time, endpoint):
     sup = make_sup(_moomoo(oauth_pending=False))
     _state(sup, 1, expires_at=None)
     await sup.startup()
-    await _until(lambda: "moomoo" not in sup._refresh_tasks)
+    await _until(lambda: MOO not in sup._refresh_tasks)
     assert fake_time.sleeps == [] and endpoint.bodies == []
 
 
 @pytest.mark.asyncio
 async def test_refresh_renews_the_header_without_a_restart(make_sup, fake_time, endpoint):
     sup = await _connected(make_sup, fake_time)
-    child = sup.get("moomoo")
+    child = sup.get(MOO)
     endpoint.script.append((200, _tokens(2)))
     fake_time.release()
     await _until(lambda: _header(sup) == "Bearer ACCESS2xyz")
@@ -402,7 +410,7 @@ async def test_refresh_renews_the_header_without_a_restart(make_sup, fake_time, 
     assert state["access_token"] == "ACCESS2xyz" and state["refresh_token"] == "REFRESH2xyz"
     assert state["expires_at"] >= int(time.time()) + 7200 - 5
     # No restart: the same child, still stopped, no start task.
-    assert sup.get("moomoo") is child and child.status == "stopped" and child.task is None
+    assert sup.get(MOO) is child and child.status == "stopped" and child.task is None
 
 
 @pytest.mark.asyncio
@@ -417,13 +425,13 @@ async def test_refresh_without_refresh_token_keeps_the_stored_one(make_sup, fake
 @pytest.mark.asyncio
 async def test_a_disabled_child_keeps_its_grant_alive(make_sup, fake_time, endpoint):
     sup = await _connected(make_sup, fake_time, enabled=True)
-    await sup.disable("moomoo")  # disable leaves the task
-    assert "moomoo" in sup._refresh_tasks
+    await sup.disable(MOO, ADMIN_ACTOR)  # disable leaves the task
+    assert MOO in sup._refresh_tasks
     endpoint.script.append((200, _tokens(2)))
     fake_time.release()
     await _until(lambda: _header(sup) == "Bearer ACCESS2xyz")
     assert sup.creds.read_refresh("moomoo")["access_token"] == "ACCESS2xyz"
-    child = sup.get("moomoo")
+    child = sup.get(MOO)
     assert child.status == "stopped" and child.task is None and child.transport is None
     # Enable then starts the child with the refreshed header.
     seen: list[str] = []
@@ -432,7 +440,7 @@ async def test_a_disabled_child_keeps_its_grant_alive(make_sup, fake_time, endpo
         seen.append(sup.get(ns).spec.headers["Authorization"])
 
     sup._run_start = fake_start
-    await sup.enable("moomoo")
+    await sup.enable(MOO, ADMIN_ACTOR)
     await _until(lambda: seen)
     assert seen == ["Bearer ACCESS2xyz"]
 
@@ -443,8 +451,8 @@ async def test_a_rejected_refresh_stops_the_task(make_sup, fake_time, endpoint):
     before = sup.creds.refresh_path("moomoo").read_text()
     endpoint.script.append((400, {"error": "invalid_grant"}))
     fake_time.release()
-    await _until(lambda: "moomoo" not in sup._refresh_tasks)
-    assert sup.get("moomoo").last_error == "refresh rejected (400 invalid_grant); re-authorize"
+    await _until(lambda: MOO not in sup._refresh_tasks)
+    assert sup.get(MOO).last_error == "refresh rejected (400 invalid_grant); re-authorize"
     assert sup.creds.refresh_path("moomoo").read_text() == before
     assert _header(sup) == "Bearer ACCESS1xyz"
 
@@ -454,8 +462,8 @@ async def test_a_rejected_refresh_filters_the_error_word(make_sup, fake_time, en
     sup = await _connected(make_sup, fake_time)
     endpoint.script.append((403, {"error": "no <b>way</b>"}))
     fake_time.release()
-    await _until(lambda: "moomoo" not in sup._refresh_tasks)
-    assert sup.get("moomoo").last_error == "refresh rejected (403 nobwayb); re-authorize"
+    await _until(lambda: MOO not in sup._refresh_tasks)
+    assert sup.get(MOO).last_error == "refresh rejected (403 nobwayb); re-authorize"
 
 
 @pytest.mark.asyncio
@@ -465,8 +473,8 @@ async def test_an_echoed_refresh_token_stays_out_of_last_error(make_sup, fake_ti
     sup = await _connected(make_sup, fake_time)
     endpoint.script.append((400, {"error": "x" * 60 + "REFRESH1xyz" + "y" * 100}))
     fake_time.release()
-    await _until(lambda: "moomoo" not in sup._refresh_tasks)
-    err = sup.get("moomoo").last_error
+    await _until(lambda: MOO not in sup._refresh_tasks)
+    err = sup.get(MOO).last_error
     assert "REFRESH1" not in err and "RESH1xyz" not in err
     word = err.removeprefix("refresh rejected (400 ").removesuffix("); re-authorize")
     assert len(word) == 64 and word.startswith("x" * 60)
@@ -496,8 +504,8 @@ async def test_rate_limiting_retries_with_backoff_to_the_cap(make_sup, fake_time
     fake_time.release(6)
     await _until(lambda: len(fake_time.sleeps) == 7)
     assert fake_time.sleeps[1:] == [30, 60, 120, 240, 300, 300]
-    assert "moomoo" in sup._refresh_tasks
-    assert not (sup.get("moomoo").last_error or "").startswith("refresh rejected")
+    assert MOO in sup._refresh_tasks
+    assert not (sup.get(MOO).last_error or "").startswith("refresh rejected")
 
 
 @pytest.mark.asyncio
@@ -521,7 +529,7 @@ async def test_a_stale_grant_is_discarded_even_when_the_response_arrives(
 ):
     # I1 on its own: the response reaches the apply, but the grant moved.
     sup = await _connected(make_sup, fake_time)
-    child = sup.get("moomoo")
+    child = sup.get(MOO)
     endpoint.script.append((200, _tokens(9)))
     await child.lock.acquire()
     fake_time.release()
@@ -530,7 +538,7 @@ async def test_a_stale_grant_is_discarded_even_when_the_response_arrives(
         await asyncio.sleep(0)
     child.grant += 1
     child.lock.release()
-    await _until(lambda: "moomoo" not in sup._refresh_tasks)
+    await _until(lambda: MOO not in sup._refresh_tasks)
     assert sup.creds.read_refresh("moomoo")["access_token"] == "ACCESS1xyz"
     assert _header(sup) == "Bearer ACCESS1xyz"
 
@@ -538,13 +546,13 @@ async def test_a_stale_grant_is_discarded_even_when_the_response_arrives(
 @pytest.mark.asyncio
 async def test_a_remove_during_the_refresh_writes_nothing(make_sup, fake_time, endpoint):
     sup = await _connected(make_sup, fake_time)
-    task = sup._refresh_tasks["moomoo"]
+    task = sup._refresh_tasks[MOO]
     endpoint.gate = asyncio.Event()
     endpoint.script.append((200, _tokens(9)))
     fake_time.release()
     await endpoint.arrived.wait()
-    await sup.remove("moomoo")
-    assert "moomoo" not in sup._refresh_tasks
+    await sup.remove(MOO, ADMIN_ACTOR)
+    assert MOO not in sup._refresh_tasks
     endpoint.gate.set()
     for _ in range(50):
         await asyncio.sleep(0)
@@ -555,24 +563,24 @@ async def test_a_remove_during_the_refresh_writes_nothing(make_sup, fake_time, e
 @pytest.mark.asyncio
 async def test_a_remove_and_readd_during_the_refresh_writes_nothing(make_sup, fake_time, endpoint):
     sup = await _connected(make_sup, fake_time)
-    old = sup.get("moomoo")
+    old = sup.get(MOO)
     grant = old.grant
     state = sup.creds.read_refresh("moomoo")
     # A refresh round of the old grant that `remove` cannot cancel: it is not
     # the table's task, so only the grant and identity guard stands in its way.
     endpoint.gate = asyncio.Event()
     endpoint.script.append((200, _tokens(9)))
-    round_ = asyncio.create_task(sup._refresh_once("moomoo", old, grant, state))
+    round_ = asyncio.create_task(sup._refresh_once(MOO, old, grant, state))
     await endpoint.arrived.wait()
     # The real remove, then the real add and connect.
-    await sup.remove("moomoo")
-    new = await sup.add(_moomoo())
+    await sup.remove(MOO, ADMIN_ACTOR)
+    new = await sup.add(_moomoo(), ADMIN_ACTOR)
     assert await _connect(sup, _tokens(2))
-    assert new is sup.get("moomoo") and new is not old
+    assert new is sup.get(MOO) and new is not old
     # The new counter equals the captured one: identity alone must reject.
     assert new.grant == grant
     endpoint.gate.set()
-    assert await round_ is None
+    assert await round_ is False
     assert sup.creds.read_refresh("moomoo")["access_token"] == "ACCESS2xyz"
     assert _header(sup) == "Bearer ACCESS2xyz"
 
@@ -580,10 +588,10 @@ async def test_a_remove_and_readd_during_the_refresh_writes_nothing(make_sup, fa
 @pytest.mark.asyncio
 async def test_remove_bumps_the_grant_and_cancels_the_task(make_sup, fake_time):
     sup = await _connected(make_sup, fake_time)
-    child = sup.get("moomoo")
-    task = sup._refresh_tasks["moomoo"]
+    child = sup.get(MOO)
+    task = sup._refresh_tasks[MOO]
     grant = child.grant
-    await sup.remove("moomoo")
+    await sup.remove(MOO, ADMIN_ACTOR)
     await asyncio.sleep(0)
     assert child.grant == grant + 1 and task.cancelled()
     assert not sup._refresh_tasks
@@ -592,12 +600,12 @@ async def test_remove_bumps_the_grant_and_cancels_the_task(make_sup, fake_time):
 @pytest.mark.asyncio
 async def test_a_replaced_task_does_not_drop_its_successor(make_sup, fake_time):
     sup = await _connected(make_sup, fake_time)
-    old = sup._refresh_tasks["moomoo"]
+    old = sup._refresh_tasks[MOO]
     assert await _connect(sup, _tokens(2), reauth=True)
-    new = sup._refresh_tasks["moomoo"]
+    new = sup._refresh_tasks[MOO]
     for _ in range(20):
         await asyncio.sleep(0)
-    assert old.done() and sup._refresh_tasks.get("moomoo") is new
+    assert old.done() and sup._refresh_tasks.get(MOO) is new
 
 
 @pytest.mark.asyncio
@@ -624,13 +632,13 @@ async def test_startup_repairs_a_header_after_a_crash_between_the_writes(
     _state(sup, 2)
     await sup.startup()
     assert _header(sup) == "Bearer ACCESS2xyz"
-    assert sup.get("moomoo").spec.headers["Authorization"] == "Bearer ACCESS2xyz"
-    reg = Registry(data_dir / "servers.json")
+    assert sup.get(MOO).spec.headers["Authorization"] == "Bearer ACCESS2xyz"
+    reg = Registry(data_dir / "servers.json", data_dir / "user_servers.json")
     reg.load()
-    assert reg.get("moomoo").headers["Authorization"] == "Bearer ACCESS2xyz"
+    assert reg.get(MOO).headers["Authorization"] == "Bearer ACCESS2xyz"
     await _until(lambda: fake_time.sleeps)
     assert endpoint.bodies == []
-    assert "moomoo" in sup._refresh_tasks
+    assert MOO in sup._refresh_tasks
 
 
 @pytest.mark.asyncio
@@ -661,7 +669,7 @@ async def test_startup_drops_an_orphan_credential_directory(make_sup, fake_time)
 @pytest.mark.asyncio
 async def test_shutdown_cancels_every_task(make_sup, fake_time):
     sup = await _connected(make_sup, fake_time)
-    task = sup._refresh_tasks["moomoo"]
+    task = sup._refresh_tasks[MOO]
     await sup.shutdown()
     assert task.cancelled() and not sup._refresh_tasks
 
@@ -696,7 +704,7 @@ def _serve_fake_remote(transport: str = "http"):
 
 
 async def _whoami(sup: Supervisor) -> str:
-    async with sup._lease(sup.get("moomoo")) as client:
+    async with sup._lease(sup.get(MOO)) as client:
         result = await client.call_tool("whoami", {})
     return result.content[0].text
 
@@ -710,7 +718,7 @@ async def test_the_next_call_after_a_refresh_sends_the_new_header(
     try:
         sup = make_sup(_moomoo(url=url, transport=transport))
         assert await _connect(sup, _tokens(1))  # connect enables and starts
-        child = sup.get("moomoo")
+        child = sup.get(MOO)
         for _ in range(400):
             if child.status == "running":
                 break
@@ -765,14 +773,14 @@ async def test_a_provider_turned_confidential_deletes_the_refresh_file(make_sup,
     # MED-2: a re-authorization whose provider is now confidential passes no
     # refresh token URL. The old grant's file must not outlive it.
     sup = await _connected(make_sup, fake_time)
-    old_task = sup._refresh_tasks["moomoo"]
-    flow = sup.flows.create("moomoo", "moomoo", ClientCreds("c", "s"), reauth=True)
+    old_task = sup._refresh_tasks[MOO]
+    flow = sup.flows.create("moomoo", "moomoo", ClientCreds("c", "s"), ADMIN_ACTOR, reauth=True)
     assert await sup.finish_oauth(
         flow, None, _tokens(2), reauth=True, header=HeaderSpec("Authorization", "Bearer")
     )
     await asyncio.sleep(0)
     assert not sup.creds.refresh_path("moomoo").exists()
-    assert "moomoo" not in sup._refresh_tasks and old_task.done()
+    assert MOO not in sup._refresh_tasks and old_task.done()
     assert _header(sup) == "Bearer ACCESS2xyz"
 
 
@@ -794,8 +802,8 @@ async def test_an_unexpected_error_keeps_the_task_alive(make_sup, fake_time, end
     fake_time.release()
     await _until(lambda: len(fake_time.sleeps) == 2)
     assert fake_time.sleeps[1] == 30
-    assert sup.get("moomoo").last_error == "refresh failed (OSError); retrying"
-    assert "moomoo" in sup._refresh_tasks
+    assert sup.get(MOO).last_error == "refresh failed (OSError); retrying"
+    assert MOO in sup._refresh_tasks
     fake_time.release()
     await _until(lambda: _header(sup) == "Bearer ACCESS3xyz")
 
@@ -812,25 +820,24 @@ async def test_an_invalid_token_url_keeps_the_task_alive(make_sup, fake_time, mo
     fake_time.release(2)
     await _until(lambda: len(fake_time.sleeps) == 3)
     assert fake_time.sleeps[1:] == [30, 60]
-    assert sup.get("moomoo").last_error == "refresh failed (InvalidURL); retrying"
-    assert "moomoo" in sup._refresh_tasks
+    assert sup.get(MOO).last_error == "refresh failed (InvalidURL); retrying"
+    assert MOO in sup._refresh_tasks
 
 
 @pytest.mark.asyncio
-async def test_a_corrupt_expiry_retries_and_heals(make_sup, fake_time, endpoint):
-    # MED-3: a non-numeric `expires_at` in the file.
+async def test_a_corrupt_expiry_is_an_unreadable_file(make_sup, fake_time, endpoint):
+    # D6, D11: `read_refresh` rejects a non-numeric `expires_at`, so startup
+    # records the rejection and starts no task.
     sup = make_sup(_moomoo(oauth_pending=False))
     _state(sup, 1, expires_at=None)
     state = sup.creds.read_refresh("moomoo")
     sup.creds.write_refresh("moomoo", {**state, "expires_at": "soon"})
     await sup.startup()
-    await _until(lambda: fake_time.sleeps)
-    assert fake_time.sleeps == [30]
-    assert sup.get("moomoo").last_error == "refresh failed (TypeError); retrying"
-    endpoint.script.append((200, _tokens(2)))
-    fake_time.release()
-    await _until(lambda: _header(sup) == "Bearer ACCESS2xyz")
-    assert isinstance(sup.creds.read_refresh("moomoo")["expires_at"], int)
+    child = sup.get(MOO)
+    assert child.last_error == "refresh.json unreadable; re-authorize"
+    assert child.refresh_rejected == child.last_error
+    assert MOO not in sup._refresh_tasks
+    assert fake_time.sleeps == [] and endpoint.bodies == []
 
 
 @pytest.mark.asyncio
@@ -840,14 +847,14 @@ async def test_a_rejection_survives_a_successful_start(make_sup, fake_time, endp
     try:
         sup = make_sup(_moomoo(url=url))
         assert await _connect(sup, _tokens(1))
-        child = sup.get("moomoo")
+        child = sup.get(MOO)
         await _wait_running(child)
         endpoint.script.append((400, {"error": "invalid_grant"}))
         fake_time.release()
-        await _until(lambda: "moomoo" not in sup._refresh_tasks)
+        await _until(lambda: MOO not in sup._refresh_tasks)
         msg = "refresh rejected (400 invalid_grant); re-authorize"
         assert child.last_error == msg
-        await sup.restart("moomoo")
+        await sup.restart(MOO, ADMIN_ACTOR)
         await _wait_running(child)
         assert child.last_error == msg and child.refresh_rejected == msg
         # Only a re-authorization clears it.
@@ -864,9 +871,9 @@ async def test_a_rejection_survives_a_successful_start(make_sup, fake_time, endp
 async def test_a_failing_reauth_write_leaves_no_old_task(make_sup, fake_time, monkeypatch):
     # LOW-1: the grant bump and the cancel come before any write.
     sup = await _connected(make_sup, fake_time)
-    child = sup.get("moomoo")
+    child = sup.get(MOO)
     grant = child.grant
-    old_task = sup._refresh_tasks["moomoo"]
+    old_task = sup._refresh_tasks[MOO]
 
     def boom(ns, state):
         raise OSError("disk full")
@@ -876,7 +883,7 @@ async def test_a_failing_reauth_write_leaves_no_old_task(make_sup, fake_time, mo
         await _connect(sup, _tokens(2), reauth=True)
     await asyncio.sleep(0)
     assert child.grant == grant + 1
-    assert old_task.cancelled() and "moomoo" not in sup._refresh_tasks
+    assert old_task.cancelled() and MOO not in sup._refresh_tasks
 
 
 def test_record_error_masks_a_remembered_log_secret(make_sup):
@@ -886,8 +893,8 @@ def test_record_error_masks_a_remembered_log_secret(make_sup):
 
     sup = make_sup(_moomoo())
     remember_log_secrets(["ROTATEDtoken999"])
-    sup._record_error(sup.get("moomoo"), "bad ROTATEDtoken999", [])
-    assert "ROTATEDtoken999" not in sup.get("moomoo").last_error
+    sup._record_error(sup.get(MOO), "bad ROTATEDtoken999", [])
+    assert "ROTATEDtoken999" not in sup.get(MOO).last_error
 
 
 def test_write_private_removes_the_tmp_on_failure(tmp_path, monkeypatch):
@@ -909,3 +916,564 @@ def test_public_header_sink_checks_refresh_token():
     for bad in (12345, "", ["x"]):
         with pytest.raises(oauth_mod.OAuthTokenError):
             check_token_response(None, {**_tokens(1), "refresh_token": bad}, refresh=True)
+
+
+# --- Review round 2 (design D4, D6, D10-D13; invariants I1, I7, I8) --------------
+
+
+def _rotating(endpoint: FakeEndpoint) -> dict:
+    """Replace the endpoint with a rotating provider: each 200 issues the next
+    refresh token and revokes the old one; an old token gets `invalid_grant`."""
+    live = {"n": 1}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = dict(parse_qsl(request.content.decode()))
+        endpoint.bodies.append(body)
+        if body["refresh_token"] != f"REFRESH{live['n']}xyz":
+            return httpx.Response(400, json={"error": "invalid_grant"})
+        live["n"] += 1
+        return httpx.Response(200, json=_tokens(live["n"]))
+
+    endpoint.handler = handler
+    return live
+
+
+def _past_expiry(fake_time: FakeTime) -> None:
+    """Put the fake clock past the `expires_at` that a connect just wrote
+    (`refresh_state` stamps it from the wall clock)."""
+    fake_time.now = time.time() + 10**6
+
+
+@pytest.mark.asyncio
+async def test_failed_header_write_keeps_new_grant(make_sup, fake_time, endpoint, monkeypatch):
+    # Scenario: A failed header write after the file write keeps the new grant (I7).
+    _rotating(endpoint)
+    sup = await _connected(make_sup, fake_time)
+    real = sup.registry.set_oauth_header
+    calls = {"n": 0}
+
+    def flaky(*args):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(errno.ENOSPC, "disk")
+        return real(*args)
+
+    monkeypatch.setattr(sup.registry, "set_oauth_header", flaky)
+    fake_time.release()  # round 1: the provider rotates, the header write raises
+    await _until(lambda: len(fake_time.sleeps) == 2)
+    assert fake_time.sleeps[1] == 30
+    assert sup.creds.read_refresh("moomoo")["refresh_token"] == "REFRESH2xyz"
+    assert _header(sup) == "Bearer ACCESS1xyz"
+    fake_time.release()  # the next round starts from the file
+    await _until(lambda: len(fake_time.sleeps) == 3 or MOO not in sup._refresh_tasks)
+    assert MOO in sup._refresh_tasks, sup.get(MOO).last_error
+    assert _header(sup) == "Bearer ACCESS2xyz"
+    assert len(endpoint.bodies) == 1  # no request before the new refresh time
+    fake_time.release()
+    await _until(lambda: _header(sup) == "Bearer ACCESS3xyz" or MOO not in sup._refresh_tasks)
+    assert endpoint.bodies[1]["refresh_token"] == "REFRESH2xyz"
+    assert MOO in sup._refresh_tasks
+    assert sup.get(MOO).last_error is None and sup.get(MOO).refresh_rejected is None
+
+
+@pytest.mark.asyncio
+async def test_failed_header_write_repairs_header_without_post(
+    make_sup, fake_time, endpoint, monkeypatch
+):
+    # Scenario: A failed header write after the file write keeps the new grant (I4, I8).
+    sup = await _connected(make_sup, fake_time)
+    real = sup.registry.set_oauth_header
+    calls = {"n": 0}
+
+    def flaky(*args):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(errno.ENOSPC, "disk")
+        return real(*args)
+
+    monkeypatch.setattr(sup.registry, "set_oauth_header", flaky)
+    endpoint.script.append((200, _tokens(2)))
+    fake_time.release()
+    await _until(lambda: len(fake_time.sleeps) == 2)
+    assert _header(sup) == "Bearer ACCESS1xyz"
+    fake_time.release()
+    await _until(lambda: len(fake_time.sleeps) == 3)
+    # The sync repaired the header from the file, and sent no second request.
+    assert _header(sup) == "Bearer ACCESS2xyz"
+    assert sup.get(MOO).spec.headers["Authorization"] == "Bearer ACCESS2xyz"
+    assert len(endpoint.bodies) == 1
+
+
+@pytest.mark.asyncio
+async def test_repaired_header_clears_own_transient(make_sup, fake_time, endpoint, monkeypatch):
+    # Scenario: A repaired header clears its own transient error.
+    sup = await _connected(make_sup, fake_time)
+    real = sup.registry.set_oauth_header
+    calls = {"n": 0}
+
+    def flaky(*args):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(errno.ENOSPC, "disk")
+        return real(*args)
+
+    monkeypatch.setattr(sup.registry, "set_oauth_header", flaky)
+    endpoint.script.append((200, _tokens(2)))
+    fake_time.release()
+    await _until(lambda: len(fake_time.sleeps) == 2)
+    assert sup.get(MOO).last_error == "refresh failed (OSError); retrying"
+    fake_time.release()
+    await _until(lambda: len(fake_time.sleeps) == 3)
+    # The repair healed the fault: no stale error before the next request.
+    assert _header(sup) == "Bearer ACCESS2xyz"
+    assert len(endpoint.bodies) == 1
+    assert sup.get(MOO).last_error is None and sup.get(MOO).refresh_transient is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("foreign", [False, True])
+async def test_reauthorization_clears_old_transient(make_sup, fake_time, endpoint, foreign):
+    # Scenario: A re-authorization clears the transient error of the old grant.
+    sup = await _connected(make_sup, fake_time)
+    _past_expiry(fake_time)
+    endpoint.script.append((503, {}))
+    fake_time.release()
+    await _until(lambda: len(fake_time.sleeps) == 2)
+    child = sup.get(MOO)
+    assert child.last_error == "refresh failing (503); retrying"
+    if foreign:
+        child.last_error = "start failed"  # an error the task did not record
+    assert await _connect(sup, _tokens(2), reauth=True)
+    assert child.refresh_transient is None
+    assert child.last_error == ("start failed" if foreign else None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        pytest.param(
+            "chmod",
+            marks=pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes"),
+        ),
+        "directory",
+    ],
+)
+async def test_startup_unreadable_refresh_file(make_sup, fake_time, endpoint, fault):
+    # Scenario: An unreadable refresh file does not stop the gateway.
+    server, thread, url = _serve_fake_remote()
+    path = None
+    try:
+        sup = make_sup(
+            _moomoo(url=url, oauth_pending=False, enabled=True),
+            ServerSpec(namespace="other", kind="remote", url=url, transport="http", enabled=True),
+        )
+        _state(sup, 1)
+        path = sup.creds.refresh_path("moomoo")
+        if fault == "chmod":
+            path.chmod(0)
+        else:
+            path.unlink()
+            path.mkdir()
+        await sup.startup()  # must not raise
+        other = sup.get(ServerKey(None, "other"))
+        child = sup.get(MOO)
+        msg = "refresh.json unreadable; re-authorize"
+        # `startup` itself recorded the rejection and started no task: nothing
+        # has run since it returned.
+        assert child.last_error == msg and child.refresh_rejected == msg
+        assert MOO not in sup._refresh_tasks
+        await _wait_running(other)
+        await _wait_running(child)
+        assert child.last_error == msg and child.refresh_rejected == msg
+        assert MOO not in sup._refresh_tasks
+        assert fake_time.sleeps == [] and endpoint.bodies == []
+    finally:
+        if path is not None and path.exists() and path.is_file():
+            path.chmod(0o600)
+        server.should_exit = True
+        thread.join(timeout=10)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["garbage", "not-an-object", "directory"])
+async def test_task_unreadable_refresh_file_records_rejection(
+    make_sup, fake_time, endpoint, monkeypatch, fault
+):
+    # Scenario: An unreadable refresh file stops the task visibly.
+    sup = await _connected(make_sup, fake_time)
+
+    def bad_client():
+        raise httpx.InvalidURL("bad")
+
+    # Round 1 faults, so round 2 reads the file again after the backoff.
+    monkeypatch.setattr("mcpflow.oauth.http_client", bad_client)
+    fake_time.release()
+    await _until(lambda: len(fake_time.sleeps) == 2)
+    path = sup.creds.refresh_path("moomoo")
+    if fault == "garbage":
+        path.write_text("{bad")
+    elif fault == "not-an-object":
+        path.write_text("[1, 2]")
+    else:
+        path.unlink()
+        path.mkdir()
+    fake_time.release()
+    await _until(lambda: MOO not in sup._refresh_tasks)
+    child = sup.get(MOO)
+    msg = "refresh.json unreadable; re-authorize"
+    assert child.last_error == msg and child.refresh_rejected == msg
+    assert endpoint.bodies == []
+    assert len(fake_time.sleeps) == 2  # no further wait: the task is gone
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "answer, cause", [((503, {}), "503"), ("raise", "ConnectError")]
+)
+async def test_outage_past_expiry_is_visible(make_sup, fake_time, endpoint, answer, cause):
+    # Scenario: An outage past the expiry is visible.
+    sup = await _connected(make_sup, fake_time)
+    _past_expiry(fake_time)
+    endpoint.script.extend([answer, answer, answer])
+    fake_time.release()
+    await _until(lambda: len(fake_time.sleeps) == 2)
+    msg = f"refresh failing ({cause}); retrying"
+    assert sup.get(MOO).last_error == msg
+    assert MOO in sup._refresh_tasks
+    fake_time.release()  # it keeps retrying
+    await _until(lambda: len(fake_time.sleeps) == 3)
+    assert sup.get(MOO).last_error == msg and MOO in sup._refresh_tasks
+
+
+@pytest.mark.asyncio
+async def test_outage_before_expiry_records_nothing(make_sup, fake_time, endpoint):
+    # Design D12: before the expiry the header still works.
+    sup = await _connected(make_sup, fake_time)
+    endpoint.script.extend([(503, {})])
+    fake_time.release()
+    await _until(lambda: len(fake_time.sleeps) == 2)
+    assert sup.get(MOO).last_error is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["failed", "failing"])
+async def test_heal_clears_own_transient(make_sup, fake_time, endpoint, monkeypatch, kind):
+    # Scenario: A healed refresh clears its own transient error.
+    sup = await _connected(make_sup, fake_time)
+    if kind == "failed":
+        real = sup.creds.write_refresh
+        calls = {"n": 0}
+
+        def flaky(ref, state):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("disk full")
+            real(ref, state)
+
+        monkeypatch.setattr(sup.creds, "write_refresh", flaky)
+        endpoint.script.extend([(200, _tokens(2)), (200, _tokens(3))])
+        recorded = "refresh failed (OSError); retrying"
+    else:
+        _past_expiry(fake_time)
+        endpoint.script.extend([(503, {}), (200, _tokens(3))])
+        recorded = "refresh failing (503); retrying"
+    fake_time.release()
+    await _until(lambda: len(fake_time.sleeps) == 2)
+    assert sup.get(MOO).last_error == recorded
+    fake_time.release()
+    await _until(lambda: _header(sup) == "Bearer ACCESS3xyz")
+    assert sup.get(MOO).last_error is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transient_first", [False, True])
+async def test_heal_keeps_foreign_error(make_sup, fake_time, endpoint, transient_first):
+    # Scenario: A healed refresh keeps an error it did not record.
+    sup = await _connected(make_sup, fake_time)
+    if transient_first:
+        _past_expiry(fake_time)
+        endpoint.script.append((503, {}))
+        fake_time.release()
+        await _until(lambda: len(fake_time.sleeps) == 2)
+        assert sup.get(MOO).last_error == "refresh failing (503); retrying"
+    sup.get(MOO).last_error = "start failed"
+    endpoint.script.append((200, _tokens(2)))
+    fake_time.release()
+    await _until(lambda: _header(sup) == "Bearer ACCESS2xyz")
+    assert sup.get(MOO).last_error == "start failed"
+
+
+def test_remove_refresh_syncs_directory(tmp_path, monkeypatch):
+    # Scenario: The delete of a refresh file syncs its directory.
+    store = CredStore(tmp_path)
+    store.write_refresh("moomoo", {"a": "b"})
+    path = store.refresh_path("moomoo")
+    directory_inode = (tmp_path / "creds" / "moomoo").stat().st_ino
+    seen: list[tuple[bool, int, bool]] = []
+    real = os.fsync
+
+    def spy(fd):
+        st = os.fstat(fd)
+        seen.append((stat.S_ISDIR(st.st_mode), st.st_ino, path.exists()))
+        real(fd)
+
+    monkeypatch.setattr(os, "fsync", spy)
+    store.remove_refresh("moomoo")
+    # One sync, on the credential directory, after the file is gone.
+    assert seen == [(True, directory_inode, False)]
+    store.remove_refresh("nothere")  # no directory: no error
+
+
+@pytest.mark.asyncio
+async def test_handler_record_fault_keeps_task(make_sup, fake_time, endpoint, monkeypatch, caplog):
+    # Scenario: A fault in the error record does not stop the task.
+    caplog.set_level(logging.WARNING)
+    sup = await _connected(make_sup, fake_time)
+
+    def boom(ref, state):
+        raise RuntimeError("apply fault")
+
+    monkeypatch.setattr(sup.creds, "write_refresh", boom)
+    real = sup._record_error
+    calls = {"n": 0}
+
+    def rec(*args):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise KeyError("REC-SECRET-77")
+        return real(*args)
+
+    monkeypatch.setattr(sup, "_record_error", rec)
+    endpoint.script.extend([(200, _tokens(2)), (200, _tokens(3))])
+    fake_time.release()
+    await _until(lambda: len(fake_time.sleeps) == 2 or MOO not in sup._refresh_tasks)
+    assert MOO in sup._refresh_tasks
+    assert fake_time.sleeps[1] == 30
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("KeyError" in m for m in warnings)
+    assert "REC-SECRET-77" not in caplog.text
+    fake_time.release()  # the request goes out again after the retry delay
+    await _until(lambda: len(endpoint.bodies) == 2)
+    assert MOO in sup._refresh_tasks
+    assert endpoint.bodies[1]["refresh_token"] == "REFRESH1xyz"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", [types.SimpleNamespace(), types.SimpleNamespace(headers=None)])
+async def test_no_header_map_logs_warning(make_sup, fake_time, endpoint, caplog, transport):
+    # Scenario: A transport without a header map logs a warning.
+    caplog.set_level(logging.WARNING)
+    sup = await _connected(make_sup, fake_time)
+    child = sup.get(MOO)
+    child.transport = transport
+    try:
+        endpoint.script.append((200, _tokens(2)))
+        fake_time.release()
+        await _until(lambda: _header(sup) == "Bearer ACCESS2xyz")
+        assert MOO in sup._refresh_tasks
+        warned = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and "moomoo" in r.getMessage()
+        ]
+        assert warned
+        for secret in ("ACCESS1xyz", "REFRESH1xyz", "ACCESS2xyz", "REFRESH2xyz"):
+            assert secret not in caplog.text
+    finally:
+        child.transport = None  # the shutdown must not close a stand-in
+
+
+@pytest.mark.asyncio
+async def test_user_owned_header_sink_gets_no_refresh_file(make_sup, fake_time):
+    # Scenario: A user-owned header sink gets no refresh file.
+    sup = make_sup(_moomoo(owner="alice"))
+    key = ServerKey("alice", "moomoo")
+    flow = sup.flows.create("moomoo@alice", "moomoo", CLIENT, ADMIN_ACTOR)
+    assert await sup.finish_oauth(flow, None, _tokens(1), header=HEADER)
+    assert not sup.creds.refresh_path("moomoo@alice").exists()
+    assert key not in sup._refresh_tasks and not sup._refresh_tasks
+    assert sup.registry.get(key).headers["Authorization"] == "Bearer ACCESS1xyz"
+    assert fake_time.sleeps == []
+
+
+class _Spin(BaseException):
+    """Bounds a loop that would spin: a `BaseException` passes `except Exception`."""
+
+
+@pytest.mark.asyncio
+async def test_repair_fault_backs_off(make_sup, fake_time, endpoint, monkeypatch):
+    # Scenario: A round fault waits before the next read.
+    sup = make_sup(_moomoo(oauth_pending=False, headers={"Authorization": "Bearer OLDxyzxyz"}))
+    _state(sup, 2)
+
+    def full(*args):
+        raise OSError(errno.ENOSPC, "no space left")
+
+    monkeypatch.setattr(sup.registry, "set_oauth_header", full)
+    real_sync = sup._refresh_sync
+    calls = {"n": 0}
+
+    async def bounded(*args):
+        calls["n"] += 1
+        if calls["n"] > 40:
+            raise _Spin
+        return await real_sync(*args)
+
+    monkeypatch.setattr(sup, "_refresh_sync", bounded)
+    await sup.startup()  # the startup repair fails too; the boot goes on
+    assert MOO in sup._refresh_tasks
+    await _until(lambda: fake_time.sleeps)
+    fake_time.release(5)
+    await _until(lambda: len(fake_time.sleeps) == 6)
+    assert fake_time.sleeps == [30, 60, 120, 240, 300, 300]
+    assert endpoint.bodies == []
+    assert MOO in sup._refresh_tasks
+    assert sup.get(MOO).last_error == "refresh failed (OSError); retrying"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [errno.EMFILE, errno.EIO])
+async def test_transient_read_error_retries(make_sup, fake_time, endpoint, monkeypatch, code):
+    # Scenario: A transient read error retries.
+    sup = await _connected(make_sup, fake_time)
+    real = sup.creds.read_refresh
+    calls = {"n": 0}
+
+    def flaky(ref):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(code, "transient")
+        return real(ref)
+
+    monkeypatch.setattr(sup.creds, "read_refresh", flaky)
+    endpoint.script.append((200, _tokens(2)))
+    fake_time.release()  # round 1 applies; the read of round 2 raises
+    await _until(lambda: len(fake_time.sleeps) == 2 or MOO not in sup._refresh_tasks)
+    assert MOO in sup._refresh_tasks
+    assert fake_time.sleeps[1] == 30
+    child = sup.get(MOO)
+    assert child.last_error == "refresh failed (OSError); retrying"
+    assert child.refresh_rejected is None
+    fake_time.release()  # it reads again, and adopts the file of round 1
+    await _until(lambda: len(fake_time.sleeps) == 3)
+    assert fake_time.sleeps[2] > 30 and MOO in sup._refresh_tasks
+    assert len(endpoint.bodies) == 1
+
+
+@pytest.mark.asyncio
+async def test_startup_transient_read_error_starts_the_task(
+    make_sup, fake_time, endpoint, monkeypatch
+):
+    # Spec: any other OSError of the read in `startup` skips the repair and
+    # starts the task; the first round of the task repairs the header.
+    sup = make_sup(_moomoo(oauth_pending=False, headers={"Authorization": "Bearer OLDxyzxyz"}))
+    _state(sup, 2)
+    real = sup.creds.read_refresh
+    calls = {"n": 0}
+
+    def flaky(ref):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(errno.EMFILE, "transient")
+        return real(ref)
+
+    monkeypatch.setattr(sup.creds, "read_refresh", flaky)
+    await sup.startup()  # must not raise
+    assert MOO in sup._refresh_tasks
+    await _until(lambda: fake_time.sleeps)
+    assert _header(sup) == "Bearer ACCESS2xyz"
+    assert endpoint.bodies == []
+    assert sup.get(MOO).refresh_rejected is None
+
+
+@pytest.mark.asyncio
+async def test_startup_repair_fault_keeps_boot(make_sup, fake_time, endpoint, monkeypatch):
+    # Scenario: A failed header repair at startup does not stop the gateway.
+    sup = make_sup(
+        _moomoo(oauth_pending=False, headers={"Authorization": "Bearer OLDxyzxyz"}),
+        ServerSpec(namespace="other", kind="remote", url="http://127.0.0.1:9/mcp",
+                   transport="http", enabled=True),
+    )
+    _state(sup, 2, expires_at=T0 - 100)  # past: the first round fires at once
+    real = sup.registry.set_oauth_header
+    calls: list[tuple[str, int]] = []
+
+    def flaky(key, name, value):
+        calls.append((value, len(endpoint.bodies)))
+        if len(calls) == 1:
+            raise OSError(errno.ENOSPC, "no space left")
+        return real(key, name, value)
+
+    monkeypatch.setattr(sup.registry, "set_oauth_header", flaky)
+    started: list = []
+
+    async def fake_start(ns):
+        started.append(ns)
+
+    monkeypatch.setattr(sup, "_run_start", fake_start)
+    await sup.startup()  # must not raise
+    await _until(lambda: started)  # the other child started
+    assert len(started) == 1
+    assert MOO in sup._refresh_tasks
+    await _until(lambda: fake_time.sleeps)
+    # The first round repaired the header, before any request.
+    assert calls[1] == ("Bearer ACCESS2xyz", 0)
+    assert _header(sup) == "Bearer ACCESS2xyz"
+    assert endpoint.bodies == []
+    endpoint.script.append((200, _tokens(3)))
+    fake_time.release()
+    await _until(lambda: _header(sup) == "Bearer ACCESS3xyz")
+    assert endpoint.bodies[0]["refresh_token"] == "REFRESH2xyz"
+
+
+@pytest.mark.asyncio
+async def test_sync_stale_grant_writes_nothing(make_sup, fake_time, tmp_path):
+    # Scenario: A re-authorization during the refresh wins (I1, defence in depth).
+    sup = await _connected(make_sup, fake_time)
+    child = sup.get(MOO)
+    grant = child.grant
+    # The header differs from the file BEFORE the grant moves, so a sync that
+    # skips the grant check would repair it.
+    sup.registry.set_oauth_header(MOO, "Authorization", "Bearer DIVERGEDxyz")
+    real = sup.registry.set_oauth_header
+    writes: list = []
+
+    def counting(*args):
+        writes.append(args)
+        return real(*args)
+
+    sup.registry.set_oauth_header = counting
+    servers = tmp_path / "sup0" / "servers.json"
+    registry_before = servers.read_bytes()
+    file_before = sup.creds.refresh_path("moomoo").read_bytes()
+    child.grant += 1
+    assert await sup._refresh_sync(MOO, child, grant) is None
+    assert writes == []
+    assert _header(sup) == "Bearer DIVERGEDxyz"
+    assert servers.read_bytes() == registry_before
+    assert sup.creds.refresh_path("moomoo").read_bytes() == file_before
+    assert child.last_error is None
+    # Control: the current grant repairs the header from the file.
+    state = await sup._refresh_sync(MOO, child, child.grant)
+    assert state is not None and state["access_token"] == "ACCESS1xyz"
+    assert len(writes) == 1 and _header(sup) == "Bearer ACCESS1xyz"
+
+
+@pytest.mark.parametrize(
+    "bad", [math.nan, math.inf, -math.inf, True, False, "later", 10**400]
+)
+def test_read_refresh_bad_expiry(tmp_path, bad):
+    # Scenario: A refresh file with a bad expiry is refused.
+    store = CredStore(tmp_path)
+    state = refresh_state("cid", TOKEN_URL, HEADER, _tokens(1))
+    store.write_refresh("moomoo", {**state, "expires_at": bad})
+    with pytest.raises(ValueError, match="expires_at"):
+        store.read_refresh("moomoo")
+
+
+@pytest.mark.parametrize("good", [0, 7200, 1_790_000_000.5])
+def test_read_refresh_accepts_a_finite_number(tmp_path, good):
+    store = CredStore(tmp_path)
+    state = refresh_state("cid", TOKEN_URL, HEADER, _tokens(1))
+    store.write_refresh("moomoo", {**state, "expires_at": good})
+    assert store.read_refresh("moomoo")["expires_at"] == good

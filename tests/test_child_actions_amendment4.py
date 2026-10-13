@@ -23,7 +23,7 @@ import re
 
 import pytest
 from action_browser import action_post
-from conftest import fake_child_spec
+from conftest import ADMIN_ACTOR, fake_child_spec
 from fake_mcp_server import (
     R3_DEFAULT_SECRET,
     R3_DESC_SECRET,
@@ -35,6 +35,7 @@ from test_supervisor import make_supervisor  # noqa: F401 -- async fixture
 from test_visibility import admin
 
 from mcpflow.actions import clause_violation, redact
+from mcpflow.registry import ServerKey
 from mcpflow.supervisor import Supervisor
 
 
@@ -72,13 +73,13 @@ def _more_env(**env):
 
 
 @pytest.mark.asyncio
-async def test_r3_f1_one_context(make_supervisor):  # noqa: F811
+async def test_r3_f1_one_context(make_supervisor):
     """`run_action` runs ONE listing and ONE call under one lease, and the mask
     binds to THAT listing: an optional password whose child-side default the
     result echoes is masked, because `run_action` collected the default from its
     own listing (the handler has no other secret source)."""
     sup = make_supervisor()
-    child = await sup.add(more_spec())
+    child = await sup.add(more_spec(), ADMIN_ACTOR)
     await child.task
     client = child.session.client
     counts = {"list": 0, "mcp": 0}
@@ -97,7 +98,7 @@ async def test_r3_f1_one_context(make_supervisor):  # noqa: F811
 
     # Post the optional password empty: the child runs with its default and
     # echoes it in the result.
-    run = await sup.run_action("store", "echo_default", {})
+    run = await sup.run_action(ServerKey(None, "store"), "echo_default", {}, ADMIN_ACTOR)
     assert run.kind == "ran"
     assert counts == {"list": 1, "mcp": 1}  # ONE listing, ONE call, one lease
     # The mask set carries the execution listing's default literal.
@@ -130,7 +131,7 @@ def test_r3_f1_overlapping_error_scrubs_once(server_factory, monkeypatch):
     overlapping secrets mask whole with no stranded fragment."""
     from mcpflow.supervisor import ActionRun
 
-    async def overlap(self, ns, name, form, **kwargs):
+    async def overlap(self, ns, name, form, actor, **kwargs):
         return ActionRun(
             "transport", frozenset({"abcd", "cdefg"}), frozenset(), None, "abcdefg"
         )
@@ -150,7 +151,7 @@ def test_r3_f7_concurrent_removal_404(server_factory, monkeypatch):
     `run_action`'s own `self.get` raises `KeyError`. The handler maps that to
     404 (it no longer looks the namespace up again), never a 500 traceback."""
 
-    async def gone(self, ns, name, form, **kwargs):
+    async def gone(self, ns, name, form, actor, **kwargs):
         raise KeyError(ns)  # the child was removed between the probe and the run
 
     monkeypatch.setattr(Supervisor, "run_action", gone)
@@ -316,13 +317,13 @@ def test_r3_f6_clause_returns_meta_for_malformed_shapes():
     [None, {"_internal": None}],
     ids=["null_fastmcp", "null_internal"],
 )
-async def test_r3_f6_malformed_meta(make_supervisor, caplog, bad_fastmcp):  # noqa: F811
+async def test_r3_f6_malformed_meta(make_supervisor, caplog, bad_fastmcp):
     """A conforming tagged tool with `meta.fastmcp = null` or
     `meta.fastmcp._internal = null` gets no view, logs one WARNING naming `meta`,
     and does not crash `actions` or `run_action` (the guard runs at the clause,
     before `action_enabled`/`is_enabled` could dereference the null)."""
     sup = make_supervisor()
-    child = await sup.add(store_spec())
+    child = await sup.add(store_spec(), ADMIN_ACTOR)
     await child.task
     _inject(
         child.session.client,
@@ -330,7 +331,7 @@ async def test_r3_f6_malformed_meta(make_supervisor, caplog, bad_fastmcp):  # no
         meta=lambda t: {**(t.meta or {}), "fastmcp": bad_fastmcp},
     )
     with caplog.at_level(logging.WARNING):
-        views = {v.name for v in await sup.actions("store")}
+        views = {v.name for v in await sup.actions(ServerKey(None, "store"))}
     assert "set_writable" not in views  # no view, no crash inside actions
     warnings = [
         r.getMessage()
@@ -339,7 +340,7 @@ async def test_r3_f6_malformed_meta(make_supervisor, caplog, bad_fastmcp):  # no
     ]
     assert len(warnings) == 1 and "meta" in warnings[0]
     # The submit path stays inside its error boundary too: kind "unknown".
-    run = await sup.run_action("store", "set_writable", {"name": "s3main"})
+    run = await sup.run_action(ServerKey(None, "store"), "set_writable", {"name": "s3main"}, ADMIN_ACTOR)
     assert run.kind == "unknown"
 
 
@@ -370,15 +371,15 @@ def test_r3_f9_clause_returns_schema_for_null_root_members():
     ],
     ids=["null_properties", "null_required"],
 )
-async def test_r3_f9_null_root_member(make_supervisor, caplog, bad_schema):  # noqa: F811
+async def test_r3_f9_null_root_member(make_supervisor, caplog, bad_schema):
     """A tagged tool with `properties: null` or `required: null` gets no view and
     logs one WARNING naming `schema`; the page and the submit never crash."""
     sup = make_supervisor()
-    child = await sup.add(store_spec())
+    child = await sup.add(store_spec(), ADMIN_ACTOR)
     await child.task
     _inject(child.session.client, "set_writable", schema=bad_schema)
     with caplog.at_level(logging.WARNING):
-        views = {v.name for v in await sup.actions("store")}
+        views = {v.name for v in await sup.actions(ServerKey(None, "store"))}
     assert "set_writable" not in views
     warnings = [
         r.getMessage()
@@ -386,5 +387,5 @@ async def test_r3_f9_null_root_member(make_supervisor, caplog, bad_schema):  # n
         if r.levelno == logging.WARNING and "set_writable" in r.getMessage()
     ]
     assert len(warnings) == 1 and "schema" in warnings[0]
-    run = await sup.run_action("store", "set_writable", {"name": "s3main"})
+    run = await sup.run_action(ServerKey(None, "store"), "set_writable", {"name": "s3main"}, ADMIN_ACTOR)
     assert run.kind == "unknown"

@@ -2,9 +2,10 @@
 {# The id is stable across every swap of a window: the footer button outside
    this form submits it through the native `form=` attribute, so the window
    frame can stay a plain `<div>` and the action forms never nest inside the
-   edit form. #}
+   edit form. The edit form posts to the server reference `ns`, never the
+   typed namespace: `github@alice` and `github` share one namespace. #}
 <form id="server-form" method="post"
-      action="{{ '/servers/' ~ values.get('namespace') if editing else '/servers' }}">
+      action="{{ '/servers/' ~ ns if editing else '/servers' }}">
   <input type="hidden" name="kind" value="{{ k }}">
   <label>Namespace</label>
   <input name="namespace" value="{{ values.get('namespace', '') }}" {{ 'readonly' if editing }}>

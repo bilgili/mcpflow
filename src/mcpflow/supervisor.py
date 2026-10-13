@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import itertools
 import logging
 import os
@@ -31,16 +32,20 @@ from fastmcp.client.transports import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable
+    from collections.abc import AsyncIterator, Callable, Iterator
     from typing import Unpack
 
     from fastmcp.client.transports.base import SessionKwargs, TransportOptions
     from mcp import ClientSession
+
+    from .identity import User
+    from .policy import AccessPolicy, Reach
 from fastmcp.server.providers import AggregateProvider, FastMCPProvider, Provider
 from fastmcp.server.providers.proxy import ProxyProvider
 from fastmcp.server.transforms import Namespace, Visibility
-from mcp.types import CallToolResult, TextResourceContents
+from mcp.types import CallToolResult, TextResourceContents, Tool
 
+from . import oauth as _oauth
 from .actions import (
     ActionScopeFilter,
     ActionView,
@@ -54,7 +59,6 @@ from .actions import (
     secret_literals,
 )
 from .config import Settings
-from . import oauth as _oauth
 from .oauth import (
     ClientCreds,
     CredStore,
@@ -64,16 +68,21 @@ from .oauth import (
     refresh_request,
     refresh_state,
 )
+from .policy import ADMIN_REQUIRED
 from .registry import (
     PINNED_ADMIN_TOOLS,
     RESERVED_NAMESPACE,
     SECRET_MASK,
     Registry,
     RegistryError,
+    ServerKey,
     ServerSpec,
     build_command,
     source_secrets,
     url_secrets,
+)
+from .registry import (
+    revision as spec_revision,
 )
 from .sources import SourceStore, total_bytes
 
@@ -102,6 +111,10 @@ _AUTH_SCHEMES = ("bearer ", "basic ", "token ")
 
 logger = logging.getLogger(__name__)
 
+# The key of the built-in admin server. It has no `Child`; the visibility
+# mutators route it to the `admin` object of the registry.
+_BUILTIN_KEY = ServerKey(None, RESERVED_NAMESPACE)
+
 # A child that publishes a concrete resource at this URI contributes a block to
 # the gateway's `instructions`. The contract is the URI only.
 INSTRUCTIONS_URI: str = "instructions://self"
@@ -115,6 +128,11 @@ INSTRUCTIONS_READ_TIMEOUT: float = 2.0  # seconds, per child
 # would block every operation of that child behind one hung read.
 LEASE_DRAIN_TIMEOUT: float = 5.0  # seconds, per teardown
 
+# The age at which a probing render starts a background probe of a
+# generation (design D3, D7). A rate limit only: a poll answer never probes.
+# Read as a module global at call time, so a test can patch it.
+SNAPSHOT_MAX_AGE: float = 10.0  # seconds
+
 # The four states of one `ChildSession`. `_run_start` owns `starting -> open`;
 # `_teardown` owns `open -> closing -> closed`. `acquire` and the proxy factory
 # grant only while the state is `open`.
@@ -126,6 +144,12 @@ SessionState = Literal["starting", "open", "closing", "closed"]
 REFRESH_MIN_MARGIN: float = 60.0
 REFRESH_RETRY_START: float = 30.0
 REFRESH_RETRY_CAP: float = 300.0
+# The errors of `read_refresh` that do not heal by themselves (design D11): a
+# corrupt file, a permission fault, a path that is not a file. They stop the
+# task with `refresh.json unreadable; re-authorize`. Every other `OSError`
+# (`EMFILE`, `EIO`) is a round fault the task retries.
+_REFRESH_UNREADABLE = (ValueError, PermissionError, IsADirectoryError, NotADirectoryError)
+_REFRESH_UNREADABLE_TEXT = "refresh.json unreadable; re-authorize"
 # The characters of an OAuth error code; anything else a provider sends is
 # dropped before it reaches `last_error`.
 _OAUTH_ERROR_JUNK = re.compile(r"[^A-Za-z0-9_.-]")
@@ -303,6 +327,18 @@ class LeaseRefused(RuntimeError):
         self.reason = reason
 
 
+class RevisionConflict(Exception):
+    """`approve` named a revision that is not the revision of the stored spec.
+
+    Not a `ValueError`: the adapters map it to 409, not 400. Carries the
+    stored revision so the API can answer it.
+    """
+
+    def __init__(self, ref: str, stored: str) -> None:
+        super().__init__(f"{ref} changed since the approval was read")
+        self.revision = stored
+
+
 class ActionUnavailable(RuntimeError):
     """The leased generation cannot run the named action.
 
@@ -449,6 +485,17 @@ class ChildSession:
     state: SessionState = "starting"
     leases: int = 0
     idle: asyncio.Event = field(default_factory=_set_event)  # set iff leases == 0
+    # The tool snapshot of this generation (design D1). Display-only: only
+    # `Supervisor.tools` reads it. `tools` is raw, pre-transform, so it keeps a
+    # muted tool; `None` until `_run_start` seeds it. A probe captures its
+    # session and writes only that object, so a late write lands on a dead
+    # generation that no render reads.
+    tools: list[Tool] | None = None  # raw, pre-transform; None until seeded
+    probed_at: float | None = None  # time.monotonic() of the last finished probe
+    # The last probe task; the strong reference the loop does not keep. It can
+    # hold a done task: a cancel before the first step skips the `finally` that
+    # clears it (design D4), so every reader treats a done task as no probe.
+    probe: asyncio.Task[None] | None = None
 
     def acquire(self) -> None:
         """Grant one lease. Synchronous, so `_lease` reads `child.session` and
@@ -490,6 +537,10 @@ class Child:
     # memory only. `_run_start` restores it as `last_error` on a successful
     # start, so a restart before the expiry does not hide "re-authorize".
     refresh_rejected: str | None = None
+    # The last transient text the refresh task stored as `last_error` (design
+    # D12). A successful apply clears `last_error` only while it still equals
+    # this text, so an error the task did not record stays. In memory only.
+    refresh_transient: str | None = None
 
 
 @dataclass(frozen=True)
@@ -506,6 +557,10 @@ class ToolView:
     # True for an admin tool that visibility never hides. The dashboard
     # renders such a row as a checked, disabled control.
     pinned: bool = False
+    # The server reference and the owner of the child that publishes the
+    # tool. `owner` is `None` for an admin-owned child and the built-in rows.
+    ref: str = ""
+    owner: str | None = None
 
 
 @dataclass(frozen=True)
@@ -545,10 +600,17 @@ def _visible(pinned: bool, hide_all: bool, hidden: set[str], tool: str) -> bool:
 
 
 def _summarize_schema(schema: dict | None) -> str:
-    if not schema:
+    """Total (design D11): a schema shape comes from the child, and one raise
+    would fail the whole tree. A shape is not proof of a dead child."""
+    if not schema or not isinstance(schema, dict):
         return ""
     props = schema.get("properties", {})
-    parts = [f"{name}: {spec.get('type', 'any')}" for name, spec in props.items()]
+    if not isinstance(props, dict):
+        return ""
+    parts = [
+        f"{name}: {spec.get('type', 'any') if isinstance(spec, dict) else 'any'}"
+        for name, spec in props.items()
+    ]
     return ", ".join(parts)
 
 
@@ -582,26 +644,33 @@ class Supervisor:
         settings: Settings,
         creds: CredStore,
         flows: PendingFlows,
+        policy: AccessPolicy,
     ) -> None:
         self.registry = registry
         self.settings = settings
         self.creds = creds
         self.flows = flows
+        # The one owner of every access decision. The supervisor never builds
+        # a `Reach`; the read methods take one from the caller, so they cannot
+        # choose or widen the keys. The web and REST adapters reach the policy
+        # through this attribute.
+        self.policy = policy
         self.sources = SourceStore(settings.data_dir / "servers")
         self.table = AggregateProvider(provider_error_strategy="warn")
-        self._children: dict[str, Child] = {
-            spec.namespace: _new_child(spec) for spec in registry.list()
+        self._children: dict[ServerKey, Child] = {
+            spec.key: _new_child(spec) for spec in registry.list()
         }
         # One generation number per start, so a `ChildSession` and its refusals
         # name the generation that produced them. Starts at 1; 0 is the "no
         # generation" sentinel of `LeaseRefused`.
         self._generations = itertools.count(1)
-        # Namespaces a `remove` holds until its teardown returns. Separate from
+        # Keys a `remove` holds until its teardown returns. Separate from
         # `_children`, which `remove` empties before the await so `children()`
         # never lists a half torn down child. A reclaim inside that window
         # would let the old process write a file the replacement inherits, so
-        # `add` refuses a namespace this set holds.
-        self._removing: set[str] = set()
+        # `add` refuses a key this set holds. Keys, not namespaces: the
+        # removal of one owner's server never blocks another owner's add.
+        self._removing: set[ServerKey] = set()
         # The built-in admin server. It is deliberately NOT a `_children`
         # entry: `startup` starts every child, `set_root_muted` applies the
         # root to every child, `children()` publishes every child to
@@ -609,9 +678,9 @@ class Supervisor:
         # child key. None of the four may reach the built-in mount.
         self._builtin: FastMCP | None = None
         self._builtin_visibility: Visibility | None = None
-        # One header sink refresh task per namespace that holds a
+        # One header sink refresh task per server key that holds a
         # `refresh.json` (design D7). A task removes only its own entry.
-        self._refresh_tasks: dict[str, asyncio.Task] = {}
+        self._refresh_tasks: dict[ServerKey, asyncio.Task] = {}
 
     # --- environment, command, transport ---------------------------------
 
@@ -624,16 +693,23 @@ class Supervisor:
         env.update(spec.env)
         return env
 
-    def _log_path(self, namespace: str):
-        return self.settings.data_dir / "logs" / f"{namespace}.log"
+    def _log_path(self, key: ServerKey):
+        # Keyed by reference: an admin-owned child keeps `logs/<ns>.log`, and
+        # two owners of one namespace never share a log.
+        return self.settings.data_dir / "logs" / f"{key.ref}.log"
 
     def _build_transport(
         self, spec: ServerSpec, generation: int = 0
     ) -> ClientTransport:
         if spec.kind == "remote":
+            # A copy: fastmcp keeps the dict, and `_apply_refresh_header` writes
+            # into the live transport's dict. Shared with the stored record, that
+            # write would change the record in place and leave its approval memo
+            # stale (bound-user-writes R1).
+            headers = dict(spec.headers)
             if spec.transport == "sse":
-                return SSETransport(spec.url, headers=spec.headers)
-            return StreamableHttpTransport(spec.url, headers=spec.headers)
+                return SSETransport(spec.url, headers=headers)
+            return StreamableHttpTransport(spec.url, headers=headers)
         # The raw source, never the redacted one: the child has to install from
         # it. The marketplace detail calls the same function with the redacted
         # form, so the page and the child agree on the shape and differ only in
@@ -645,7 +721,7 @@ class Supervisor:
             command=spec.command,
             source=spec.source,
         )
-        log_path = self._log_path(spec.namespace)
+        log_path = self._log_path(spec.key)
         log_path.write_text("")  # truncate on each start
         # Open the log here, in the same synchronous step as the truncate and
         # the `child.spec` read of `_run_start`, and hand fastmcp the handle.
@@ -667,7 +743,7 @@ class Supervisor:
                 keep_alive=True,
                 log_file=log,
             ),
-            spec.namespace,
+            spec.key.ref,
             generation,
             log,
         )
@@ -689,20 +765,27 @@ class Supervisor:
         spec = child.spec
         if not spec.actions:
             # F2 revised: a non-capable child has no action, so no tool of it is
-            # ever hidden from an mcp session or reached by hash. Keep the
-            # pre-amendment chain (visibility, then namespace) and the
-            # `child-catalog-freshness` cache_ttl. NO ActionScopeFilter, NO
-            # AuthorizedHashProvider: the classification path is not built, so a
-            # stale cache cannot cross into an admin-only boundary.
+            # ever hidden from an mcp session by scope. Keep the pre-amendment
+            # chain (visibility, then namespace) and the
+            # `child-catalog-freshness` cache_ttl, with NO ActionScopeFilter:
+            # the classification path is not built, so a stale cache cannot
+            # cross into an admin-only boundary.
             ttl = (
                 spec.cache_ttl
                 if spec.cache_ttl is not None
                 else self.settings.child_cache_ttl
             )
             provider = ProxyProvider(self._make_factory(child.session), cache_ttl=ttl)
-            return provider.wrap_transform(visibility).wrap_transform(
+            chain = provider.wrap_transform(visibility).wrap_transform(
                 Namespace(spec.namespace)
             )
+            # D6: the mute is a global kill switch on every path. The app path
+            # skips every transform, so wrap this chain too: the wrapper re-runs
+            # the named decision there, which here is the mute alone. On the
+            # hashed path the chain's own template applies the mute mark, and
+            # the wrapper's `_check_hashed_target` refuses a muted tool. The
+            # cache stays below it and holds raw lists, never a decision.
+            return AuthorizedHashProvider(chain, spec.namespace)
         # F2 revised: an action-capable child. cache_ttl=0, so every
         # list_tools/get_tool/get_tool_by_hash re-lists the live generation. The
         # filter and the hashed-path authorizer then classify the metadata the
@@ -717,9 +800,10 @@ class Supervisor:
         chain = provider.wrap_transform(visibility).wrap_transform(
             Namespace(spec.namespace)
         )
-        # F1: outermost, so `AggregateProvider.get_tool_by_hash` and the app
-        # path resolve through it. It re-applies the named-path decision to the
-        # hashed and app paths, which bypass every transform otherwise.
+        # F1: outermost, so the hashed and app paths resolve through it. On the
+        # hashed path the chain's template applies the scope filter and the
+        # mute mark, and the wrapper refuses a muted tool; on the app path,
+        # which bypasses every transform, it re-applies the named decision.
         return AuthorizedHashProvider(chain, spec.namespace)
 
     def register_builtin(self, server: FastMCP) -> Provider:
@@ -790,7 +874,7 @@ class Supervisor:
         """
         session = child.session
         if session is None:
-            raise LeaseRefused(child.spec.namespace, 0, "no generation")
+            raise LeaseRefused(child.spec.key.ref, 0, "no generation")
         session.acquire()
         try:
             if session.client is not None:
@@ -831,31 +915,52 @@ class Supervisor:
 
     async def startup(self) -> None:
         # Before any child starts (design D7). First drop the credential of
-        # every namespace the registry does not list: a crash between
+        # every reference the registry does not list: a crash between
         # `registry.remove` and `creds.remove` leaves a live refresh token on
-        # disk otherwise (I2b).
-        for ns in self.creds.namespaces():
-            if ns not in self._children:
-                self.creds.remove(ns)
+        # disk otherwise (I2b). By reference, so the credential of `github`
+        # never survives or dies by the state of `github@alice`.
+        for ref in self.creds.refs():
+            if ServerKey.parse(ref) not in self._children:
+                self.creds.remove(ref)
         # Then make each header follow its `refresh.json` (D4, I5): a crash
         # between the file write and the header write left the old token in
         # the registry. No network call. Then one task per file, enabled or
-        # not: a disabled child keeps its grant alive.
-        for ns, child in self._children.items():
+        # not: a disabled child keeps its grant alive. A fault of one file
+        # never stops the boot (D11): an unreadable file is a recorded
+        # rejection with no task; any other read or repair fault starts the
+        # task, whose first round reads and repairs again.
+        for key, child in self._children.items():
             try:
-                state = self.creds.read_refresh(ns)
-            except ValueError:
-                logger.warning("ignoring an unreadable refresh.json for %s", ns)
+                state = self.creds.read_refresh(key.ref)
+            except _REFRESH_UNREADABLE as exc:
+                logger.warning(
+                    "refresh.json of %s is unreadable (%s)", key.ref, type(exc).__name__
+                )
+                self._record_error(
+                    child, _REFRESH_UNREADABLE_TEXT, self._secrets_of(child.spec)
+                )
+                child.refresh_rejected = child.last_error
+                continue
+            except OSError as exc:
+                logger.warning(
+                    "cannot read refresh.json of %s (%s); the refresh task retries",
+                    key.ref, type(exc).__name__,
+                )
+                self._start_refresh_task(key, child)
                 continue
             if state is None:
                 continue
-            self._apply_refresh_header(child, state)
-            self._start_refresh_task(ns, child)
+            try:
+                self._repair_refresh_header(child, state)
+            except Exception as exc:  # noqa: BLE001 -- one bad header must not stop the boot; the task repairs again
+                logger.warning(
+                    "header repair of %s failed (%s); the refresh task retries",
+                    key.ref, type(exc).__name__,
+                )
+            self._start_refresh_task(key, child)
         for child in self._children.values():
-            if child.spec.enabled:
-                child.status = "starting"
-                child.task = asyncio.create_task(self._run_start(child.spec.namespace))
-            else:
+            # A pending child stays `stopped`, even with `enabled` stored true.
+            if not (child.spec.enabled and self._start_unless_pending(child)):
                 child.status = "stopped"
 
     async def shutdown(self) -> None:
@@ -875,74 +980,149 @@ class Supervisor:
         `startup` before any task. No teardown, no restart (D8): fastmcp reads
         `transport.headers` at each connect, and every lease and proxy call
         builds a new `Client` over `child.transport`."""
-        ns = child.spec.namespace
+        key = child.spec.key
         name = state["header_name"]
         value = f"{state['header_scheme']} {state['access_token']}"
         remember_log_secrets(
             [state["access_token"], state["refresh_token"], value]
         )
-        self.registry.set_oauth_header(ns, name, value)
-        child.spec = self.registry.get(ns)
-        headers = getattr(child.transport, "headers", None)
-        if isinstance(headers, dict):
-            headers[name] = value
+        self.registry.set_oauth_header(key, name, value)
+        child.spec = self.registry.get(key)
+        if child.transport is not None:
+            headers = getattr(child.transport, "headers", None)
+            if isinstance(headers, dict):
+                headers[name] = value
+            else:
+                # D13: say so. The next start reads the registry header.
+                logger.warning(
+                    "the transport of %s has no header map; the new header "
+                    "applies at the next start",
+                    key.ref,
+                )
 
-    def _cancel_refresh_task(self, namespace: str) -> None:
-        """Cancel the namespace's task, if any. No await, so it is atomic with
+    def _repair_refresh_header(self, child: Child, state: dict) -> None:
+        """Make the registry header follow `refresh.json` (design D4, D10).
+
+        The one owner of "compare the header with the file, then repair when
+        they differ": `startup` and `_refresh_sync` call it. Writes only when
+        the header differs. The caller holds the child lock, or runs in
+        `startup` before any task. Raises what `_apply_refresh_header` raises.
+
+        A repair that writes heals the fault of an earlier header write, so it
+        clears the task's own transient text (D12), like a successful apply.
+        """
+        value = f"{state['header_scheme']} {state['access_token']}"
+        # The file's tokens join the log scrubber even when no write is due:
+        # after a restart the set does not hold them yet.
+        remember_log_secrets([state["access_token"], state["refresh_token"], value])
+        current = self.registry.get(child.spec.key).headers.get(state["header_name"])
+        if current != value:
+            self._apply_refresh_header(child, state)
+            if child.last_error == child.refresh_transient:
+                child.last_error = None
+            child.refresh_transient = None
+
+    def _cancel_refresh_task(self, key: ServerKey) -> None:
+        """Cancel the task of `key`, if any. No await, so it is atomic with
         the caller's lock hold."""
-        old = self._refresh_tasks.pop(namespace, None)
+        old = self._refresh_tasks.pop(key, None)
         if old is not None:
             old.cancel()
 
-    def _start_refresh_task(self, namespace: str, child: Child) -> None:
+    def _start_refresh_task(self, key: ServerKey, child: Child) -> None:
         """Start the task of the current grant. The caller has cancelled any
         previous task and knows `refresh.json` exists. No await."""
-        self._refresh_tasks[namespace] = asyncio.create_task(
-            self._refresh_loop(namespace, child, child.grant)
+        self._refresh_tasks[key] = asyncio.create_task(
+            self._refresh_loop(key, child, child.grant)
         )
 
-    def _refresh_current(self, namespace: str, child: Child, grant: int) -> bool:
+    def _refresh_current(self, key: ServerKey, child: Child, grant: int) -> bool:
         # I1: apply only for the same grant of the same `Child` object.
-        return self._children.get(namespace) is child and child.grant == grant
+        return self._children.get(key) is child and child.grant == grant
 
-    async def _refresh_loop(self, namespace: str, child: Child, grant: int) -> None:
-        """Keep one header sink grant alive (design D5, D6).
+    async def _refresh_sync(
+        self, key: ServerKey, child: Child, grant: int
+    ) -> dict | None:
+        """The start of each round (design D10). Returns the state of
+        `refresh.json`, or None to stop the task. Takes `child.lock`.
 
-        Each round sleeps until `expires_at - max(60, lifetime / 10)`, POSTs
+        Under the lock: check the grant and identity (I1), read the file, and
+        make the header follow it. None when the grant is no longer current,
+        the file is gone, or the file is unreadable (D11: recorded as a
+        rejection). Any other `OSError` of the read, and a fault of the header
+        repair, propagate as a round fault: that round sends no request, so the
+        provider does not rotate a grant whose header cannot follow the file.
+        """
+        async with child.lock:
+            if not self._refresh_current(key, child, grant):
+                return None
+            try:
+                state = self.creds.read_refresh(key.ref)
+            except _REFRESH_UNREADABLE as exc:
+                logger.warning(
+                    "refresh.json of %s is unreadable (%s)", key.ref, type(exc).__name__
+                )
+                self._record_error(
+                    child, _REFRESH_UNREADABLE_TEXT, self._secrets_of(child.spec)
+                )
+                child.refresh_rejected = child.last_error
+                return None
+            if state is None:
+                return None
+            self._repair_refresh_header(child, state)
+            return state
+
+    async def _refresh_loop(self, key: ServerKey, child: Child, grant: int) -> None:
+        """Keep one header sink grant alive (design D5, D6, D10).
+
+        Each round starts from `refresh.json` (D10): `_refresh_sync` checks
+        the grant, reads the file, and makes the header follow it. The file is
+        the only input of a round, so a header write that failed after the
+        file write cannot make the retry send the old refresh token. A file
+        that differs from the last read holds the task's own landed write, and
+        the task adopts it.
+
+        The round sleeps until `expires_at - max(60, lifetime / 10)`, POSTs
         the refresh without the child lock, then applies under the lock only
         when the captured grant and `Child` are still current. The lifetime is
         measured from when the task read the state, so a state read at startup
         uses the remaining lifetime (a later, still-safe margin).
 
-        The first round may fire at once (a past expiry at startup). Every
-        later round sleeps at least `REFRESH_RETRY_START`, so a provider that
+        The first request may fire at once (a past expiry at startup). Every
+        later one waits at least `REFRESH_RETRY_START`, so a provider that
         issues a very short `expires_in` cannot drive back-to-back refreshes.
-        An unexpected exception in a round (a disk error on the write, an
-        unusable URL, a corrupt `expires_at`) never ends the task: the round
-        records a scrubbed error with the exception class only, and the next
-        round retries after the same 30 s to 300 s backoff.
+        An unexpected exception in a round (a disk error, an unusable URL, a
+        header repair that raises, a transient read error) never ends the
+        task: the round records a scrubbed error with the exception class
+        only, and the next round first sleeps the 30 s to 300 s backoff, then
+        reads the file again (gate R1). A free lock does not yield, so without
+        that sleep a sync that raises every time would spin.
         """
+        state: dict | None = None
+        read_at = 0.0
+        floor = 0.0
+        backoff: float | None = None
         try:
-            try:
-                state = self.creds.read_refresh(namespace)
-            except ValueError:
-                logger.warning("ignoring an unreadable refresh.json for %s", namespace)
-                return
-            read_at = _now()
-            floor = 0.0
-            backoff: float | None = None
-            while state is not None and state.get("expires_at") is not None:
+            while True:
                 try:
+                    if backoff is not None:
+                        # A fault always waits before the next read (gate R1).
+                        await _sleep(backoff)
+                    fresh = await self._refresh_sync(key, child, grant)
+                    if fresh is None or fresh.get("expires_at") is None:
+                        return
+                    if fresh != state:
+                        # The first round, or the task's own write landed.
+                        state, read_at, backoff = fresh, _now(), None
                     if backoff is None:
                         expires_at = state["expires_at"]
                         margin = max(REFRESH_MIN_MARGIN, (expires_at - read_at) / 10)
-                        wait = max(floor, expires_at - margin - _now())
-                    else:
-                        wait = backoff
-                    await _sleep(wait)
+                        await _sleep(max(floor, expires_at - margin - _now()))
+                    # Else: a fault with the file unchanged. The backoff
+                    # already waited; send the request with no second sleep.
                     floor = REFRESH_RETRY_START
-                    state = await self._refresh_once(namespace, child, grant, state)
-                    read_at = _now()
+                    if not await self._refresh_once(key, child, grant, state):
+                        return
                     backoff = None
                 except Exception as exc:  # noqa: BLE001 -- the task must outlive any fault; CancelledError is not an Exception
                     backoff = (
@@ -955,45 +1135,69 @@ class Supervisor:
                     name = type(exc).__name__
                     logger.warning(
                         "token refresh for %s failed (%s); retrying in %.0fs",
-                        namespace, name, backoff,
+                        key.ref, name, backoff,
                     )
-                    async with child.lock:
-                        if self._refresh_current(namespace, child, grant):
-                            self._record_error(
-                                child,
-                                f"refresh failed ({name}); retrying",
-                                self._secrets_of(child.spec),
-                            )
+                    try:
+                        async with child.lock:
+                            if self._refresh_current(key, child, grant):
+                                self._record_error(
+                                    child,
+                                    f"refresh failed ({name}); retrying",
+                                    self._secrets_of(child.spec),
+                                )
+                                child.refresh_transient = child.last_error
+                    except Exception as rec:  # noqa: BLE001 -- a fault of the record must not end the task
+                        logger.warning(
+                            "token refresh for %s: the error record failed (%s)",
+                            key.ref, type(rec).__name__,
+                        )
         finally:
-            if self._refresh_tasks.get(namespace) is asyncio.current_task():
-                del self._refresh_tasks[namespace]
+            if self._refresh_tasks.get(key) is asyncio.current_task():
+                del self._refresh_tasks[key]
 
     async def _refresh_once(
-        self, namespace: str, child: Child, grant: int, state: dict
-    ) -> dict | None:
-        """One refresh with retries. Returns the applied state, or None to
-        stop the task (rejected, or the grant is no longer current). Never logs
-        a body or a token."""
+        self, key: ServerKey, child: Child, grant: int, state: dict
+    ) -> bool:
+        """One refresh request of a round, with its transport retries (design
+        D6, D10). Returns True when applied: the loop continues, and its next
+        `_refresh_sync` reads the file. Returns False to stop the task: a
+        rejection, or the grant is no longer current.
+
+        The retries keep `state`: no write happens between them, so it equals
+        the file. At or after `expires_at` a retry records
+        `refresh failing (<cause>); retrying` (D12): the header no longer
+        works. Never logs a body or a token."""
         delay = REFRESH_RETRY_START
         while True:
-            if not self._refresh_current(namespace, child, grant):
-                return None
+            if not self._refresh_current(key, child, grant):
+                return False
             url, body = refresh_request(state)
             resp = None
+            cause = ""
             try:
                 # Through the module, so a test can `monkeypatch` the factory.
                 async with _oauth.http_client() as client:
                     resp = await client.post(url, data=body)
-            except httpx.HTTPError:
+            except httpx.HTTPError as exc:
                 # A transport error or a timeout. The exception can carry the
-                # URL and the body, so it is not logged.
-                pass
+                # URL and the body, so only its class name is kept.
+                cause = type(exc).__name__
             status = resp.status_code if resp is not None else None
             if status is None or status in (408, 429) or status >= 500:
+                cause = str(status) if status is not None else cause
                 logger.info(
                     "token refresh for %s failed (%s); retrying in %.0fs",
-                    namespace, status or "transport error", delay,
+                    key.ref, cause, delay,
                 )
+                if _now() >= state["expires_at"]:
+                    async with child.lock:
+                        if self._refresh_current(key, child, grant):
+                            self._record_error(
+                                child,
+                                f"refresh failing ({cause}); retrying",
+                                self._secrets_of(child.spec),
+                            )
+                            child.refresh_transient = child.last_error
                 await _sleep(delay)
                 delay = min(delay * 2, REFRESH_RETRY_CAP)
                 continue
@@ -1024,13 +1228,18 @@ class Supervisor:
                     new_state = None
                 if new_state is not None:
                     async with child.lock:
-                        if not self._refresh_current(namespace, child, grant):
-                            return None
+                        if not self._refresh_current(key, child, grant):
+                            return False
                         # D4: the file first, then the header.
-                        self.creds.write_refresh(namespace, new_state)
+                        self.creds.write_refresh(key.ref, new_state)
                         self._apply_refresh_header(child, new_state)
-                    logger.info("refreshed the access token of %s", namespace)
-                    return new_state
+                        # D12: clear only the transient text this task stored;
+                        # a rejection or a start error is never equal to it.
+                        if child.last_error == child.refresh_transient:
+                            child.last_error = None
+                        child.refresh_transient = None
+                    logger.info("refreshed the access token of %s", key.ref)
+                    return True
             # Any other status, or a 2xx this task cannot use: stop, keep the
             # file, and tell the admin to re-authorize.
             # The current tokens join the scrub set: a provider may echo the
@@ -1052,23 +1261,93 @@ class Supervisor:
                     # that no longer matches the secret.
                     error = scrub_secrets(error, secrets)[:_OAUTH_ERROR_MAX]
             async with child.lock:
-                if self._refresh_current(namespace, child, grant):
+                if self._refresh_current(key, child, grant):
                     self._record_error(
                         child,
                         f"refresh rejected ({status} {error}); re-authorize",
                         secrets,
                     )
                     child.refresh_rejected = child.last_error
-            return None
+            return False
 
     def children(self) -> list[Child]:
         return list(self._children.values())
 
-    def get(self, namespace: str) -> Child:
-        return self._children[namespace]
+    def children_of(self, owner: str | None) -> list[Child]:
+        """The children of one owner; `None` names the admin-owned ones."""
+        return [c for c in self.children() if c.spec.owner == owner]
 
-    async def _run_start(self, namespace: str) -> None:
-        child = self._children[namespace]
+    def routed(self, reach: Reach) -> list[tuple[ServerKey, Provider]]:
+        """The provider of each running child whose key `reach` holds.
+
+        The router asks only these, so a server outside the `Reach` is never
+        asked. Reads the mount table's members through `child.provider`, which
+        `_run_start` and `_teardown` set and clear together with the table.
+        """
+        keys = set(reach.keys)
+        return [
+            (key, c.provider)
+            for c in self.children()
+            if c.status == "running"
+            and c.provider is not None
+            and (key := c.spec.key) in keys
+        ]
+
+    def get(self, key: ServerKey) -> Child:
+        """The child of `key`. `KeyError` carries the reference, so every
+        error mapper names `<ref> not found`, as it named the namespace."""
+        try:
+            return self._children[key]
+        except KeyError:
+            raise KeyError(key.ref) from None
+
+    def _begin_start(self, child: Child) -> None:
+        """The one start gate: step one of the two-step start (D7).
+
+        Every start path calls this, and nothing else creates a start task.
+        It reads the STORED record, never an incoming spec, so no caller body
+        can carry an approval in. A pending child raises before any state
+        changes: no task, no transport, no provider, so a pending `remote`
+        child sends no request to its URL. The child then runs the record the
+        gate checked, because `child.spec` is set from that same read.
+
+        Synchronous on purpose: no await separates the check from the task
+        creation, and the publish block of `_run_start` (step two) mounts the
+        provider only while the status is still `starting`. An edit cancels
+        the task in `_teardown`, so an un-approved revision never publishes.
+        """
+        key = child.spec.key
+        child.spec = self._approved_record(key)
+        child.status = "starting"
+        child.task = asyncio.create_task(self._run_start(key))
+
+    def _approved_record(self, key: ServerKey) -> ServerSpec:
+        """The stored record of `key`, or `RegistryError` when it is pending.
+
+        The gate's one read. `enable` also calls it before its registry
+        write, so a refused enable changes nothing.
+        """
+        stored = self.registry.get(key)
+        if stored.approval != "approved":
+            raise RegistryError(f"{key.ref} awaits approval")
+        return stored
+
+    def _start_unless_pending(self, child: Child) -> bool:
+        """Pass the gate, or leave the child alone when it awaits approval.
+
+        For the paths where a pending child is a normal end state, not an
+        error: `startup`, `add`, `update`, and the OAuth completion. The
+        caller sets `stopped` on `False`. `enable` and `restart` call the
+        gate directly, so they raise.
+        """
+        try:
+            self._begin_start(child)
+        except RegistryError:
+            return False
+        return True
+
+    async def _run_start(self, key: ServerKey) -> None:
+        child = self.get(key)
         spec = child.spec
         # The secret set of this generation, captured before the probe. A
         # concurrent `update` cancels this task, so its error is normally never
@@ -1093,7 +1372,7 @@ class Supervisor:
             )
         )
         session = ChildSession(
-            namespace=spec.namespace,
+            namespace=spec.key.ref,
             generation=generation,
             transport=transport,
             client=owned,
@@ -1150,14 +1429,19 @@ class Supervisor:
                 # the provider and sets `running`, so a lease or a proxy call is
                 # granted exactly when the tools become reachable.
                 session.state = "open"
+                # Seed the snapshot in the same block (design D2), so the first
+                # render after a start lists the rows and starts no probe. A
+                # probe never writes `tool_count`: it keeps the start read.
+                session.tools = list(tools)
+                session.probed_at = time.monotonic()
         finally:
             # Clear the in-flight task, but only when it is still this task.
             # A concurrent teardown/restart may have installed a newer task.
             if child.task is asyncio.current_task():
                 child.task = None
 
-    def _still_current(self, namespace: str, child: Child) -> None:
-        """Fail if this child is no longer the one that owns the namespace.
+    def _still_current(self, key: ServerKey, child: Child) -> None:
+        """Fail if this child is no longer the one that owns the key.
 
         A mutator resolves its child before it awaits `child.lock`, so a
         queued waiter can hold a generation that a completed `remove` already
@@ -1167,13 +1451,46 @@ class Supervisor:
         down its own stale object.
 
         The lock cannot prevent this on its own: it belongs to the `Child`,
-        so it serialises one generation, not the namespace. Re-check identity
+        so it serialises one generation, not the key. Re-check identity
         after acquiring it.
         """
-        if self._children.get(namespace) is not child:
+        if self._children.get(key) is not child:
             raise RegistryError(
-                f"{namespace} changed while the operation waited; try again"
+                f"{key.ref} changed while the operation waited; try again"
             )
+
+    def _authorize(self, actor: User, key: ServerKey | None, *, admin: bool) -> None:
+        """The write-time decision of a server write.
+
+        Synchronous on purpose: the caller writes after this returns, with no
+        `await` between. `require_current` first, then the right of the write
+        on the snapshot. Writes nothing; never grants a right.
+
+        The policy owns the primitives: `require_current`, the admin check,
+        and `can_manage`. This method only puts them in sequence for a server
+        write, so the supervisor holds the whole decision and no adapter can
+        widen it. A key the actor cannot manage reads as a missing one
+        (`KeyError`), the rule of the edge."""
+        self.policy.require_current(actor)
+        if admin and not actor.is_admin:
+            raise PermissionError(ADMIN_REQUIRED)
+        if key is not None and not self.policy.can_manage(actor, key):
+            raise KeyError(key.ref)
+
+    @contextlib.asynccontextmanager
+    async def _locked(
+        self, key: ServerKey, actor: User, *, admin: bool = False
+    ) -> AsyncIterator[Child]:
+        """Take the child lock, then decide, then hand the child to the write.
+
+        The one `await` is the lock, and it comes first: the checks see the
+        state at lock time. Nothing awaits between `_authorize` and the first
+        statement of the caller's block."""
+        child = self.get(key)
+        async with child.lock:
+            self._still_current(key, child)
+            self._authorize(actor, key, admin=admin)
+            yield child
 
     async def _teardown(self, child: Child) -> None:
         """Release the live resources of a child.
@@ -1227,6 +1544,14 @@ class Supervisor:
             try:
                 if session is not None:
                     session.state = "closing"
+                    # Cancel the snapshot probe in the same synchronous block
+                    # (design D6): no render starts a probe of a `closing`
+                    # generation, so none can start after this. Not awaited: the
+                    # drain below waits for its lease. The cancel shortens the
+                    # drain, it does not bound it; FastMCP can swallow it, so
+                    # the probe keeps its own captured-session guards (D4).
+                    if session.probe is not None:
+                        session.probe.cancel()
                     # Wait for the in-flight leases to drain, but only for the
                     # bound. A hold past it is a hung request; the close below
                     # fails it.
@@ -1269,29 +1594,34 @@ class Supervisor:
     # --- public operations ----------------------------------------------
 
     def _check_source(self, spec: ServerSpec) -> None:
-        """Reject a source under the store root that is not this namespace's.
+        """Reject a source under the store root that is not this reference's.
 
         A source that resolves inside `DATA_DIR/servers` must resolve to
-        exactly this namespace's own directory. One guard for every write path
+        exactly the directory of the spec's own reference. The store resolves
+        symlinks and `..` before it compares, so `servers/tool@alice/../github`
+        is the directory of `github`. Another namespace and the same namespace
+        under another owner are both refused. One guard for every write path
         (form, REST, admin MCP), so no child runs from another child's tree
-        and no `remove` deletes a directory a sibling owns. `RegistryError` is
+        and no `remove` deletes a directory a sibling owns. The callers run it
+        before the registry write and before any teardown. `RegistryError` is
         a `ValueError`, so the REST layer answers 400 and the admin tool a
         `ToolError` with no new mapping.
         """
         owner = self.sources.owner_of(spec.source)
-        if owner is not None and not self.sources.owns(spec.source, spec.namespace):
+        ref = spec.key.ref
+        if owner is not None and not self.sources.owns(spec.source, ref):
             root = self.sources.root
             if owner == "":
                 raise RegistryError(
                     f"source: {spec.source} is inside DATA_DIR/servers but is "
-                    f"not {root}/{spec.namespace}"
+                    f"not {root}/{ref}"
                 )
             raise RegistryError(
-                f"source: {spec.source} belongs to namespace {owner}"
+                f"source: {spec.source} belongs to reference {owner}"
             )
 
     def _check_creds(
-        self, namespace: str, enabled: bool, oauth_pending: bool = False
+        self, key: ServerKey, enabled: bool, oauth_pending: bool = False
     ) -> None:
         """Refuse to enable a child that awaits OAuth authorization.
 
@@ -1304,14 +1634,17 @@ class Supervisor:
         `RegistryError` is a `ValueError`, so every caller answers 400 with no
         new mapping.
         """
-        if enabled and (self.creds.awaiting(namespace) or oauth_pending):
+        # The own reference only: the credential state of the same namespace
+        # under another owner never decides this guard.
+        if enabled and (self.creds.awaiting(key.ref) or oauth_pending):
             raise RegistryError(
-                f"{namespace} awaits authorization; delete it and connect again"
+                f"{key.ref} awaits authorization; delete it and connect again"
             )
 
     async def add(
         self,
         spec: ServerSpec,
+        actor: User,
         client_fmt: str | None = None,
         client: ClientCreds | None = None,
     ) -> Child:
@@ -1322,35 +1655,67 @@ class Supervisor:
         The web layer must not do that pair itself: `add` awaits the child lock
         after the install, and a `remove` that interleaves there would leave a
         `client.json` for a namespace the registry no longer lists.
+
+        `actor` decides the owner; the body never does. An admin actor adds
+        an admin-owned server (owner `None`). A non-admin actor adds a server
+        it owns, pending approval, with no trust grant: `approved_revision`,
+        `actions`, and `catalog` are reset whatever the body holds (D7). The
+        registry refuses an unpinned user-owned spec at the write (D7b).
+
+        The actor check runs first, with no `await` before the registry write:
+        a demoted or deleted actor raises `PermissionError` and nothing is
+        written (no record, no rule purge, no log delete, no client file). The
+        check never moves an admin call to the user branch.
         """
-        ns = spec.namespace
-        if ns in self._removing:
-            # A `remove` holds the namespace until its teardown returns. Its
-            # old process may still be alive and may still write its token
-            # file, which a replacement registered now would inherit.
-            raise RegistryError(f"namespace {ns} is being removed")
+        self.policy.require_current(actor)
+        if actor.is_admin:
+            spec = spec.model_copy(update={"owner": None, "approved_revision": None})
+        else:
+            spec = spec.model_copy(
+                update={
+                    "owner": actor.id,
+                    "approved_revision": None,
+                    "actions": False,
+                    "catalog": None,
+                }
+            )
+        key = spec.key
+        if key in self._removing:
+            # A `remove` holds the key until its teardown returns. Its old
+            # process may still be alive and may still write its token file,
+            # which a replacement registered now would inherit.
+            raise RegistryError(f"{key.ref} is being removed")
         self._check_source(spec)
-        self._check_creds(ns, spec.enabled, spec.oauth_pending)
-        # A log under a free namespace is residue (a remove that a restart
+        self._check_creds(key, spec.enabled, spec.oauth_pending)
+        # Prove the key free BEFORE the rule purge: a duplicate add must
+        # keep the rules of the live server. A free key's rules are residue
+        # of a removed server, so a new server inherits no grant (D8b). A
+        # refusal by `registry.add` below drops only that residue.
+        if any(s.key == key for s in self.registry.list()):
+            raise RegistryError(f"namespace {key.ref} already exists")
+        self.policy.drop_server_rules(key)
+        # A log under a free key is residue (a remove that a restart
         # interrupted, or one from before the log delete) and holds an old
         # child's output, which this child cannot scrub. Discard it BEFORE the
         # registry write, for the reason `update` discards first: a crash or
         # an `OSError` after the write would leave the new record beside the
-        # old log. Only when the registry does not list the namespace, so a
-        # duplicate `add` (which `registry.add` refuses below) never deletes
-        # the log of a live child.
-        if ns not in self._children:
-            self._log_path(ns).unlink(missing_ok=True)
+        # old log. Only after the proof above that the key is free, so a
+        # duplicate `add` never deletes the log of a live child. By key, so
+        # `logs/github@alice.log` never touches `logs/github.log`.
+        self._log_path(key).unlink(missing_ok=True)
         self.registry.add(spec)
-        # `registry.add` raises on a duplicate, so reaching here proves the
-        # namespace was free, so any credential directory under it is residue
-        # of a removal that a restart interrupted. Delete it AFTER that proof,
-        # never before: before it, a duplicate `add` would delete the live
-        # child's credential and only then raise. No `await` from the registry
-        # write to the install below, so nothing can interleave.
-        self.creds.remove(ns)
+        # `registry.add` raises on a duplicate key, and the key and the
+        # reference map one to one, so reaching here proves the REFERENCE was
+        # free, and any credential directory under it is residue of a removal
+        # that a restart interrupted. A free namespace proves nothing: another
+        # owner may hold it, so the purge names the reference, never the
+        # namespace alone. Delete it AFTER that proof, never before: before
+        # it, a duplicate `add` would delete the live child's credential and
+        # only then raise. No `await` from the registry write to the install
+        # below, so nothing can interleave.
+        self.creds.remove(key.ref)
         child = _new_child(spec)
-        self._children[spec.namespace] = child
+        self._children[key] = child
         # The client file is written last, after the registry and the child
         # table already agree. It is the only fallible step here: a disk error
         # between the two stores would stand the namespace up in one and not
@@ -1361,26 +1726,34 @@ class Supervisor:
         # `await` since `registry.add`, so the register-before-write order the
         # residue purge depends on is unchanged.
         if client_fmt is not None:
-            self.creds.write_client(ns, client_fmt, client)
+            self.creds.write_client(key.ref, client_fmt, client)
         async with child.lock:
-            if spec.enabled:
-                child.status = "starting"
-                child.task = asyncio.create_task(self._run_start(spec.namespace))
-            else:
+            # A pending child stays `stopped`; the add itself succeeds.
+            if not (spec.enabled and self._start_unless_pending(child)):
                 child.status = "stopped"
         return child
 
-    async def update(self, spec: ServerSpec) -> Child:
-        child = self._children[spec.namespace]
-        async with child.lock:
-            self._still_current(spec.namespace, child)
+    async def update(self, key: ServerKey, spec: ServerSpec, actor: User) -> Child:
+        """Replace the caller-owned fields of the child `key` names.
+
+        The key names the child, never the body: the owner is stamped from
+        `key`, and a body that names another namespace is refused, so an edit
+        can never land on a different server.
+
+        `actor` is checked under the child lock, before the first write.
+        """
+        # Before the lock and the check: it writes nothing.
+        if spec.namespace != key.namespace:
+            raise RegistryError(
+                f"namespace: {spec.namespace} does not match {key.ref}"
+            )
+        spec = spec.model_copy(update={"owner": key.owner})
+        async with self._locked(key, actor) as child:
             self._check_source(spec)
             # oauth_pending is registry-owned and preserved by registry.update,
             # so an edit that omits it (defaulting False) must not lower the
             # guard: read the stored value, not the incoming spec's.
-            self._check_creds(
-                spec.namespace, spec.enabled, child.spec.oauth_pending
-            )
+            self._check_creds(key, spec.enabled, child.spec.oauth_pending)
             # When the secret set changes, the retained log holds a secret that
             # `_scrub` cannot mask once `child.spec` holds the new record, so
             # discard the log BEFORE the record is persisted. `merge` validates
@@ -1398,25 +1771,47 @@ class Supervisor:
             # from here to the write, so `merge` and `update` agree.
             old_secrets = set(self._secrets_of(child.spec))
             if set(self._secrets_of(self.registry.merge(spec))) != old_secrets:
-                self._log_path(spec.namespace).unlink(missing_ok=True)
+                self._log_path(key).unlink(missing_ok=True)
             self.registry.update(spec)
             await self._teardown(child)
             # `registry.update` merges the visibility state and `created_at`
             # into the stored record. Read it back: installing the incoming
             # `spec` here would drop the merge, and `_build_provider` reads
             # `child.spec`, so the restart would republish a muted tool.
-            child.spec = self.registry.get(spec.namespace)
-            if spec.enabled:
-                child.status = "starting"
-                child.task = asyncio.create_task(self._run_start(spec.namespace))
-            else:
+            child.spec = self.registry.get(key)
+            # A pending child (an edit of a revision field un-approves it) is
+            # left `stopped` by the gate, the same as a disabled one.
+            if not (spec.enabled and self._start_unless_pending(child)):
                 child.status = "stopped"
         return child
 
-    async def remove(self, namespace: str) -> None:
-        child = self._children[namespace]
-        async with child.lock:
-            self._still_current(namespace, child)
+    async def approve(self, key: ServerKey, revision: str, actor: User) -> Child:
+        """Approve the revision the admin read, then start through the gate.
+
+        `revision` is the one the approver saw. Compared with the revision of
+        the STORED spec under the child lock, the same lock `update` holds
+        across its write and teardown, so an edit lands either before the
+        compare (a mismatch: `RevisionConflict`, nothing changes) or after
+        the approval (it un-approves and cancels the start). A stale page
+        never approves code its reader did not see (F1). Admin-only: an
+        owner cannot approve its own server.
+        """
+        async with self._locked(key, actor, admin=True) as child:
+            if key.owner is None:
+                raise RegistryError(f"{key.ref} is admin-owned and needs no approval")
+            stored = spec_revision(self.registry.get(key))
+            if revision != stored:
+                raise RevisionConflict(key.ref, stored)
+            self.registry.set_approved_revision(key, revision)
+            child.spec = self.registry.get(key)
+            # `stopped` only: an approve of an already running child (a
+            # repeat) must not start a second task over the live transport.
+            if child.spec.enabled and child.status == "stopped":
+                self._begin_start(child)
+        return child
+
+    async def remove(self, key: ServerKey, actor: User) -> None:
+        async with self._locked(key, actor) as child:
             # Write first, like the other persisted lifecycle mutators here.
             # Tearing down first and then failing the write would unpublish
             # the provider and drop the transport handle while the registry still
@@ -1425,36 +1820,37 @@ class Supervisor:
             # absent: `_teardown` swallows `Exception` and `CancelledError`,
             # so no ordinary failure returns control part-way, but another
             # `BaseException` still escapes. See its docstring.
-            self.registry.remove(namespace)
-            # Reserve the namespace for the rest of this removal. Not at the
+            self.registry.remove(key)
+            # Reserve the key for the rest of this removal. Not at the
             # entry of this method: the first `await` here is the child lock
             # above, so reserving at entry would hold the namespace while this
             # call queues behind another operation that `_still_current` may
             # then reject anyway.
-            self._removing.add(namespace)
+            self._removing.add(key)
             try:
                 # Drop the open flow and the credential files in the same
                 # window, right after the registry write and before the first
                 # `await`. A callback that arrives after this would otherwise
-                # write a token file for a namespace that no longer exists, or
+                # write a token file for a reference that no longer exists, or
                 # enable a reconnected child with a token issued to the old
                 # client. `discard` and `remove` are both no-ops when absent.
                 # This delete runs while the process is still up: it is the one
                 # stated exception to "touch a credential only while no process
-                # of that namespace runs", and it races only the file of the
-                # child being removed.
-                self.flows.discard(namespace)
+                # of that reference runs", and it races only the file of the
+                # child being removed. Every store call names `key.ref`, so
+                # the removal of `github@alice` never touches `github`.
+                self.flows.discard(key.ref)
                 # Retire the grant and its refresh task before the teardown
                 # (design D7, I2): a refresh response that arrives later sees
                 # the bump and writes nothing.
                 child.grant += 1
-                self._cancel_refresh_task(namespace)
-                self.creds.remove(namespace)
+                self._cancel_refresh_task(key)
+                self.creds.remove(key.ref)
                 # Drop the child before the first await, so `children()` never
                 # sees a child that is half torn down. Nothing between the
                 # write and the `del` suspends.
                 child.status = "stopped"
-                del self._children[namespace]
+                del self._children[key]
                 await self._teardown(child)
                 # Delete again now the teardown has closed the transport. A
                 # child that rewrites its own token file, as one that refreshes
@@ -1462,21 +1858,27 @@ class Supervisor:
                 # the first delete; `rmtree(ignore_errors=True)` reports
                 # nothing. No child-table guard: the reservation admits no
                 # replacement, so there is nothing here to protect.
-                self.creds.remove(namespace)
+                self.creds.remove(key.ref)
                 # And the log: it holds this child's raw output, which a later
-                # child under the same namespace could not scrub (its secret
-                # set is different), so `server_log` would show the old secret.
-                self._log_path(namespace).unlink(missing_ok=True)
+                # child under the same key could not scrub (its secret set is
+                # different), so `server_log` would show the old secret.
+                self._log_path(key).unlink(missing_ok=True)
                 # Same for the source directory, and for the same reason it
                 # waits for the teardown: no delete pulls files out from under
                 # a live process. `owns` answers whether the directory is ours
                 # to delete at all, since a `source` may name a foreign path.
-                if self.sources.owns(child.spec.source, namespace):
-                    self.sources.remove(namespace)
+                if self.sources.owns(child.spec.source, key.ref):
+                    self.sources.remove(key.ref)
+                # Hygiene (D8b): drop the grants that name the reference. After
+                # the registry write and the teardown, so a failed rule write
+                # can never strand a half torn down child. A rule that outlives
+                # a crash here grants nothing: no server holds the reference,
+                # and the next `add` of it purges the rule first.
+                self.policy.drop_server_rules(key)
             finally:
                 # Release whatever the teardown or the deletes did. An `OSError`
-                # from the source delete propagates with the namespace free.
-                self._removing.discard(namespace)
+                # from the source delete propagates with the key free.
+                self._removing.discard(key)
 
     async def finish_oauth(
         self,
@@ -1513,43 +1915,61 @@ class Supervisor:
 
         Returns `True` when applied, `False` when the flow was gone (removed or
         expired during the exchange) or the child changed.
+
+        `flow.actor`, the admin who opened the flow, is checked right after
+        the pop, so the flow is spent whatever the answer. A refusal raises
+        `PermissionError` or `KeyError` and writes no credential. A file sink
+        re-authorization checks again after its teardown, before the client
+        write; that refusal leaves the child `stopped` with its old token.
         """
-        namespace = flow.namespace
-        child = self._children.get(namespace)
+        key = ServerKey.parse(flow.ref)
+        child = self._children.get(key)
         if child is None:
             # The child was removed during the exchange; its flow is already
             # discarded. Consume the state in case it somehow survived.
             self.flows.pop(flow.state)
             return False
         async with child.lock:
-            if self._children.get(namespace) is not child:
+            if self._children.get(key) is not child:
                 # A remove-then-add replaced the child during the exchange.
                 self.flows.pop(flow.state)
                 return False
             if self.flows.pop(flow.state) is None:
                 # Removed or expired during the exchange: write nothing.
                 return False
+            # After the pop: a refused flow is consumed. No `await` from here
+            # to the first write.
+            self._authorize(flow.actor, key, admin=True)
             if header is not None:
                 # A new grant (D5), retired first: a refresh in flight for the
                 # old grant is discarded, and the old task is cancelled before
                 # any write, so a failing write cannot leave it live.
                 child.grant += 1
-                self._cancel_refresh_task(namespace)
-                # The rejection belonged to the old grant.
-                if child.last_error is not None and child.last_error == child.refresh_rejected:
+                self._cancel_refresh_task(key)
+                # The rejection and the transient error belonged to the old
+                # grant (D12): clear `last_error` only when it is one of them.
+                if child.last_error is not None and child.last_error in (
+                    child.refresh_rejected,
+                    child.refresh_transient,
+                ):
                     child.last_error = None
                 child.refresh_rejected = None
+                child.refresh_transient = None
                 # Public client (design D3, D4): `refresh.json` first, in this
                 # lock hold, then the header. Every other header sink callback
-                # deletes the file: no refresh token, or a provider that is now
-                # confidential. A stale file would otherwise let a later task
-                # overwrite this grant's header with the old grant.
-                wrote_refresh = header.refresh_token_url is not None and bool(
-                    tokens.get("refresh_token")
+                # deletes the file: no refresh token, a provider that is now
+                # confidential, or a user-owned key (D13, m9: `headers` is a
+                # revision field, so a refresh would drop the approval). A
+                # stale file would otherwise let a later task overwrite this
+                # grant's header with the old grant.
+                wrote_refresh = (
+                    key.owner is None
+                    and header.refresh_token_url is not None
+                    and bool(tokens.get("refresh_token"))
                 )
                 if wrote_refresh:
                     self.creds.write_refresh(
-                        namespace,
+                        key.ref,
                         refresh_state(
                             flow.client.client_id,
                             header.refresh_token_url,
@@ -1558,7 +1978,7 @@ class Supervisor:
                         ),
                     )
                 else:
-                    self.creds.remove_refresh(namespace)
+                    self.creds.remove_refresh(key.ref)
                 # Header sink: one registry write sets the header AND clears
                 # oauth_pending, so the token and the awaiting flag flip in one
                 # atomic write. `update` preserves oauth_pending, so this uses
@@ -1568,10 +1988,10 @@ class Supervisor:
                 remember_log_secrets(
                     [tokens["access_token"], str(tokens.get("refresh_token") or ""), value]
                 )
-                self.registry.set_oauth_header(namespace, header.name, value)
-                child.spec = self.registry.get(namespace)
+                self.registry.set_oauth_header(key, header.name, value)
+                child.spec = self.registry.get(key)
                 if wrote_refresh:
-                    self._start_refresh_task(namespace, child)
+                    self._start_refresh_task(key, child)
             else:
                 if reauth:
                     # Stop the child before writing. A child that refreshes its
@@ -1591,34 +2011,35 @@ class Supervisor:
                     # The tail below overwrites this with `starting` on the way
                     # back up.
                     child.status = "stopped"
+                    # The teardown awaited the lease drain: check the opener
+                    # again, with no `await` from here to the writes.
+                    self._authorize(flow.actor, key, admin=True)
                 # File sink: client before token, no await between, so the old
                 # token survives until the new one replaces it. The teardown
                 # moved in front of the pair, never between it.
                 if client_fmt is not None:
-                    self.creds.write_client(namespace, client_fmt, flow.client)
-                self.creds.write_token(namespace, token_fmt, tokens)
+                    self.creds.write_client(key.ref, client_fmt, flow.client)
+                self.creds.write_token(key.ref, token_fmt, tokens)
             if reauth:
                 # Restart to load the new token, but only when the child is
                 # still enabled. A disable during the flow is honored.
-                if self.registry.get(namespace).enabled:
+                if self.registry.get(key).enabled:
                     await self._teardown(child)
-                    child.spec = self.registry.get(namespace)
-                    child.status = "starting"
-                    child.task = asyncio.create_task(self._run_start(namespace))
+                    child.spec = self.registry.get(key)
+                    if not self._start_unless_pending(child):
+                        child.status = "stopped"
                 else:
                     child.status = "stopped"
             elif child.status == "stopped":
                 # Connect: the credential now exists, so `_check_creds` passes.
-                self.registry.set_enabled(namespace, True)
-                child.spec = self.registry.get(namespace)
-                child.status = "starting"
-                child.task = asyncio.create_task(self._run_start(namespace))
+                # The gate still decides: a pending child stays `stopped`.
+                self.registry.set_enabled(key, True)
+                child.spec = self.registry.get(key)
+                self._start_unless_pending(child)
         return True
 
-    async def enable(self, namespace: str) -> None:
-        child = self._children[namespace]
-        async with child.lock:
-            self._still_current(namespace, child)
+    async def enable(self, key: ServerKey, actor: User) -> None:
+        async with self._locked(key, actor) as child:
             # Idempotent: enable states an end state ("this child is on"), not
             # a transition. A child that is not `stopped` already meets it, so
             # enabling it again is a no-op. Starting a second task here would
@@ -1628,32 +2049,39 @@ class Supervisor:
             # child; `enable` only turns a `stopped` one on.
             if child.status != "stopped":
                 return
-            self._check_creds(namespace, True, child.spec.oauth_pending)
-            self.registry.set_enabled(namespace, True)
-            child.spec = self.registry.get(namespace)
-            child.status = "starting"
-            child.task = asyncio.create_task(self._run_start(namespace))
+            self._check_creds(key, True, child.spec.oauth_pending)
+            # Refuse a pending child before the write, so a refused enable
+            # leaves `enabled` and the status unchanged.
+            self._approved_record(key)
+            self.registry.set_enabled(key, True)
+            child.spec = self.registry.get(key)
+            self._begin_start(child)
 
-    async def disable(self, namespace: str) -> None:
-        child = self._children[namespace]
-        async with child.lock:
-            self._still_current(namespace, child)
-            self.registry.set_enabled(namespace, False)
-            child.spec = self.registry.get(namespace)
+    async def disable(self, key: ServerKey, actor: User) -> None:
+        async with self._locked(key, actor) as child:
+            self.registry.set_enabled(key, False)
+            child.spec = self.registry.get(key)
             await self._teardown(child)
             child.status = "stopped"
 
-    async def restart(self, namespace: str) -> None:
-        child = self._children[namespace]
-        async with child.lock:
-            self._still_current(namespace, child)
+    async def restart(self, key: ServerKey, actor: User) -> None:
+        async with self._locked(key, actor) as child:
             if child.status not in ("running", "failed"):
-                raise RegistryError(f"{namespace} is not running; enable it instead")
+                # A pending child says so (the gate's text), not "enable it":
+                # enable refuses it too.
+                self._approved_record(key)
+                raise RegistryError(f"{key.ref} is not running; enable it instead")
             await self._teardown(child)
-            child.status = "starting"
-            child.task = asyncio.create_task(self._run_start(namespace))
+            try:
+                self._begin_start(child)
+            except RegistryError:
+                # The teardown already ran; say so before the refusal leaves.
+                child.status = "stopped"
+                raise
 
-    async def write_source(self, namespace: str, files: dict[str, str]) -> SourceWrite:
+    async def write_source(
+        self, key: ServerKey, files: dict[str, str], actor: User
+    ) -> SourceWrite:
         """Write a source tree, then restart a `running` or `failed` child.
 
         The store write comes first and never awaits, so the swap completes
@@ -1663,18 +2091,23 @@ class Supervisor:
         child is not restarted: `enabled` owns the process, and a write must
         not turn a disabled child on. An orphan write (no child yet) returns
         `restarted=False`; the agent then calls `mcpflow_add_server`.
+
+        Admin-only. `actor` is checked first, with no lock: the write does not
+        need a child. The restart checks it again under the lock; a refusal
+        there leaves the written files in place.
         """
-        path = self.sources.write(namespace, files)
+        self._authorize(actor, key, admin=True)
+        path = self.sources.write(key.ref, files)
         restarted = False
-        child = self._children.get(namespace)
+        child = self._children.get(key)
         if child is not None and child.status in ("running", "failed"):
             # `restart` may still raise RegistryError if the child moved
             # between this check and its lock; the files are already written,
             # so the agent retries only the restart.
-            await self.restart(namespace)
+            await self.restart(key, actor)
             restarted = True
         return SourceWrite(
-            namespace=namespace,
+            namespace=key.ref,
             path=path,
             files=len(files),
             bytes=total_bytes(files),
@@ -1705,7 +2138,8 @@ class Supervisor:
     def root_muted(self) -> bool:
         return self.registry.root_muted()
 
-    def set_root_muted(self, muted: bool) -> None:
+    def set_root_muted(self, muted: bool, actor: User) -> None:
+        self._authorize(actor, None, admin=True)
         self.registry.set_root_muted(muted)
         # `children()` is a list copy, so a concurrent remove cannot raise.
         for child in self.children():
@@ -1714,48 +2148,118 @@ class Supervisor:
     def mcpflow_muted(self) -> bool:
         return self.registry.admin_muted()
 
-    def set_namespace_muted(self, namespace: str, muted: bool) -> None:
+    def set_namespace_muted(self, key: ServerKey, muted: bool, actor: User) -> None:
+        self._authorize(actor, key, admin=True)
         # The built-in namespace first, before the child lookup: it has no
         # `Child` and no `ServerSpec`. Both branches stay synchronous and
         # lock-free. There is no await between the assignments, so no
         # coroutine can observe a half-applied state.
-        if namespace == RESERVED_NAMESPACE:
+        if key == _BUILTIN_KEY:
             self.registry.set_admin_muted(muted)
             self._apply_builtin()
             return
-        child = self._children[namespace]
-        self.registry.set_muted(namespace, muted)
-        child.spec = self.registry.get(namespace)
+        child = self.get(key)
+        self.registry.set_muted(key, muted)
+        child.spec = self.registry.get(key)
         self._apply(child)
 
-    def set_tool_muted(self, namespace: str, tool: str, muted: bool) -> None:
+    def set_tool_muted(
+        self, key: ServerKey, tool: str, muted: bool, actor: User
+    ) -> None:
         """Mute or unmute one tool. `tool` is the bare child tool name."""
-        if namespace == RESERVED_NAMESPACE:
+        self._authorize(actor, key, admin=True)
+        if key == _BUILTIN_KEY:
             self.registry.set_admin_tool_muted(tool, muted)
             self._apply_builtin()
             return
-        child = self._children[namespace]
-        self.registry.set_tool_muted(namespace, tool, muted)
-        child.spec = self.registry.get(namespace)
+        child = self.get(key)
+        self.registry.set_tool_muted(key, tool, muted)
+        child.spec = self.registry.get(key)
         self._apply(child)
 
     # --- reads -----------------------------------------------------------
 
-    async def tools(self) -> list[ToolView]:
-        # Probe every running child concurrently: dashboard latency becomes the
-        # slowest single probe, not the sum. gather preserves input order, so
-        # the flattened result keeps namespace-then-tool ordering. The built-in
-        # rows come first, because that group has no child behind it.
-        running = [c for c in self.children() if c.status == "running"]
-        results = await asyncio.gather(*(self._probe_child(c) for c in running))
-        return [
-            *await self._builtin_views(),
-            *(view for sub in results for view in sub),
-        ]
+    async def tools(self, reach: Reach, *, probe: bool = True) -> list[ToolView]:
+        """The tool rows of the children `reach` holds, filtered by it.
 
-    async def actions(self, namespace: str) -> list[ActionView]:
+        `reach` is required, so no caller can skip the filter, and the caller
+        chooses the surface, so this method cannot widen the keys. A tool the
+        policy hides gets no row at all: a "hidden" mark would leak its name.
+        The mute is different: a muted tool keeps its row with
+        `visible=False`, because the dashboard offers the control that unmutes
+        it. The built-in rows are the admin tools, so only an admin sees them.
+
+        The rows come from the snapshot of each generation (design D3), so a
+        render awaits no child. With `probe` true, a stale snapshot of an
+        `open` generation starts one background probe; its result shows in a
+        later render. With `probe` false (a poll answer, D7) nothing starts.
+        This method is the one owner of "may this render probe".
+        """
+        # The one await, before the pass: the built-in rows come first, because
+        # that group has no child behind it.
+        views = await self._builtin_views() if reach.user.is_admin else []
+        # One synchronous pass: no await between the first read of a child and
+        # the return, so `probing` called right after sees the same state.
+        for child, session in self._open_children(reach):
+            if probe and (
+                session.probed_at is None
+                or time.monotonic() - session.probed_at >= SNAPSHOT_MAX_AGE
+            ):
+                self._schedule_probe(child, session)
+            if session.tools is None:
+                continue
+            views.extend(
+                view
+                for view in self._snapshot_views(child, session.tools)
+                if reach.allows_tool(child.spec.key, view.tool)
+            )
+        return views
+
+    def probing(self, reach: Reach) -> bool:
+        """True while a probe of an `open` generation in `reach` is live.
+
+        The poll mark of the tree (design D7): the tree polls while this is
+        true, so it shows the result of the probe and then stops. Synchronous;
+        reads no child. A done task counts as no probe (D4, F5), and a
+        `closing` generation counts as none even while `running`.
+        """
+        return any(
+            session.probe is not None and not session.probe.done()
+            for _child, session in self._open_children(reach)
+        )
+
+    def _open_children(self, reach: Reach) -> Iterator[tuple[Child, ChildSession]]:
+        """The one filter of `tools` and `probing`, so the rows and the poll
+        mark can never drift apart: each `running` child whose key `reach`
+        holds, with its generation read once. A generation that is not `open`
+        contributes no row and starts no probe (D3 step 2), so a render during
+        a teardown starts nothing after the teardown cancel."""
+        keys = set(reach.keys)
+        for child in self.children():
+            if child.status != "running" or child.spec.key not in keys:
+                continue
+            session = child.session
+            if session is None or session.state != "open":
+                continue
+            yield child, session
+
+    def _schedule_probe(self, child: Child, session: ChildSession) -> None:
+        """Start one probe of `session` unless one is live (design D5).
+
+        Synchronous, called only by `tools`. The session holds the one strong
+        reference, because the loop keeps only a weak one; the `finally` of
+        `_probe_child` drops it. Never awaited: a render waits on no child.
+        """
+        if session.probe is None or session.probe.done():
+            # A fresh context: the probe must not inherit the request user or
+            # the FastMCP request context of the render that started it.
+            session.probe = asyncio.create_task(
+                self._probe_child(child, session), context=contextvars.Context()
+            )
+
+    async def actions(self, key: ServerKey) -> list[ActionView]:
         """Raw admitted metadata; the web boundary owns presentation masking."""
-        child = self.get(namespace)
+        child = self.get(key)
         if not child.spec.actions or child.status != "running":
             return []
         try:
@@ -1773,7 +2277,7 @@ class Supervisor:
             term = clause_violation(tool)
             if term is not None:
                 logger.warning(
-                    "%s: tool %s is not an action: %s", namespace, tool.name, term
+                    "%s: tool %s is not an action: %s", key.ref, tool.name, term
                 )
                 continue
             disabled = not action_enabled(
@@ -1793,9 +2297,10 @@ class Supervisor:
 
     async def run_action(
         self,
-        namespace: str,
+        key: ServerKey,
         name: str,
         form: Mapping[str, Any],
+        actor: User,
         *,
         rendered_password_keys: frozenset[str] = frozenset(),
         rendered_secrets: frozenset[str] = frozenset(),
@@ -1804,8 +2309,17 @@ class Supervisor:
 
         Rendered metadata adds secrecy, never execution authority. Accumulators
         survive failures at any await; only the web boundary masks their detail.
+
+        Admin-only. `actor` is checked twice: at entry, before any outcome,
+        lease, or listing; and again right before the call, inside the lease
+        (a lease holder must not await the lock). Only these refusals leave
+        as `PermissionError` or `KeyError`. The second one is held until the
+        lease ends, and it wins over a fault of the lease exit: the tool did
+        not run. Every other error, a `PermissionError` of the transport
+        included, stays an `ActionRun` of the kind "transport".
         """
-        child = self.get(namespace)
+        child = self.get(key)
+        self._authorize(actor, key, admin=True)
         password_keys = frozenset(rendered_password_keys)
         full = (
             frozenset(self._secrets_of(child.spec))
@@ -1820,8 +2334,10 @@ class Supervisor:
             return ActionRun("unknown", full, password_keys, None, "")
         if child.status != "running":
             return ActionRun(
-                "transport", full, password_keys, None, f"{namespace} is not running"
+                "transport", full, password_keys, None, f"{key.ref} is not running"
             )
+        refused: PermissionError | KeyError | None = None
+        run: ActionRun | None = None
         try:
             async with self._lease(child) as client:
                 tools = await client.list_tools()
@@ -1855,29 +2371,49 @@ class Supervisor:
                     return ActionRun(
                         "coerce_error", full, password_keys, None, str(exc)
                     )
-                result = await client.call_tool_mcp(name, arguments)
-                return ActionRun("ran", full, password_keys, result, "")
+                # Narrow on purpose: only the decision is caught here, so a
+                # transport `PermissionError` stays "transport" below.
+                try:
+                    self._authorize(actor, key, admin=True)
+                except (PermissionError, KeyError) as exc:
+                    refused = exc
+                else:
+                    result = await client.call_tool_mcp(name, arguments)
+                    return ActionRun("ran", full, password_keys, result, "")
         except LeaseRefused as exc:
-            return ActionRun("lease_refused", full, password_keys, None, str(exc))
+            run = ActionRun("lease_refused", full, password_keys, None, str(exc))
         except Exception as exc:  # noqa: BLE001 -- the handler renders the reason
-            return ActionRun(
+            run = ActionRun(
                 "transport", full, password_keys, None, str(exc) or repr(exc)
             )
+        # A held refusal wins over a fault of the lease exit: the tool did not
+        # run. Raised outside every handler, so it carries no `__context__`
+        # (the raw exit fault can hold a posted secret), and the lease has
+        # ended: the refusal holds no lease.
+        if refused is not None:
+            raise refused
+        if run is None:  # every other path of the `try` returns
+            raise RuntimeError("run_action: the lease ended with no outcome")
+        return run
 
-    async def instructions_blocks(self) -> list[tuple[str, str]]:
-        """Read `instructions://self` from every running, unmuted child.
+    async def instructions_blocks(self, reach: Reach) -> list[tuple[str, str]]:
+        """Read `instructions://self` from every running, unmuted child that
+        `reach` allows as a server.
 
         Returns `(namespace, text)` pairs in registry order, one per child
         whose read returned non-blank text within `INSTRUCTIONS_READ_TIMEOUT`.
         The text is raw: no header, no cap. Never raises. Never changes a
-        child's status.
+        child's status. `reach` is required: the caller passes the `mcp`
+        surface of the session's user, and a child outside it is never read.
         """
         # The gate resolves before the read: it decides whether to read at
         # all. `hidden` is not consulted, so a tool mute has no effect here.
         candidates = [
             c
             for c in self.children()
-            if c.status == "running" and not self.registry.visibility(c.spec)[0]
+            if c.status == "running"
+            and reach.allows_server(c.spec.key)
+            and not self.registry.visibility(c.spec)[0]
         ]
         results = await asyncio.gather(
             *(self._read_instructions(c) for c in candidates),
@@ -1959,80 +2495,122 @@ class Supervisor:
                     tool=name,
                     visible=_visible(pinned, hide_all, hidden, name),
                     pinned=pinned,
+                    ref=RESERVED_NAMESPACE,
                 )
             )
         return views
 
-    async def _probe_child(self, child: Child) -> list[ToolView]:
-        namespace = child.spec.namespace
+    def _snapshot_views(self, child: Child, tools: list[Tool]) -> list[ToolView]:
+        """The rows of one snapshot, in list order. Synchronous; raises nothing.
+
+        The snapshot is raw, read from the child and not through the mount
+        table, so the visibility transform never touched it. That is
+        load-bearing: the dashboard must list a muted tool to offer the control
+        that unmutes it. The policy resolves here, at render time, so a mute
+        answer shows the new mark with no probe (design D3), and every row of
+        one call sees one policy.
+        """
+        spec = child.spec
+        namespace = spec.namespace
+        hide_all, hidden = self.registry.visibility(spec)
+        return [
+            ToolView(
+                namespace=namespace,
+                name=f"{namespace}_{tool.name}",
+                description=tool.description or "",
+                # getattr: one odd tool object must not fail every tree (D11).
+                schema_summary=_summarize_schema(getattr(tool, "input_schema", None)),
+                status="running",
+                tool=tool.name,
+                visible=_visible(False, hide_all, hidden, tool.name),
+                ref=spec.key.ref,
+                owner=spec.owner,
+            )
+            for tool in tools
+        ]
+
+    async def _probe_child(self, child: Child, session: ChildSession) -> None:
+        """The snapshot probe of one generation (design D4). Raises no
+        `Exception`, and writes only `session`, the generation it was started
+        for, so a late write lands on a dead object that no render reads.
+
+        Success writes `tools` and `probed_at`. A superseded session or a
+        refused lease writes `probed_at` only, so a stale render never waits
+        for ever. Any other `Exception`, a cancel FastMCP swallowed included,
+        runs the failure path and writes no snapshot. A cancel that takes
+        effect raises `CancelledError`, which runs only the `finally`.
+        """
         # Capture the secret set of this generation before the await. A
         # concurrent `update` can swap `child.spec` while `list_tools` runs, so
         # a post-await read would scrub the failure text with the wrong
         # generation's secrets and leak this one's.
         secrets = self._secrets_of(child.spec)
-        # Read the generation in the same synchronous step as the lease, so the
-        # failure path below can check identity (D7): a probe of generation g
-        # that fails after a restart must never mark generation g+1.
-        session = child.session
-        # This client talks to the child, not through the mount table, so the
-        # visibility transform does not apply here. That is load-bearing: the
-        # dashboard must list a muted tool to offer the control that unmutes
-        # it. Do not route this read through the table.
         try:
-            async with self._lease(child) as client:
-                tools = await client.list_tools()
-            # Resolve the policy after the await, so one rendered tree never
-            # mixes a pre-await policy with a post-await tool inventory.
-            hide_all, hidden = self.registry.visibility(child.spec)
-            views: list[ToolView] = []
-            for tool in tools:
-                schema = getattr(tool, "input_schema", None) or getattr(
-                    tool, "inputSchema", None
-                )
-                views.append(
-                    ToolView(
-                        namespace=namespace,
-                        name=f"{namespace}_{tool.name}",
-                        description=tool.description or "",
-                        schema_summary=_summarize_schema(schema),
-                        status="running",
-                        tool=tool.name,
-                        visible=_visible(False, hide_all, hidden, tool.name),
-                    )
-                )
-            return views
-        except LeaseRefused:
-            # A refusal is not proof of a dead child: the generation is starting
-            # or tearing down. Take no lock, log nothing, change no status.
-            return []
-        except Exception as exc:  # noqa: BLE001 -- one child's error must not stop the others
-            # The lease released as the exception left its `async with` block,
-            # so this lock is taken only after the lease block exits (L1).
-            async with child.lock:
-                # Re-check under the lock: a concurrent disable/stop may have
-                # left "running", and a restart may have installed generation
-                # g+1. Mark `failed` only for the generation that failed (D7).
-                if child.status != "running" or child.session is not session:
-                    return []
-                child.status = "failed"
-                self._record_error(child, str(exc) or repr(exc), secrets)
-                if (
-                    child.provider is not None
-                    and child.provider in self.table.providers
-                ):
-                    self.table.providers.remove(child.provider)
-                child.provider = None
-                child.visibility = None
-            return []
+            # The task can first run after a restart replaced the generation.
+            # This check and the `acquire` inside `_lease` run with no
+            # suspension between them, so the lease lands on `session` or not
+            # at all: a probe of g never leases g+1 (D4 step 2).
+            if child.session is not session:
+                session.probed_at = time.monotonic()
+                return
+            # This client talks to the child, not through the mount table, so
+            # the visibility transform does not apply here. That is
+            # load-bearing: the snapshot must keep a muted tool. Do not route
+            # this read through the table.
+            try:
+                async with self._lease(child) as client:
+                    tools = await client.list_tools()
+            except LeaseRefused:
+                # A refusal is not proof of a dead child: the generation is
+                # starting or tearing down. Take no lock, log nothing, change
+                # no status. Stamp it, so the snapshot stops being stale.
+                session.probed_at = time.monotonic()
+                return
+            except Exception as exc:  # noqa: BLE001 -- one child's error must not stop the others
+                # The lease released as the exception left its `async with`
+                # block, so this lock is taken only after the lease block exits
+                # (L1). No snapshot and no `probed_at` on this path.
+                async with child.lock:
+                    # Re-check under the lock: a concurrent disable/stop may
+                    # have left "running", and a restart may have installed
+                    # generation g+1. Mark `failed` only for the generation that
+                    # failed (D7), and only while it is `open`: a `closing`
+                    # generation belongs to `_teardown`. That covers `shutdown`,
+                    # which holds no lock, so a swallowed cancel finds the lock
+                    # free and the session still current (D4 step 6).
+                    if (
+                        child.status != "running"
+                        or child.session is not session
+                        or session.state != "open"
+                    ):
+                        return
+                    child.status = "failed"
+                    self._record_error(child, str(exc) or repr(exc), secrets)
+                    if (
+                        child.provider is not None
+                        and child.provider in self.table.providers
+                    ):
+                        self.table.providers.remove(child.provider)
+                    child.provider = None
+                    child.visibility = None
+                return
+            # Write the captured generation, never `child.session`: a read that
+            # outlived the drain bound can end here after a restart.
+            session.tools = list(tools)
+            session.probed_at = time.monotonic()
+        finally:
+            # Drop the strong reference, but only when it is still this task.
+            if session.probe is asyncio.current_task():
+                session.probe = None
 
-    def child_secrets(self, namespace: str) -> list[str]:
+    def child_secrets(self, key: ServerKey) -> list[str]:
         """The configured secret strings of one child, for the web redactor.
 
         A public accessor over `_secrets_of(child.spec)`, so the actions page
         can union the configured secrets with the request-local posted ones.
-        `get` raises `KeyError` for an unknown namespace.
+        `get` raises `KeyError` for an unknown key.
         """
-        return self._secrets_of(self.get(namespace).spec)
+        return self._secrets_of(self.get(key).spec)
 
     def _secrets_of(self, spec: ServerSpec) -> list[str]:
         """The secret strings of one spec generation: every non-empty `env`
@@ -2082,9 +2660,9 @@ class Supervisor:
         """
         child.last_error = scrub_secrets(text, [*secrets, *_LOG_SECRETS])
 
-    def log_tail(self, namespace: str, lines: int = 100) -> str:
-        child = self.get(namespace)
-        path = self._log_path(child.spec.namespace)
+    def log_tail(self, key: ServerKey, lines: int = 100) -> str:
+        child = self.get(key)
+        path = self._log_path(key)
         if not path.exists():
             return ""
         return self._scrub(child, _read_tail(path, lines))

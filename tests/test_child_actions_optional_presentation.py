@@ -34,8 +34,8 @@ def render_actions_page():
     settings = SimpleNamespace(data_dir=Path(__file__).parent, session_ttl=60)
     # Route registration needs bound lifecycle methods; this test calls none.
     supervisor = object.__new__(Supervisor)
-    routes = build_routes(supervisor, None, settings, None, None)
-    endpoint = next(r.endpoint for r in routes if r.path == "/servers/{ns}/actions")
+    routes = build_routes(supervisor, None, settings, None, None, None)
+    endpoint = next(r.endpoint for r in routes if r.path == "/servers/{ref}/actions")
     render_page = inspect.getclosurevars(endpoint).nonlocals["_actions_page"]
     request = Request(
         {

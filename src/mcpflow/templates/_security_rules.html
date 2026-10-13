@@ -1,0 +1,72 @@
+<section id="rules">
+{# The policy validates every field; a refusal renders the page again with
+   400 and the reason. #}
+<h2>Rules</h2>
+<p class="note muted small">A rule grants or denies a user or a group the tools of a
+  server. The narrowest level wins; at that level a user rule beats a group
+  rule, and one deny beats an allow. A <strong>global allow covers admin-owned
+  servers only</strong>; name another user's server at the server or tool level.
+  A global deny covers every server.</p>
+{% if error and section == 'rules' %}<p class="error">{{ error }}</p>{% endif %}
+
+<form method="post" action="/rules">
+  <div class="form-row">
+    <div class="field"><label for="r-kind">Subject kind</label>
+      <select id="r-kind" name="subject_kind">
+        <option value="user">user</option>
+        <option value="group">group</option>
+      </select></div>
+    <div class="field"><label for="r-subject">Subject</label>
+      <input id="r-subject" name="subject" list="rule-subjects" required>
+      <datalist id="rule-subjects">
+        {% for u in users %}<option value="{{ u.id }}">{% endfor %}
+        {# Admins skip rule resolution, so a rule on `admins_group` is refused. #}
+        {% for g in groups if g != admins_group %}<option value="{{ g }}">{% endfor %}
+      </datalist></div>
+    <div class="field"><label for="r-level">Level</label>
+      <select id="r-level" name="level">
+        <option value="global">global</option>
+        <option value="server" selected>server</option>
+        <option value="tool">tool</option>
+      </select></div>
+    <div class="field"><label for="r-server" title="Server and tool level">Server</label>
+      <select id="r-server" name="server">
+        <option value="">—</option>
+        {% for ref in servers %}<option value="{{ ref }}">{{ ref }}</option>{% endfor %}
+      </select></div>
+    <div class="field"><label for="r-tool" title="Tool level: the bare tool name">Tool</label>
+      <input id="r-tool" name="tool"></div>
+    <div class="field"><label for="r-effect">Effect</label>
+      <select id="r-effect" name="effect">
+        <option value="allow">allow</option>
+        <option value="deny">deny</option>
+      </select></div>
+    <div class="field fit"><button type="submit">Add rule</button></div>
+  </div>
+</form>
+
+<table>
+  <thead>
+    <tr><th>ID</th><th>Subject</th><th>Level</th><th>Target</th><th>Effect</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for r in rules %}
+    <tr>
+      <td><code>{{ r.id }}</code></td>
+      <td>{{ r.subject_kind }} <code>{{ r.subject }}</code></td>
+      <td>{{ r.level }}</td>
+      <td>{% if r.level == 'global' %}<span class="muted">{{ 'admin-owned servers' if r.effect == 'allow' else 'every server' }}</span>{% else %}<code>{{ r.server }}</code>{% if r.tool %} · <code>{{ r.tool }}</code>{% endif %}{% endif %}</td>
+      <td>{{ r.effect }}</td>
+      <td class="nowrap">
+        <form class="inline" method="post" action="/rules/{{ r.id }}/delete">
+          <button class="btn-sm danger">delete</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+    {% if not rules %}
+    <tr><td colspan="6" class="muted">No rules yet.</td></tr>
+    {% endif %}
+  </tbody>
+</table>
+</section>

@@ -15,6 +15,7 @@ from fastmcp.server.middleware import Middleware
 from mcp import types as mt
 
 if TYPE_CHECKING:
+    from .policy import AccessPolicy
     from .supervisor import Supervisor
 
 logger = logging.getLogger(__name__)
@@ -59,13 +60,25 @@ class ChildInstructionsMiddleware(Middleware):
     The read runs after `call_next`, so a failed gateway `initialize` reads no
     child. `instructions_blocks` never raises, so a child read never fails the
     request.
+
+    The blocks follow the policy: the `Reach` of the request's user on the
+    `mcp` surface decides which children are read, and a request with no
+    resolved user gets no child block. The `Reach` is built here, per request,
+    and never kept.
     """
 
-    def __init__(self, supervisor: Supervisor) -> None:
+    def __init__(self, supervisor: Supervisor, policy: AccessPolicy) -> None:
         self.supervisor = supervisor
+        self.policy = policy
 
     async def _instructions(self, own: str | None) -> str | None:
-        return render_instructions(own, await self.supervisor.instructions_blocks())
+        user = self.policy.current_user()
+        if user is None:
+            return render_instructions(own, [])
+        reach = self.policy.keys_for(user, "mcp")
+        return render_instructions(
+            own, await self.supervisor.instructions_blocks(reach)
+        )
 
     async def on_initialize(
         self, context, call_next

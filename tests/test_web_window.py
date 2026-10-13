@@ -11,7 +11,7 @@ from pathlib import Path
 
 from conftest import fake_child_spec, seed_registry
 
-from mcpflow.registry import Registry, ServerSpec
+from mcpflow.registry import Registry, ServerKey, ServerSpec
 
 HX = {"HX-Request": "true"}
 
@@ -112,9 +112,9 @@ def test_save_redirects_to_the_dashboard(server_factory):
     client.close()
     assert resp.status_code == 303
     assert resp.headers["location"] == "/"
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    assert reg.get("gmail").description == "changed"
+    assert reg.get(ServerKey(None, "gmail")).description == "changed"
 
 
 def test_save_keeps_the_authorization_header_of_a_header_sink_child(server_factory):
@@ -139,9 +139,9 @@ def test_save_keeps_the_authorization_header_of_a_header_sink_child(server_facto
     )
     client.close()
     assert resp.status_code == 303
-    reg = Registry(server.data_dir / "servers.json")
+    reg = Registry(server.data_dir / "servers.json", server.data_dir / "user_servers.json")
     reg.load()
-    spec = reg.get("linear")
+    spec = reg.get(ServerKey(None, "linear"))
     assert spec.headers["Authorization"] == "Bearer SEKRETTOKEN"
     assert spec.description == "changed"
 
@@ -204,7 +204,7 @@ def test_the_window_lists_no_tool(server_factory):
     server.wait(running=1)
     client = server.login()
     window = client.get("/servers/time").text
-    page = client.get("/").text
+    page = client.get("/tools/tree").text
     client.close()
     # The window names no tool and holds no list element for them.
     assert "time_get_current_time" not in window
@@ -216,18 +216,19 @@ def test_the_window_lists_no_tool(server_factory):
 
 
 def test_the_window_probes_no_child(server_factory, monkeypatch):
-    """`Supervisor.tools()` probes every running child and marks one `failed`
-    when its probe raises. A read-only window must not be able to do that to an
-    unrelated child."""
+    """A `Supervisor.tools()` render can start a probe of any running child
+    with a stale snapshot, and that probe marks the child `failed` when it
+    raises. A read-only window must not be able to do that to an unrelated
+    child."""
     server = server_factory(seed_registry(fake_child_spec("time", "two")))
     server.wait(running=1)
     sup = server.supervisor
     calls = []
     real = sup.tools
 
-    async def counting():
+    async def counting(*args, **kwargs):
         calls.append(1)
-        return await real()
+        return await real(*args, **kwargs)
 
     monkeypatch.setattr(sup, "tools", counting)
     client = server.login()
@@ -303,10 +304,10 @@ def test_the_tree_polls_while_a_child_starts(server_factory):
     )
     server.wait(starting=1)
     client = server.login()
-    body = client.get("/").text
+    body = client.get("/tools/tree").text
     client.close()
     root = body[body.index('<div id="tools-tree"') :].split(">", 1)[0]
-    assert 'hx-get="/tools/tree"' in root
+    assert 'hx-get="/tools/tree?poll=1"' in root
     assert 'hx-trigger="every 3s"' in root
     assert 'hx-target="#tools-tree"' in root
     assert 'hx-swap="outerHTML"' in root
@@ -318,11 +319,11 @@ def test_the_tree_does_not_poll_when_every_child_is_settled(server_factory):
     server = server_factory(seed_registry(fake_child_spec("time", "good")))
     server.wait(running=1)
     client = server.login()
-    body = client.get("/").text
+    body = client.get("/tools/tree").text
     client.close()
     root = body[body.index('<div id="tools-tree"') :].split(">", 1)[0]
     assert "hx-trigger" not in root
-    assert 'hx-get="/tools/tree"' not in root
+    assert 'hx-get="/tools/tree?poll=1"' not in root
     assert 'hx-disinherit="*"' in root
 
 
@@ -357,7 +358,7 @@ def test_the_details_control_does_not_share_the_poll_queue(server_factory):
     server = server_factory(seed_registry(fake_child_spec("time", "good")))
     server.wait(running=1)
     client = server.login()
-    body = client.get("/").text
+    body = client.get("/tools/tree").text
     client.close()
     control = re.search(r"<a[^>]*hx-get=\"/servers/time\"[^>]*>", body)
     assert control is not None
@@ -441,7 +442,7 @@ def test_a_stopped_child_shows_a_group(server_factory):
     )
     server = server_factory(seed_registry(spec), CHILD_START_TIMEOUT="2")
     client = server.login()
-    body = client.get("/").text
+    body = client.get("/tools/tree").text
     client.close()
     assert 'data-ns="weather"' in body
     assert "status-stopped" in body
@@ -458,7 +459,7 @@ def test_the_server_row_shows_the_command_and_only_details(server_factory):
     )
     server = server_factory(seed_registry(spec), CHILD_START_TIMEOUT="2")
     client = server.login()
-    body = client.get("/").text
+    body = client.get("/tools/tree").text
     client.close()
     row = body[body.index('class="server-row"') :]
     row = row[: row.index("</div>")]
@@ -547,6 +548,7 @@ def test_no_import_result_element_remains(server_factory):
     client = server.login()
     pages = [
         client.get("/").text,
+        client.get("/tools/tree").text,
         client.get("/add-server").text,
         client.get("/add-server?tab=json", headers=HX).text,
         client.post(

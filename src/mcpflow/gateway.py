@@ -24,13 +24,19 @@ from .api import API_EXCEPTION_HANDLERS, build_api_routes
 from .auth import AdminTokenGate, HashedTokenVerifier, SessionGate, TokenStore
 from .catalog import SECRET_MASK
 from .config import Settings
+from .identity import LocalIdentityProvider
 from .instructions import ChildInstructionsMiddleware
 from .oauth import CALLBACK_SECRET_PARAMS, CredStore, PendingFlows
+from .policy import AccessPolicy, RuleStore
 from .registry import Registry
+from .router import CallerRouter
 from .supervisor import Supervisor, install_log_redaction
-from .web import build_routes
+from .web import USER_ROUTES, WEB_EXCEPTION_HANDLERS, build_routes
 
-_PUBLIC_PREFIXES = ("/health", "/login", "/static/", "/mcp", "/api/", "/.well-known/")
+# Bearer-only paths: no cookie, so `SessionGate` exempts them from the
+# cross-site check. Each one must also be a public prefix.
+_BEARER_PREFIXES: tuple[str, ...] = ("/mcp", "/api/")
+_PUBLIC_PREFIXES = ("/health", "/login", "/static/", "/.well-known/", *_BEARER_PREFIXES)
 
 # The SDK client transports log the outgoing `tools/call` request, arguments
 # included, at DEBUG. The gateway is the only in-process user of those
@@ -101,11 +107,32 @@ def build_app(settings: Settings) -> Starlette:
     _pin_transport_log_floor()
     _mask_access_log()
     install_log_redaction()
-    registry = Registry(settings.data_dir / "servers.json")
+    # Identity first: it creates the bootstrap `admin` on the first start and
+    # sets its hash from the environment, and every later owner asks it.
+    identity = LocalIdentityProvider(
+        settings.data_dir / "users.json", settings.admin_password_hash
+    )
+    identity.load()
+
+    tokens = TokenStore(
+        settings.data_dir / "tokens.json",
+        settings.data_dir / "user_tokens.json",
+        max_user_tokens=settings.max_user_tokens,
+    )
+    tokens.load()
+
+    registry = Registry(
+        settings.data_dir / "servers.json",
+        settings.data_dir / "user_servers.json",
+        max_user_servers=settings.max_user_servers,
+    )
     registry.load()
 
-    tokens = TokenStore(settings.data_dir / "tokens.json")
-    tokens.load()
+    # The rule store loads after the registry and the token store; the policy
+    # reads all four owners and is the one owner of every access decision.
+    rules = RuleStore(settings.data_dir / "rules.json")
+    rules.load()
+    policy = AccessPolicy(identity, rules, tokens, registry)
 
     # One credential store and one pending-flow table, shared by the
     # supervisor (the owner of teardown) and the web layer (the owner of the
@@ -113,18 +140,24 @@ def build_app(settings: Settings) -> Starlette:
     creds = CredStore(settings.data_dir)
     flows = PendingFlows()
 
-    supervisor = Supervisor(registry, settings, creds, flows)
+    # The policy exists before the supervisor: the supervisor's read methods
+    # take a `Reach`, and the adapters reach the policy through it.
+    supervisor = Supervisor(registry, settings, creds, flows, policy)
 
     gateway = FastMCP(
         "mcpflow",
-        auth=HashedTokenVerifier(tokens),
+        auth=HashedTokenVerifier(tokens, identity),
         mask_error_details=True,
     )
-    gateway.add_provider(supervisor.table)
-    # Each new session carries the live instructions of the running children.
-    gateway.add_middleware(ChildInstructionsMiddleware(supervisor))
+    # D5: the router is the one gateway provider of the children and the only
+    # reader of `supervisor.table`. It serves each request the components of
+    # its caller's `Reach`; the table is never mounted here.
+    gateway.add_provider(CallerRouter(supervisor, policy))
+    # Each new session carries the live instructions of the running children
+    # that the session's user may reach.
+    gateway.add_middleware(ChildInstructionsMiddleware(supervisor, policy))
 
-    # Mount the built-in admin server beside the aggregate table. The
+    # Mount the built-in admin server beside the router. The
     # supervisor owns the whole provider chain, the namespace `mcpflow` included,
     # so the rule "a visibility transform matches the bare tool name" has one
     # owner. `add_provider` therefore takes no `namespace` keyword: a keyword
@@ -155,18 +188,19 @@ def build_app(settings: Settings) -> Starlette:
 
     # The `/api` sub-app carries its own gate and error handlers. `AdminTokenGate`
     # owns the bearer check; `SessionGate` skips `/api/` through the public
-    # prefix. Mount it before `Mount("/", mcp_app)`, whose catch-all would
+    # prefix, and `/api/` is a bearer prefix, exempt from the cross-site
+    # check. Mount it before `Mount("/", mcp_app)`, whose catch-all would
     # otherwise swallow every `/api` path.
     api_app = Starlette(
-        routes=build_api_routes(supervisor, tokens),
-        middleware=[Middleware(AdminTokenGate, store=tokens)],
+        routes=build_api_routes(supervisor),
+        middleware=[Middleware(AdminTokenGate, store=tokens, identity=identity)],
         exception_handlers=API_EXCEPTION_HANDLERS,
     )
 
     app = Starlette(
         routes=[
             Route("/health", health),
-            *build_routes(supervisor, tokens, settings, creds, flows),
+            *build_routes(supervisor, tokens, settings, creds, flows, identity),
             Mount("/static", app=StaticFiles(directory=static_dir), name="static"),
             Mount("/api", app=api_app),
             Mount("/", app=mcp_app),
@@ -175,10 +209,15 @@ def build_app(settings: Settings) -> Starlette:
             Middleware(
                 SessionGate,
                 secret=settings.secret_key,
-                password_hash=settings.admin_password_hash,
+                identity=identity,
                 public_prefixes=_PUBLIC_PREFIXES,
+                user_routes=USER_ROUTES,
+                bearer_prefixes=_BEARER_PREFIXES,
             )
         ],
+        # A write-time refusal that leaves a web route answers 403 (the
+        # `/api` sub-app answers its own first).
+        exception_handlers=WEB_EXCEPTION_HANDLERS,
         lifespan=lifespan,
     )
     # The supervisor is the app's live state. Exposing it here keeps the
@@ -186,4 +225,7 @@ def build_app(settings: Settings) -> Starlette:
     # deliberately NOT exposed: a writer that bypasses the supervisor would
     # change the persisted policy without applying it to the live transforms.
     app.state.supervisor = supervisor
+    # The policy is the one writer of rules.json, so exposing it opens no
+    # bypass. The supervisor holds the same object.
+    app.state.policy = policy
     return app

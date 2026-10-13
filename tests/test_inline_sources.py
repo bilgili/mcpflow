@@ -14,13 +14,13 @@ import asyncio
 
 import pytest
 import pytest_asyncio
-from conftest import fake_child_spec, make_settings
+from conftest import ADMIN_ACTOR, fake_child_spec, make_policy, make_settings
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
 from mcpflow.auth import TokenStore
 from mcpflow.oauth import CredStore, PendingFlows
-from mcpflow.registry import Registry, RegistryError, ServerSpec
+from mcpflow.registry import Registry, RegistryError, ServerKey, ServerSpec
 from mcpflow.supervisor import Supervisor
 
 
@@ -33,12 +33,13 @@ async def make_supervisor(tmp_path):
         counter["n"] += 1
         data_dir = tmp_path / f"sup{counter['n']}"
         data_dir.mkdir()
-        reg = Registry(data_dir / "servers.json")
+        reg = Registry(data_dir / "servers.json", data_dir / "user_servers.json")
         reg.load()
         for spec in specs:
             reg.add(spec)
         sup = Supervisor(
-            reg, make_settings(data_dir, **over), CredStore(data_dir), PendingFlows()
+            reg, make_settings(data_dir, **over), CredStore(data_dir), PendingFlows(),
+            make_policy(data_dir, reg),
         )
         created.append(sup)
         return sup
@@ -75,7 +76,7 @@ async def test_add_source_of_other_namespace_rejected(make_supervisor):
     sup = make_supervisor()
     other_dir = sup.sources.write("other", {"main.py": "x"})
     with pytest.raises(RegistryError) as exc:
-        await sup.add(_py("mine", str(other_dir)))
+        await sup.add(_py("mine", str(other_dir)), ADMIN_ACTOR)
     assert "other" in str(exc.value)
     # The registry file was not written.
     assert not (sup.settings.data_dir / "servers.json").exists()
@@ -86,10 +87,10 @@ async def test_update_source_of_other_namespace_rejected(make_supervisor):
     sup = make_supervisor()
     own = sup.sources.write("mine", {"main.py": "x"})
     other = sup.sources.write("other", {"main.py": "y"})
-    await sup.add(_py("mine", str(own)))
+    await sup.add(_py("mine", str(own)), ADMIN_ACTOR)
     before = (sup.settings.data_dir / "servers.json").read_text()
     with pytest.raises(RegistryError) as exc:
-        await sup.update(_py("mine", str(other)))
+        await sup.update(ServerKey(None, "mine"), _py("mine", str(other)), ADMIN_ACTOR)
     assert "other" in str(exc.value)
     assert (sup.settings.data_dir / "servers.json").read_text() == before
 
@@ -98,7 +99,7 @@ async def test_update_source_of_other_namespace_rejected(make_supervisor):
 async def test_add_source_equal_to_root_rejected(make_supervisor):
     sup = make_supervisor()
     with pytest.raises(RegistryError) as exc:
-        await sup.add(_py("mine", str(sup.sources.root)))
+        await sup.add(_py("mine", str(sup.sources.root)), ADMIN_ACTOR)
     assert "is inside DATA_DIR/servers" in str(exc.value)
 
 
@@ -106,7 +107,7 @@ async def test_add_source_equal_to_root_rejected(make_supervisor):
 async def test_add_own_source_ok(make_supervisor):
     sup = make_supervisor()
     own = sup.sources.write("mine", {"main.py": "x"})
-    child = await sup.add(_py("mine", str(own)))
+    child = await sup.add(_py("mine", str(own)), ADMIN_ACTOR)
     assert child.spec.namespace == "mine"
 
 
@@ -117,13 +118,13 @@ async def test_add_own_source_ok(make_supervisor):
 async def test_remove_deletes_directory_after_teardown(make_supervisor):
     sup = make_supervisor()
     own = sup.sources.write("mine", {"main.py": "x"})
-    child = await sup.add(_py("mine", str(own)))
+    child = await sup.add(_py("mine", str(own)), ADMIN_ACTOR)
     # Promote to a running child with a transport whose close asserts the
     # directory is still present when it runs (delete must come after close).
     seen = {}
     child.status = "running"
     child.transport = _FakeTransport(lambda: seen.update(present=own.exists()))
-    await sup.remove("mine")
+    await sup.remove(ServerKey(None, "mine"), ADMIN_ACTOR)
     assert seen["present"] is True  # dir was present during close
     assert not own.exists()  # deleted after teardown
 
@@ -140,43 +141,43 @@ async def test_namespace_cannot_be_reclaimed_during_teardown(make_supervisor):
     """
     sup = make_supervisor()
     own = sup.sources.write("mine", {"main.py": "x"})
-    child = await sup.add(_py("mine", str(own)))
+    child = await sup.add(_py("mine", str(own)), ADMIN_ACTOR)
     child.status = "running"
 
     held: list[bool] = []
-    child.transport = _FakeTransport(lambda: held.append("mine" in sup._removing))
+    child.transport = _FakeTransport(
+        lambda: held.append(ServerKey(None, "mine") in sup._removing)
+    )
 
-    await sup.remove("mine")
+    await sup.remove(ServerKey(None, "mine"), ADMIN_ACTOR)
 
     assert held == [True]  # reserved while the teardown ran
     assert not own.exists()  # deleted, because nothing could reclaim it
-    assert "mine" not in sup._removing  # released when the removal returned
+    assert ServerKey(None, "mine") not in sup._removing  # released on return
 
 
 @pytest.mark.asyncio
 async def test_add_refuses_a_namespace_under_removal(make_supervisor):
     sup = make_supervisor()
     own = sup.sources.write("mine", {"main.py": "x"})
-    await sup.add(_py("mine", str(own)))
-    sup._removing.add("mine")
+    await sup.add(_py("mine", str(own)), ADMIN_ACTOR)
+    sup._removing.add(ServerKey(None, "mine"))
 
     # The reservation is checked before `registry.add`, so the reason names the
     # removal rather than the duplicate namespace.
     with pytest.raises(RegistryError, match="being removed"):
-        await sup.add(_py("mine", str(own)))
+        await sup.add(_py("mine", str(own)), ADMIN_ACTOR)
 
 
 @pytest.mark.asyncio
 async def test_update_to_git_source_keeps_directory(make_supervisor):
     sup = make_supervisor()
     own = sup.sources.write("mine", {"main.py": "x"})
-    await sup.add(_py("mine", str(own)))
-    await sup.update(
-        ServerSpec(
+    await sup.add(_py("mine", str(own)), ADMIN_ACTOR)
+    await sup.update(ServerKey(None, "mine"), ServerSpec(
             namespace="mine", kind="python", package="p",
             source="git+https://host/o/r", enabled=False,
-        )
-    )
+        ), ADMIN_ACTOR)
     assert own.exists()
 
 
@@ -184,8 +185,8 @@ async def test_update_to_git_source_keeps_directory(make_supervisor):
 async def test_disable_keeps_directory(make_supervisor):
     sup = make_supervisor()
     own = sup.sources.write("mine", {"main.py": "x"})
-    await sup.add(_py("mine", str(own)))
-    await sup.disable("mine")
+    await sup.add(_py("mine", str(own)), ADMIN_ACTOR)
+    await sup.disable(ServerKey(None, "mine"), ADMIN_ACTOR)
     assert own.exists()
 
 
@@ -194,13 +195,11 @@ async def test_remove_git_source_deletes_nothing(make_supervisor):
     sup = make_supervisor()
     # A directory exists under the store, but the child runs from a git source.
     stray = sup.sources.write("mine", {"main.py": "x"})
-    await sup.add(
-        ServerSpec(
+    await sup.add(ServerSpec(
             namespace="mine", kind="python", package="p",
             source="git+https://host/o/r", enabled=False,
-        )
-    )
-    await sup.remove("mine")
+        ), ADMIN_ACTOR)
+    await sup.remove(ServerKey(None, "mine"), ADMIN_ACTOR)
     # owns() is false for a git source, so the store directory is left intact.
     assert stray.exists()
 
@@ -209,18 +208,18 @@ async def test_remove_git_source_deletes_nothing(make_supervisor):
 async def test_remove_propagates_store_oserror(make_supervisor):
     sup = make_supervisor()
     own = sup.sources.write("mine", {"main.py": "x"})
-    await sup.add(_py("mine", str(own)))
+    await sup.add(_py("mine", str(own)), ADMIN_ACTOR)
 
     def boom(namespace):
         raise OSError("disk gone")
 
     sup.sources.remove = boom
     with pytest.raises(OSError):
-        await sup.remove("mine")
+        await sup.remove(ServerKey(None, "mine"), ADMIN_ACTOR)
     # The registry no longer lists the child; a retry answers KeyError (404).
     assert "mine" not in [c.spec.namespace for c in sup.children()]
     with pytest.raises(KeyError):
-        await sup.remove("mine")
+        await sup.remove(ServerKey(None, "mine"), ADMIN_ACTOR)
 
 
 # --- write_source restart semantics (5.11, 5.12) -----------------------------
@@ -229,36 +228,36 @@ async def test_remove_propagates_store_oserror(make_supervisor):
 @pytest.mark.asyncio
 async def test_write_source_restarts_running_child(make_supervisor):
     sup = make_supervisor()
-    child = await sup.add(fake_child_spec("time", "good"))
+    child = await sup.add(fake_child_spec("time", "good"), ADMIN_ACTOR)
     await child.task
     assert child.status == "running"
-    result = await sup.write_source("time", {"main.py": "x"})
+    result = await sup.write_source(ServerKey(None, "time"), {"main.py": "x"}, ADMIN_ACTOR)
     assert result.restarted is True
     assert result.files == 1
-    await sup._children["time"].task
-    assert sup._children["time"].status == "running"
+    await sup._children[ServerKey(None, "time")].task
+    assert sup._children[ServerKey(None, "time")].status == "running"
 
 
 @pytest.mark.asyncio
 async def test_write_source_restarts_failed_child(make_supervisor):
     sup = make_supervisor()
-    child = await sup.add(fake_child_spec("broken", "fail"))
+    child = await sup.add(fake_child_spec("broken", "fail"), ADMIN_ACTOR)
     await child.task
     assert child.status == "failed"
-    result = await sup.write_source("broken", {"main.py": "x"})
+    result = await sup.write_source(ServerKey(None, "broken"), {"main.py": "x"}, ADMIN_ACTOR)
     assert result.restarted is True
 
 
 @pytest.mark.asyncio
 async def test_write_source_does_not_restart_stopped_or_missing(make_supervisor):
     sup = make_supervisor()
-    stopped = await sup.add(fake_child_spec("time", "good", enabled=False))
+    stopped = await sup.add(fake_child_spec("time", "good", enabled=False), ADMIN_ACTOR)
     assert stopped.status == "stopped"
-    r1 = await sup.write_source("time", {"main.py": "x"})
+    r1 = await sup.write_source(ServerKey(None, "time"), {"main.py": "x"}, ADMIN_ACTOR)
     assert r1.restarted is False
-    assert sup._children["time"].task is None
+    assert sup._children[ServerKey(None, "time")].task is None
     # A namespace with no child gets an orphan directory.
-    r2 = await sup.write_source("ghost", {"main.py": "x"})
+    r2 = await sup.write_source(ServerKey(None, "ghost"), {"main.py": "x"}, ADMIN_ACTOR)
     assert r2.restarted is False
     assert sup.sources.path_for("ghost").exists()
 
@@ -267,9 +266,9 @@ async def test_write_source_does_not_restart_stopped_or_missing(make_supervisor)
 async def test_write_source_does_not_restart_starting_child(make_supervisor):
     # A child that hangs at startup stays `starting`; a write must not bounce it.
     sup = make_supervisor(CHILD_START_TIMEOUT="30")
-    child = await sup.add(fake_child_spec("slow", "hang"))
+    child = await sup.add(fake_child_spec("slow", "hang"), ADMIN_ACTOR)
     assert child.status == "starting"
-    result = await sup.write_source("slow", {"main.py": "x"})
+    result = await sup.write_source(ServerKey(None, "slow"), {"main.py": "x"}, ADMIN_ACTOR)
     assert result.restarted is False
 
 
@@ -278,13 +277,13 @@ async def test_write_source_does_not_restart_starting_child(make_supervisor):
 
 def _seed(holder: dict, *specs: ServerSpec):
     def seed(data_dir):
-        reg = Registry(data_dir / "servers.json")
+        reg = Registry(data_dir / "servers.json", data_dir / "user_servers.json")
         reg.load()
         for spec in specs:
             reg.add(spec)
-        store = TokenStore(data_dir / "tokens.json")
+        store = TokenStore(data_dir / "tokens.json", data_dir / "user_tokens.json")
         store.load()
-        _a, admin = store.create("admin", "admin")
+        _a, admin = store.create("admin", "admin", "admin")
         holder["admin"] = admin
 
     return seed
