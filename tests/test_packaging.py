@@ -6,6 +6,7 @@ produces a wheel that contains the templates and the vendored static files.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import zipfile
@@ -42,6 +43,24 @@ def test_wheel_contains_package_data(tmp_path):
     assert "mcpflow/catalog/providers/google.json" in names
 
 
+def _dockerfile_body() -> str:
+    """The Dockerfile without comment lines, joined on spaces."""
+    dockerfile = (_ROOT / "Dockerfile").read_text()
+    return " ".join(
+        line for line in dockerfile.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
+def _apt_packages() -> list[str]:
+    """Package list of the install command: between `apt-get install` and the next `&&`.
+
+    Comments name the packages too, so read the command itself.
+    """
+    body = _dockerfile_body()
+    assert "apt-get install" in body, "Dockerfile has no apt-get install layer"
+    return body.split("apt-get install", 1)[1].split("&&", 1)[0].split()
+
+
 def test_image_installs_git_for_git_sources():
     """Scenario from `specs/docker-deploy/spec.md` (Git is on PATH).
 
@@ -51,15 +70,27 @@ def test_image_installs_git_for_git_sources():
     in-image check needs a running daemon, this one guards the regression in
     any environment.
     """
-    dockerfile = (_ROOT / "Dockerfile").read_text()
-    # Comments name git too, so read the package list of the install command
-    # itself: everything between `apt-get install` and the next `&&`.
-    body = " ".join(
-        line for line in dockerfile.splitlines() if not line.lstrip().startswith("#")
-    )
-    assert "apt-get install" in body, "Dockerfile has no apt-get install layer"
-    packages = body.split("apt-get install", 1)[1].split("&&", 1)[0].split()
+    packages = _apt_packages()
     assert "git" in packages, f"git is not installed; packages are {packages}"
     assert "ca-certificates" in packages, (
         f"git needs ca-certificates for an https remote; packages are {packages}"
     )
+
+
+def test_image_runs_tini_as_process_one():
+    """Scenario from `specs/docker-deploy/spec.md` (orphan reaping).
+
+    The gateway waits only for the processes it starts. An orphan (for example a
+    detached `git maintenance`) goes to process 1 and stays as a zombie unless
+    process 1 reaps it. `tini` must be installed and be the ENTRYPOINT. Read
+    statically; `scripts/reaper_probe.py` checks the behaviour in the built image.
+    """
+    assert "tini" in _apt_packages(), f"tini is not installed; packages are {_apt_packages()}"
+    # HEALTHCHECK has its own `CMD` option, so match instructions at line start.
+    lines = (_ROOT / "Dockerfile").read_text().splitlines()
+    entrypoint = [x for x in lines if x.startswith("ENTRYPOINT ")]
+    cmd = [x for x in lines if x.startswith("CMD ")]
+    assert len(entrypoint) == 1, f"expected one ENTRYPOINT, got {entrypoint}"
+    assert json.loads(entrypoint[0].removeprefix("ENTRYPOINT ")) == ["/usr/bin/tini", "-s", "--"]
+    assert len(cmd) == 1, f"expected one CMD, got {cmd}"
+    assert json.loads(cmd[0].removeprefix("CMD ")) == ["mcpflow", "serve"]

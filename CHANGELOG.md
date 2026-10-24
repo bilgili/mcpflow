@@ -1,6 +1,16 @@
 # Changelog
 
-This file records the user-visible changes of MCP Flow, a gateway for Model Context Protocol (MCP) servers, from 2026-10-02 to 2026-10-13. The package `mcpflow` stays at version 0.1.0 and has no release tags, so each section shows a ship date.
+This file records the user-visible changes of MCP Flow, a gateway for Model Context Protocol (MCP) servers, from 2026-10-02 onwards. The package `mcpflow` stays at version 0.1.0 and has no release tags, so each section shows a ship date.
+
+## Unreleased
+
+### Fixed
+
+- The Docker image runs `tini` as process 1 (`ENTRYPOINT ["/usr/bin/tini", "-s", "--"]`). `tini` reaps orphan processes. Before, an orphan of a child server (for example a detached `git maintenance`) stayed as a zombie, and the zombies exhausted the container process limit.
+
+### Changed
+
+- A stop by `SIGTERM` now exits the container with status 143. Before, it exited with status 0, because the gateway was process 1.
 
 ## 2026-10-13
 

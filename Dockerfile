@@ -16,12 +16,13 @@ ARG PIP_INDEX_URL=https://pypi.org/simple/
 # The copied node binary needs libstdc++6. git and its CA certificates are for
 # a child whose spec names a git `source`: `npx --package=<source>` and
 # `uvx --from <source>` clone it at the first start, so without git such a child
-# cannot run at all.
+# cannot run at all. tini reaps orphans of the child servers (see ENTRYPOINT).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libstdc++6 \
         git \
         ca-certificates \
+        tini \
     && rm -rf /var/lib/apt/lists/*
 
 # node, npm, npx from the node stage.
@@ -53,4 +54,7 @@ USER app
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"
+# tini is process 1: it reaps orphans and forwards SIGTERM to `mcpflow serve`.
+# -s: act as a child subreaper when a runtime init is already process 1.
+ENTRYPOINT ["/usr/bin/tini", "-s", "--"]
 CMD ["mcpflow", "serve"]
