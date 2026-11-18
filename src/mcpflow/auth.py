@@ -1,8 +1,8 @@
 """Password hashing, session cookies, the session gate, and bearer tokens.
 
 This module depends only on the standard library and `fastmcp.server.auth`.
-It takes no `Settings`, so `config.py` may import `hash_password` from here.
-`identity.py` imports `hash_password` too, so this module names its
+It takes no `Settings`, so `config.py` may import from here. `identity.py`
+imports `hash_password` and `is_password_hash`, so this module names its
 `IdentityProvider` and `User` types under `TYPE_CHECKING` only.
 """
 
@@ -59,6 +59,19 @@ def hash_password(password: str, *, iterations: int = 600_000) -> str:
     salt = secrets.token_bytes(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
     return f"pbkdf2_sha256${iterations}${salt.hex()}${digest.hex()}"
+
+
+# A usable hash needs a positive iteration count, a salt of at least 16 hex
+# chars, and a full 64-hex-char SHA-256 digest. Checked with fullmatch, so a
+# placeholder like `pbkdf2_sha256$0$00$00` is rejected.
+_HASH_RE = re.compile(r"pbkdf2_sha256\$[1-9]\d*\$[0-9a-f]{16,}\$[0-9a-f]{64}")
+
+
+def is_password_hash(value: object) -> bool:
+    """True only for a str that fully matches
+    `pbkdf2_sha256$<positive int>$<16 or more hex>$<64 hex>`
+    (lowercase hex). Never raises."""
+    return isinstance(value, str) and _HASH_RE.fullmatch(value) is not None
 
 
 def verify_password(password: str, encoded: str) -> bool:

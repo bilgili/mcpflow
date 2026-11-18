@@ -27,15 +27,15 @@ from mcpflow.identity import (
     USER_ID_RE,
     LocalIdentityProvider,
     User,
+    write_admin_password_file,
 )
 
 ADMIN_PW = "admin-secret"
 
 
 def _provider(tmp_path: Path, pw: str = ADMIN_PW) -> LocalIdentityProvider:
-    p = LocalIdentityProvider(
-        tmp_path / "users.json", hash_password(pw, iterations=1000)
-    )
+    write_admin_password_file(tmp_path, hash_password(pw, iterations=1000))
+    p = LocalIdentityProvider(tmp_path / "users.json")
     p.load()
     return p
 
@@ -123,7 +123,7 @@ def test_a_malformed_file_stops_the_start(tmp_path):
         if rec["id"] == "alice":
             del rec["id"]
     path.write_text(json.dumps(data))
-    fresh = LocalIdentityProvider(path, hash_password(ADMIN_PW, iterations=1000))
+    fresh = LocalIdentityProvider(path)
     with pytest.raises(ValueError):
         fresh.load()
 
@@ -134,24 +134,14 @@ def test_a_malformed_file_stops_the_start(tmp_path):
 def test_first_start_of_an_existing_install(tmp_path):
     path = tmp_path / "users.json"
     assert not path.exists()
-    p = LocalIdentityProvider(path, hash_password(ADMIN_PW, iterations=1000))
+    write_admin_password_file(tmp_path, hash_password(ADMIN_PW, iterations=1000))
+    p = LocalIdentityProvider(path)
     p.load()
     rec = _record(path, BOOTSTRAP_ADMIN_ID)
     assert rec is not None and "admins" in rec["groups"] and "admin" not in rec
     user = p.authenticate(BOOTSTRAP_ADMIN_ID, ADMIN_PW)
     assert user is not None
     assert user.id == "admin" and user.is_admin is True
-
-
-def test_the_environment_owns_the_admin_password(tmp_path):
-    path = tmp_path / "users.json"
-    old = LocalIdentityProvider(path, hash_password("old-pw", iterations=1000))
-    old.load()
-    assert old.authenticate("admin", "old-pw") is not None
-    new = LocalIdentityProvider(path, hash_password("new-pw", iterations=1000))
-    new.load()
-    assert new.authenticate("admin", "new-pw") is not None
-    assert new.authenticate("admin", "old-pw") is None
 
 
 def test_the_admin_user_cannot_be_removed(tmp_path):
@@ -162,8 +152,7 @@ def test_the_admin_user_cannot_be_removed(tmp_path):
         p._delete_user("admin")
     with pytest.raises(ValueError):
         p.set_admin("admin", False)
-    with pytest.raises(ValueError):
-        p.replace_credential("admin", None, "other-hash")
+    assert p.replace_credential("admin", None, "other-hash") is False
     assert path.read_bytes() == before
     assert p.get_user("admin").is_admin is True
 
@@ -236,9 +225,8 @@ class Clock:
 
 
 def _clocked(tmp_path: Path, clock: Clock) -> LocalIdentityProvider:
-    p = LocalIdentityProvider(
-        tmp_path / "users.json", hash_password(ADMIN_PW, iterations=1000), clock=clock
-    )
+    write_admin_password_file(tmp_path, hash_password(ADMIN_PW, iterations=1000))
+    p = LocalIdentityProvider(tmp_path / "users.json", clock=clock)
     p.load()
     return p
 
@@ -267,9 +255,7 @@ def _write_users(path: Path, mutate) -> None:
 
 
 def _reload(tmp_path: Path) -> LocalIdentityProvider:
-    fresh = LocalIdentityProvider(
-        tmp_path / "users.json", hash_password(ADMIN_PW, iterations=1000)
-    )
+    fresh = LocalIdentityProvider(tmp_path / "users.json")
     fresh.load()
     return fresh
 
@@ -667,20 +653,6 @@ def test_a_swap_for_an_unknown_user_is_false(tmp_path):
     assert path.read_bytes() == before
 
 
-def test_the_bootstrap_user_refuses_a_swap(tmp_path):
-    """Compare-and-swap / The bootstrap user refuses a swap."""
-    p = _provider(tmp_path)
-    path = tmp_path / "users.json"
-    before = path.read_bytes()
-    with pytest.raises(ValueError):
-        p.replace_credential("admin", p.session_binding("admin"), _new_hash())
-    with pytest.raises(ValueError):
-        p.replace_credential("admin", "some-state", _new_hash())
-    assert path.read_bytes() == before
-    assert p.authenticate("admin", ADMIN_PW) is not None
-    assert p.authenticate("admin", NEW_PW) is None
-
-
 def test_a_failed_swap_write_changes_nothing(tmp_path, monkeypatch):
     """Local user store: write the file before memory, also for a swap."""
     p = _provider(tmp_path)
@@ -744,7 +716,7 @@ def test_remove_a_member(tmp_path):
     assert sorted(_record(path, "bob")["groups"]) == ["eng"]
     assert set(p.list_groups()) == {"admins", "eng", "ops"}
     # A new provider over the same file reads the same state.
-    fresh = LocalIdentityProvider(path, hash_password(ADMIN_PW, iterations=1000))
+    fresh = LocalIdentityProvider(path)
     fresh.load()
     assert fresh.get_user("alice").groups == frozenset({"ops"})
 

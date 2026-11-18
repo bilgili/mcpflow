@@ -10,6 +10,9 @@
 <body>
   <main style="max-width:360px">
     <h1><img src="/static/logo.svg" alt="MCP Flow" class="logo logo-lg"></h1>
+    {# The note is ADMIN_PENDING_NOTE, the text the start log also uses; the
+       part between backticks is the command, shown as code. #}
+    {% if admin_pending %}{% set note = pending_note.split('`') %}<p class="muted">{% for part in note %}{% if loop.index is even %}<code>{{ part }}</code>{% else %}{{ part }}{% endif %}{% endfor %}</p>{% endif %}
     {% if error %}<p class="error">{{ error }}</p>{% endif %}
     <form method="post" action="/login">
       <input type="hidden" name="next" value="{{ next }}">

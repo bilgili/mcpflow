@@ -94,7 +94,7 @@ function mcpflowCopy(id, btn) {
       <td class="nowrap row-end">
         {# The menu forms and the dialogs are siblings: no form holds another
            form. The bootstrap user has no reset and no delete. #}
-        {% if u.id == bootstrap_id %}<span class="muted small">set by ADMIN_PASSWORD</span>{% endif %}
+        {% if u.id == bootstrap_id %}<span class="muted small">set with mcpflow set-admin-password</span>{% endif %}
         <button type="button" class="btn-sm menu-btn" popovertarget="menu-of-{{ u.id }}" aria-label="Actions for {{ u.id }}">⋯</button>
         <div popover id="menu-of-{{ u.id }}" class="row-menu">
           <button type="button" commandfor="edit-{{ u.id }}" command="show-modal">Edit user</button>

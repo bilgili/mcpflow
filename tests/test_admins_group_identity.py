@@ -18,14 +18,20 @@ from pathlib import Path
 import pytest
 
 from mcpflow.auth import hash_password
-from mcpflow.identity import ADMINS_GROUP, BOOTSTRAP_ADMIN_ID, LocalIdentityProvider
+from mcpflow.identity import (
+    ADMINS_GROUP,
+    BOOTSTRAP_ADMIN_ID,
+    LocalIdentityProvider,
+    write_admin_password_file,
+)
 
 
 @pytest.fixture
 def world(tmp_path):
     """Groups `eng`, `ops`; users `alice` (eng), `bob`; the bootstrap `admin`."""
     path = tmp_path / "users.json"
-    p = LocalIdentityProvider(path, hash_password("pw", iterations=1000))
+    write_admin_password_file(tmp_path, hash_password("pw", iterations=1000))
+    p = LocalIdentityProvider(path)
     p.load()
     p._create_group("eng")
     p._create_group("ops")
@@ -583,7 +589,7 @@ def test_every_saved_file_is_version_2_and_holds_no_admin_key(world):
     for op in ops:
         op()
         check()
-    fresh = LocalIdentityProvider(path, hash_password("pw", iterations=1000))
+    fresh = LocalIdentityProvider(path)
     fresh.load()
     check()
 

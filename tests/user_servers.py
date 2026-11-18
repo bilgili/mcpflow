@@ -25,7 +25,12 @@ from pathlib import Path
 from conftest import FAKE_SERVER, make_settings, make_user
 
 from mcpflow.auth import TokenStore, hash_password
-from mcpflow.identity import ADMINS_GROUP, LocalIdentityProvider, User
+from mcpflow.identity import (
+    ADMINS_GROUP,
+    LocalIdentityProvider,
+    User,
+    write_admin_password_file,
+)
 from mcpflow.oauth import CredStore, PendingFlows
 from mcpflow.policy import AccessPolicy, RuleStore
 from mcpflow.registry import Registry, ServerKey, ServerSpec
@@ -54,8 +59,8 @@ class Env:
         self.dir = data_dir
         self.reg = Registry(data_dir / "servers.json", data_dir / "user_servers.json")
         self.reg.load()
-        ident = LocalIdentityProvider(data_dir / "users.json",
-                                      hash_password("secret", iterations=1000))
+        write_admin_password_file(data_dir, hash_password("secret", iterations=1000))
+        ident = LocalIdentityProvider(data_dir / "users.json")
         ident.load()
         for uid in ("alice", "bob"):
             if ident.get_user(uid) is None:

@@ -16,7 +16,7 @@ from starlette.testclient import TestClient
 
 from mcpflow.auth import hash_password
 from mcpflow.gateway import build_app
-from mcpflow.identity import LocalIdentityProvider
+from mcpflow.identity import LocalIdentityProvider, write_admin_password_file
 from mcpflow.registry import Registry, ServerKey, ServerSpec
 
 PW = "pw-alice-0123456789"
@@ -28,8 +28,8 @@ STEPS = {"identity": "_delete_user", "tokens": "revoke_user", "rules": "drop_sub
 def site(tmp_path):
     """alice in group `staff`; staff may use `time`, alice is denied `convert`."""
     (tmp_path / "logs").mkdir()
-    ident = LocalIdentityProvider(tmp_path / "users.json",
-                                  hash_password("secret", iterations=1000))
+    write_admin_password_file(tmp_path, hash_password("secret", iterations=1000))
+    ident = LocalIdentityProvider(tmp_path / "users.json")
     ident.load()
     ident._create_group("staff")
     make_user(ident, "alice", PW, groups=["staff"])

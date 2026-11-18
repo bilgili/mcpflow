@@ -3,9 +3,9 @@
 Scenarios: identity "Version 1 migration", "Local user store", "Bootstrap
 admin user". Properties: `MigrationSafe`, `LoadIdempotent`, I2, I3 of
 `specs/tla/admins_group.tla`. Design D3, D4, R3, and decision E2: every test
-builds the provider with ONE fixed `admin_password_hash` string, because a
-clear `ADMIN_PASSWORD` is re-hashed with a new salt at each start (a write at
-every start, pre-existing, out of scope).
+builds the provider after writing ONE fixed hash to the admin password file,
+so a second start applies the same hash and writes nothing (a new hash would
+change the state at every start).
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from mcpflow.auth import hash_password
-from mcpflow.identity import LocalIdentityProvider
+from mcpflow.identity import LocalIdentityProvider, write_admin_password_file
 
 ADMIN_HASH = hash_password("adm1n-pw-for-tests", iterations=1000)
 USER_HASH = hash_password("user-pw-for-tests", iterations=1000)
@@ -37,7 +37,8 @@ def write(path: Path, version: int, groups: list[str], users: list[dict]) -> byt
 
 
 def provider(path: Path) -> LocalIdentityProvider:
-    return LocalIdentityProvider(path, ADMIN_HASH)
+    write_admin_password_file(path.parent, ADMIN_HASH)
+    return LocalIdentityProvider(path)
 
 
 @pytest.fixture
@@ -114,7 +115,7 @@ def test_a_conflicting_legacy_group_stops_the_start(tmp_path, writes):
         "rename that group before the upgrade")
     assert path.read_bytes() == before
     assert not (tmp_path / "users.json.tmp").exists()
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["users.json"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["admin-password.hash", "users.json"]
     # The check runs before the bootstrap rule and before any write.
     assert writes == {"replace": 0, "save": 0}
 
@@ -276,17 +277,6 @@ def test_first_start_without_a_file(tmp_path, writes):
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert writes == {"replace": 1, "save": 1}
     assert p.authenticate("admin", "adm1n-pw-for-tests") is not None
-
-
-def test_the_environment_hash_wins_at_every_start(tmp_path):
-    """Scenario "The environment owns the admin password"."""
-    path = tmp_path / "users.json"
-    provider(path).load()
-    new_hash = hash_password("another-pw-for-tests", iterations=1000)
-    p = LocalIdentityProvider(path, new_hash)
-    p.load()
-    assert p.authenticate("admin", "another-pw-for-tests") is not None
-    assert p.authenticate("admin", "adm1n-pw-for-tests") is None
 
 
 # --- MigrationSafe --------------------------------------------------------

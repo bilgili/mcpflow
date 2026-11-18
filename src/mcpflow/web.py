@@ -51,7 +51,12 @@ from .auth import COOKIE_NAME, TokenStore, hash_password, local_path, sign_sessi
 from .catalog import BUILTIN_DIR, CATEGORIES, Catalog, CatalogEntry, build_spec
 from .config import Settings
 from .errors import REFUSALS, refusal
-from .identity import ADMINS_GROUP, BOOTSTRAP_ADMIN_ID, SETUP_CODE_TTL
+from .identity import (
+    ADMIN_PENDING_NOTE,
+    ADMINS_GROUP,
+    BOOTSTRAP_ADMIN_ID,
+    SETUP_CODE_TTL,
+)
 from .importer import parse_config_block
 from .oauth import (
     CLIENT_FORMATS,
@@ -126,9 +131,6 @@ _LOGIN_ERROR = "Wrong user name or password."
 # expired, or used code, an active user, the bootstrap user, and a lost race.
 _SETUP_ERROR = "Wrong user name or setup code, or the code has expired or was used."
 _SETTINGS_RACE = "Your password changed meanwhile. Sign in again and try again."
-_BOOTSTRAP_NOTE = (
-    f"The environment variable ADMIN_PASSWORD owns the password of {BOOTSTRAP_ADMIN_ID}."
-)
 
 
 def _form_text(form, key: str, default: str = "") -> str:
@@ -384,13 +386,17 @@ def build_routes(
 
     # --- auth ------------------------------------------------------------
 
-    async def login_get(request: Request) -> Response:
+    def _login_page(request: Request, next_: str, error: str | None) -> Response:
+        """The one render of `login.html`."""
+        admin = identity.get_user(BOOTSTRAP_ADMIN_ID)
         return render(
-            "login.html",
-            request,
-            next=request.query_params.get("next", "/"),
-            error=None,
+            "login.html", request, next=next_, error=error,
+            admin_pending=admin is not None and admin.pending,
+            pending_note=ADMIN_PENDING_NOTE,
         )
+
+    async def login_get(request: Request) -> Response:
+        return _login_page(request, request.query_params.get("next", "/"), None)
 
     def _signed_in(user_id: str, binding: str, target: str) -> Response:
         """303 to `target` with a session cookie bound to `binding`.
@@ -434,7 +440,7 @@ def build_routes(
             # One answer for a wrong password, an unknown user, a pending
             # user (no binding, design D5), and a race.
             await asyncio.sleep(1)
-            return render("login.html", request, next=next_, error=_LOGIN_ERROR)
+            return _login_page(request, next_, _LOGIN_ERROR)
         if not local_path(next_):
             next_ = "/"
         return _signed_in(user.id, binding, next_)
@@ -487,9 +493,7 @@ def build_routes(
     def _settings_page(request: Request, *, error=None, status_code=200, changed=False):
         return render(
             "settings.html", request, status_code=status_code, error=error,
-            changed=changed, bootstrap_note=(
-                _BOOTSTRAP_NOTE if request.state.user.id == BOOTSTRAP_ADMIN_ID else None
-            ),
+            changed=changed,
         )
 
     async def settings_page(request: Request) -> Response:
@@ -498,9 +502,6 @@ def build_routes(
     async def settings_password(request: Request) -> Response:
         # The signed-in user only; the form never names a user.
         uid = request.state.user.id
-        if uid == BOOTSTRAP_ADMIN_ID:
-            # First, so no slow work runs for it.
-            return _settings_page(request, error=_BOOTSTRAP_NOTE, status_code=400)
         form = await request.form()
         password = _form_text(form, "password")
         try:

@@ -25,7 +25,7 @@ from conftest import ADMIN_ACTOR, make_user
 
 from mcpflow import usage
 from mcpflow.auth import TokenStore, hash_password
-from mcpflow.identity import LocalIdentityProvider
+from mcpflow.identity import LocalIdentityProvider, write_admin_password_file
 from mcpflow.policy import AccessPolicy, RuleStore
 from mcpflow.registry import Registry, ServerSpec
 from mcpflow.usage import Counts, UsageRange, UsageStore
@@ -43,9 +43,8 @@ def make_world(tmp_path, *servers: str):
     """An `AccessPolicy` over admin-owned `servers`, with the store under test
     as its `usage` argument (frozen: `AccessPolicy.__init__(..., usage)`).
     Mirrors `conftest.make_policy`, but the test holds the store."""
-    identity = LocalIdentityProvider(
-        tmp_path / "users.json", hash_password("secret", iterations=1000)
-    )
+    write_admin_password_file(tmp_path, hash_password("secret", iterations=1000))
+    identity = LocalIdentityProvider(tmp_path / "users.json")
     identity.load()
     tokens = TokenStore(tmp_path / "tokens.json", tmp_path / "user_tokens.json")
     tokens.load()

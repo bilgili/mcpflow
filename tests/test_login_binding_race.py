@@ -14,7 +14,7 @@ from starlette.testclient import TestClient
 
 from mcpflow.auth import hash_password
 from mcpflow.gateway import build_app
-from mcpflow.identity import LocalIdentityProvider
+from mcpflow.identity import LocalIdentityProvider, write_admin_password_file
 from mcpflow.web import _LOGIN_ERROR
 
 PW = "pw-alice-0123456789"
@@ -23,8 +23,8 @@ PW = "pw-alice-0123456789"
 @pytest.fixture
 def site(tmp_path):
     (tmp_path / "logs").mkdir()
-    ident = LocalIdentityProvider(tmp_path / "users.json",
-                                  hash_password("secret", iterations=1000))
+    write_admin_password_file(tmp_path, hash_password("secret", iterations=1000))
+    ident = LocalIdentityProvider(tmp_path / "users.json")
     ident.load()
     make_user(ident, "alice", PW)
     app = build_app(make_settings(tmp_path))

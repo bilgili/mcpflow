@@ -8,7 +8,12 @@ import pytest
 from conftest import make_user
 
 from mcpflow.auth import TokenStore, hash_password
-from mcpflow.identity import ADMINS_GROUP, LocalIdentityProvider, User
+from mcpflow.identity import (
+    ADMINS_GROUP,
+    LocalIdentityProvider,
+    User,
+    write_admin_password_file,
+)
 from mcpflow.policy import AccessPolicy, RuleStore, resolve
 from mcpflow.registry import Registry, ServerKey, ServerSpec, revision
 from mcpflow.usage import UsageStore
@@ -22,7 +27,8 @@ def _user(uid: str, *groups: str, admin: bool = False) -> User:
 
 @pytest.fixture
 def world(tmp_path):
-    ident = LocalIdentityProvider(tmp_path / "users.json", hash_password("pw", iterations=1000))
+    write_admin_password_file(tmp_path, hash_password("pw", iterations=1000))
+    ident = LocalIdentityProvider(tmp_path / "users.json")
     ident.load()
     for g in ("eng", "ops"):
         ident._create_group(g)

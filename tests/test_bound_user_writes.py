@@ -28,7 +28,7 @@ from dashboard_site import make_mu_site  # noqa: F401
 from mcpflow import registry
 from mcpflow.auth import DEFAULT_MAX_USER_TOKENS, TokenStore, hash_password
 from mcpflow.config import ConfigError, load_settings
-from mcpflow.identity import LocalIdentityProvider
+from mcpflow.identity import LocalIdentityProvider, write_admin_password_file
 from mcpflow.policy import AccessPolicy, RuleStore
 from mcpflow.registry import (
     DEFAULT_MAX_USER_SERVERS,
@@ -67,9 +67,8 @@ def _bytes(tmp_path: Path) -> dict[str, bytes]:
 
 
 def _world(tmp_path: Path, *, servers: int | None = None, tokens: int | None = None):
-    ident = LocalIdentityProvider(
-        tmp_path / "users.json", hash_password("pw", iterations=1000)
-    )
+    write_admin_password_file(tmp_path, hash_password("pw", iterations=1000))
+    ident = LocalIdentityProvider(tmp_path / "users.json")
     ident.load()
     for uid in ("alice", "bob"):
         make_user(ident, uid, "pw")
@@ -302,7 +301,7 @@ def test_the_dashboard_and_api_admin_mint_past_the_token_limit(make_mu_site):
 def _load(tmp_path, monkeypatch, **env):
     monkeypatch.delenv("MAX_USER_SERVERS", raising=False)
     monkeypatch.delenv("MAX_USER_TOKENS", raising=False)
-    return load_settings({"DATA_DIR": str(tmp_path), "ADMIN_PASSWORD": "pw", **env})
+    return load_settings({"DATA_DIR": str(tmp_path), **env})
 
 
 def test_the_limit_settings_default_to_20_and_10(tmp_path, monkeypatch):
@@ -333,7 +332,7 @@ def test_a_bad_limit_value_stops_the_start(tmp_path, monkeypatch, name, bad):
 def test_the_environment_is_read_too(tmp_path, monkeypatch):
     monkeypatch.setenv("MAX_USER_SERVERS", "3")
     monkeypatch.setenv("MAX_USER_TOKENS", "4")
-    s = load_settings({"DATA_DIR": str(tmp_path), "ADMIN_PASSWORD": "pw"})
+    s = load_settings({"DATA_DIR": str(tmp_path)})
     assert (s.max_user_servers, s.max_user_tokens) == (3, 4)
 
 

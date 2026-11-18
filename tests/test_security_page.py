@@ -895,7 +895,7 @@ def test_an_admin_row_shows_the_admins_tag_and_its_x_revokes(make_mu_site):
 
 def test_the_bootstrap_row_has_no_role_or_reset_form(make_mu_site):
     """Users section: the bootstrap `admin` row has no role, reset, or delete
-    form and shows `set by ADMIN_PASSWORD`. Its groups form stays: `admin` may
+    form and shows `set with mcpflow set-admin-password`. Its groups form stays: `admin` may
     hold groups (design D4). The Admin column is gone."""
     site = make_mu_site()
     body = security(site).text
@@ -903,7 +903,7 @@ def test_the_bootstrap_row_has_no_role_or_reset_form(make_mu_site):
     assert {a for a in actions if (a or "").startswith("/users/admin/")} == {
         "/users/admin/groups"}
     text = " ".join(re.sub(r"<[^>]+>", " ", row(section(body, "users"), "admin")).split())
-    assert "set by ADMIN_PASSWORD" in text
+    assert "set with mcpflow set-admin-password" in text
     assert "Admin" not in re.findall(r"<th>([^<]*)</th>", section(body, "users"))
 
 

@@ -29,7 +29,7 @@ from starlette.testclient import TestClient
 
 from mcpflow.auth import hash_password
 from mcpflow.gateway import build_app
-from mcpflow.identity import LocalIdentityProvider
+from mcpflow.identity import LocalIdentityProvider, write_admin_password_file
 from mcpflow.web import _LOGIN_ERROR, _SETUP_ERROR
 
 ALICE_PW = "pw-alice-0123456789"
@@ -133,13 +133,12 @@ def redirects_to_login(resp) -> bool:
 @pytest.fixture
 def site(tmp_path):
     (tmp_path / "logs").mkdir()
-    ident = LocalIdentityProvider(tmp_path / "users.json",
-                                  hash_password("secret", iterations=1000))
+    write_admin_password_file(tmp_path, hash_password("secret", iterations=1000))
+    ident = LocalIdentityProvider(tmp_path / "users.json")
     ident.load()
     make_user(ident, "alice", ALICE_PW)
     # A user whose code ended before the app started: the code was made 8 days ago.
     old = LocalIdentityProvider(tmp_path / "users.json",
-                                hash_password("secret", iterations=1000),
                                 clock=lambda: time.time() - 8 * 24 * 3600)
     old.load()
     _user, expired = old._create_user("old")
@@ -474,8 +473,8 @@ def test_a_pending_user_costs_one_verification_at_the_login_page(tmp_path, monke
     user, and a wrong password each cost one `pbkdf2_sha256` verification of
     the same iteration count."""
     (tmp_path / "logs").mkdir()
-    ident = LocalIdentityProvider(tmp_path / "users.json",
-                                  hash_password("secret", iterations=600_000))
+    write_admin_password_file(tmp_path, hash_password("secret", iterations=600_000))
+    ident = LocalIdentityProvider(tmp_path / "users.json")
     ident.load()
     make_user(ident, "alice", ALICE_PW, iterations=600_000)
     app = build_app(make_settings(tmp_path))
@@ -515,15 +514,6 @@ def test_a_user_sees_the_change_form(site):
     assert {"current", "password", "confirm"} <= set(by_name)
     for name in ("current", "password", "confirm"):
         assert by_name[name]["type"] == "password"
-
-
-def test_the_admin_sees_a_note_and_no_form(site):
-    """Settings page / The admin sees a note."""
-    resp = site.send("GET", "/settings", site.admin())
-    assert resp.status_code == 200
-    assert password_inputs(resp.text) == []
-    assert "ADMIN_PASSWORD" in resp.text
-    assert not any(f.get("action") == "/settings/password" for f in forms(resp.text))
 
 
 def test_the_settings_routes_need_a_session(site):
@@ -645,24 +635,6 @@ def test_a_reset_during_the_check_of_the_current_password(site, sleeps, offloads
     assert resp.status_code == 400 and "set-cookie" not in resp.headers
     assert site.identity.get_user("alice").pending is True
     assert site.identity.authenticate("alice", NEW_PW) is None
-
-
-def test_the_bootstrap_user_cannot_change_the_password_here(site, sleeps, offloads):
-    """Password change by the user / The bootstrap user cannot change the
-    password here: refused first, with no slow work."""
-    names, _then = offloads
-    before = (site.identity.session_binding("admin"),)
-    admin = site.admin()
-    names.clear()  # the sign-in above offloaded its own check
-    resp = change(site, admin, current="secret")
-    assert resp.status_code == 400
-    assert "ADMIN_PASSWORD" in resp.text
-    assert "set-cookie" not in resp.headers
-    assert names == []  # no offloaded work at all: no verify, no hash
-    assert sleeps == []
-    assert (site.identity.session_binding("admin"),) == before
-    assert site.identity.authenticate("admin", "secret") is not None
-    assert site.identity.authenticate("admin", NEW_PW) is None
 
 
 def test_the_settings_route_refuses_when_the_provider_is_not_local(site, monkeypatch):

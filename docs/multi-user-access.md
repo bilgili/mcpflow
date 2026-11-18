@@ -103,10 +103,13 @@ earlier build stays in `rules.json`. Delete it on the Rules section.
 
 The bootstrap user has the id `admin`. Three rules apply to it:
 
-- The environment owns its password. `ADMIN_PASSWORD_HASH`, or the hash of
-  `ADMIN_PASSWORD`, sets the password at every start.
+- `users.json` owns its password. A fresh install starts with `admin` pending.
+  Run `mcpflow set-admin-password`, then restart. To recover a lost password, do
+  the same: every admin browser session ends, bearer tokens stay valid, and you
+  revoke them on the tokens page. `ADMIN_PASSWORD` and `ADMIN_PASSWORD_HASH` are
+  ignored.
 - It always stays in `admins`. Each start puts it back into `admins`.
-- No operation deletes it, removes it from `admins`, or changes its password.
+- No operation deletes it or removes it from `admins`. It changes its own password on the `/settings` page.
 
 ### The group picker
 
@@ -219,8 +222,8 @@ The setup page gives one error for an unknown user, a wrong code, an expired cod
 and an active user. These refusals wait 1 second. A password that is too short,
 or two passwords that differ, give their own error with no wait.
 
-The user `admin` does not use setup codes. `ADMIN_PASSWORD` or
-`ADMIN_PASSWORD_HASH` owns its password, and `/settings` shows a note for it.
+The user `admin` does not use setup codes. It uses `mcpflow set-admin-password`
+at first start, and the `/settings` form after that.
 
 ## Grant rules
 
@@ -579,7 +582,7 @@ A downgrade fails closed. The earlier build reads `servers.json` and
 - starts no pending or approved user server;
 - accepts no token of a user other than `admin`;
 - sees no second server under one namespace;
-- uses `ADMIN_PASSWORD` or `ADMIN_PASSWORD_HASH` as before.
+- needs `ADMIN_PASSWORD` or `ADMIN_PASSWORD_HASH` again, because it ignores the hash in `users.json`.
 
 A build that reads `users.json` version 1 refuses a version 2 file. It stops
 with the error "expected an object with version 1". To roll back to such a

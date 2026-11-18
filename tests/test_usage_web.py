@@ -79,7 +79,7 @@ async def env(tmp_path, children=(), *, alice_on=None, store_start=False):
     reg.load()
     settings = make_settings(d)
     store = UsageStore(d / "usage.sqlite3")
-    identity = LocalIdentityProvider(d / "users.json", settings.admin_password_hash)
+    identity = LocalIdentityProvider(d / "users.json")
     identity.load()
     tokens = TokenStore(d / "tokens.json", d / "user_tokens.json")
     tokens.load()
@@ -102,7 +102,7 @@ async def env(tmp_path, children=(), *, alice_on=None, store_start=False):
     app = Starlette(routes=routes, middleware=[Middleware(
         SessionGate, secret=settings.secret_key, identity=identity,
         public_prefixes=("/login", "/static/"), user_routes=USER_ROUTES)])
-    cookie = sign_session(settings.secret_key, "admin", settings.admin_password_hash, int(time.time()) + 3600)
+    cookie = sign_session(settings.secret_key, "admin", identity.session_binding("admin"), int(time.time()) + 3600)
 
     def client(cookies=None):
         return httpx.AsyncClient(transport=httpx.ASGITransport(app=app),

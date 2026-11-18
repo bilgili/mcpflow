@@ -21,7 +21,12 @@ import uvicorn
 
 from mcpflow.auth import hash_password
 from mcpflow.config import Settings, load_settings
-from mcpflow.identity import ADMINS_GROUP, BOOTSTRAP_ADMIN_ID, User
+from mcpflow.identity import (
+    ADMINS_GROUP,
+    BOOTSTRAP_ADMIN_ID,
+    User,
+    write_admin_password_file,
+)
 from mcpflow.registry import Registry, ServerSpec
 
 FAKE_SERVER = str(Path(__file__).parent / "fake_mcp_server.py")
@@ -83,8 +88,17 @@ def fake_child_spec(
     )
 
 
-def make_settings(data_dir: Path, password: str = "secret", **overrides) -> Settings:
-    over = {"DATA_DIR": str(data_dir), "ADMIN_PASSWORD": password}
+def make_settings(
+    data_dir: Path, password: str | None = "secret", *, admin_hash: str | None = None, **overrides
+) -> Settings:
+    """Settings over `data_dir`. A password (or `admin_hash`) goes into the
+    admin password file, which the provider applies at start; `password=None`
+    with no `admin_hash` leaves `users.json` alone (a pending admin on a fresh
+    install). Each call writes a fresh salt, so a rebuild ends older admin
+    cookies."""
+    if admin_hash is not None or password is not None:
+        write_admin_password_file(data_dir, admin_hash or hash_password(password))
+    over = {"DATA_DIR": str(data_dir)}
     over.update(overrides)
     return load_settings(over)
 
@@ -206,13 +220,12 @@ def make_policy(data_dir: Path, registry: Registry):
     `data_dir`, beside the registry files.
     """
     from mcpflow.auth import TokenStore, hash_password
-    from mcpflow.identity import LocalIdentityProvider
+    from mcpflow.identity import LocalIdentityProvider, write_admin_password_file
     from mcpflow.policy import AccessPolicy, RuleStore
     from mcpflow.usage import UsageStore
 
-    identity = LocalIdentityProvider(
-        data_dir / "users.json", hash_password("secret", iterations=1000)
-    )
+    write_admin_password_file(data_dir, hash_password("secret", iterations=1000))
+    identity = LocalIdentityProvider(data_dir / "users.json")
     identity.load()
     tokens = TokenStore(data_dir / "tokens.json", data_dir / "user_tokens.json")
     tokens.load()

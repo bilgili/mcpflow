@@ -17,7 +17,7 @@ from conftest import make_user
 from test_policy import make_world
 
 from mcpflow.auth import hash_password
-from mcpflow.identity import LocalIdentityProvider, User
+from mcpflow.identity import LocalIdentityProvider, User, write_admin_password_file
 from mcpflow.policy import ADMIN_REQUIRED, UNKNOWN_ACTOR
 
 
@@ -141,14 +141,14 @@ def test_a_load_keeps_the_incarnation_of_a_deleted_id_for_its_next_creation(tmp_
 def test_a_load_writes_nothing_for_the_incarnation(tmp_path, users_writes):
     """Scenario "A load writes nothing for the incarnation"."""
     path = tmp_path / "users.json"
-    admin_hash = hash_password("pw", iterations=1000)
-    first = LocalIdentityProvider(path, admin_hash)
+    write_admin_password_file(tmp_path, hash_password("pw", iterations=1000))
+    first = LocalIdentityProvider(path)
     first.load()  # the first start writes the bootstrap file
     make_user(first, "alice", "pw")
     on_disk = path.read_bytes()
     users_writes["n"] = 0
     for _ in range(2):  # two more starts, one fresh provider each
-        again = LocalIdentityProvider(path, admin_hash)
+        again = LocalIdentityProvider(path)
         again.load()
         assert {u.id: u.incarnation for u in again.list_users()} == {"admin": 0, "alice": 0}
     assert users_writes["n"] == 0

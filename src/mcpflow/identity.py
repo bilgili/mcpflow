@@ -19,10 +19,13 @@ group always exists and cannot be deleted. Group changes go through
 `change_groups`, a delta of one synchronous read and write, so a stale form
 changes only the groups it toggled.
 
-The bootstrap user `admin` follows three rules: the environment owns its
-password hash at every start, it is always a member of `admins`, and no
-operation deletes it, removes it from `admins`, replaces its credential, or
-issues a setup code for it, so it is never pending.
+The bootstrap user `admin` follows three rules: `users.json` owns its
+password hash, it is always a member of `admins`, and no operation deletes
+it, removes it from `admins`, or issues a setup code for it. A fresh install
+creates it pending, with no setup code, so nobody can sign in as `admin`.
+Only two writes set its hash: `load`, which applies the admin password file
+(`write_admin_password_file`, the `mcpflow set-admin-password` command) at
+start, and `replace_credential`, the settings form of `admin` itself.
 """
 
 from __future__ import annotations
@@ -30,16 +33,18 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
+import tempfile
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
-from .auth import hash_password, verify_password
+from .auth import hash_password, is_password_hash, verify_password
 
 if TYPE_CHECKING:
     from fastmcp.server.auth.auth import AccessToken
@@ -55,6 +60,63 @@ SETUP_CODE_TTL: Final = 7 * 24 * 3600  # seconds a setup code stays valid
 MIN_PASSWORD_LENGTH: Final = 8
 _SHA256_HEX_RE: re.Pattern[str] = re.compile(r"[0-9a-f]{64}")
 _BOOTSTRAP_IN_ADMINS: Final = f"cannot remove the bootstrap user {BOOTSTRAP_ADMIN_ID} from {ADMINS_GROUP}"
+# The admin password file, in the directory of `users.json`. A start claims
+# it by a rename, applies the claimed file, and deletes it (design D2, D3).
+ADMIN_PASSWORD_FILE: Final = "admin-password.hash"
+ADMIN_PASSWORD_CLAIM: Final = "admin-password.hash.applying"
+ADMIN_PENDING_NOTE: Final = (
+    "No admin password yet. Run `mcpflow set-admin-password` on the server, then restart."
+)
+
+log = logging.getLogger("mcpflow.identity")
+
+
+def write_admin_password_file(data_dir: Path, password_hash: str) -> Path:
+    """Write `password_hash` and a newline to `data_dir/ADMIN_PASSWORD_FILE`.
+
+    Raises `ValueError` before any write when `is_password_hash` is false.
+    Creates `data_dir` (parents too) when it is absent. Writes a
+    `tempfile.mkstemp(dir=data_dir, prefix=".admin-password.hash.")` file
+    (mode 0600), then `os.replace`. The `ValueError` text holds no part
+    of `password_hash`.
+    On any error it removes the temporary file and re-raises. Returns the
+    final path. Never reads or writes `users.json`."""
+    if not is_password_hash(password_hash):
+        raise ValueError("password_hash is not a pbkdf2_sha256 hash")
+    data_dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=data_dir, prefix=f".{ADMIN_PASSWORD_FILE}.")
+    final = data_dir / ADMIN_PASSWORD_FILE
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(password_hash + "\n")
+        os.replace(tmp, final)
+    except BaseException:
+        # BaseException, so an interrupt also leaves no temporary file (N7).
+        # No fsync, the same guarantee as `_save` (design "Risks").
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return final
+
+
+def _read_claim(path: Path) -> str | None:
+    """The valid hash in the claimed file, else `None` (design D4).
+
+    An absent file gives `None` silently. An unreadable or invalid file logs
+    one ERROR with a fixed reason and is kept. Never logs `str(exc)`: a
+    `UnicodeDecodeError` holds a byte of the file."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError):
+        reason = "cannot read"
+    else:
+        text = text.strip()
+        if is_password_hash(text):
+            return text
+        reason = "not a pbkdf2_sha256 hash"
+    log.error("%s is invalid (%s); the admin password did not change", path, reason)
+    return None
 
 
 # Keyword-only, so an old positional construction with an `is_admin` value
@@ -192,15 +254,10 @@ class LocalIdentityProvider:
 
     kind = "local"
 
-    def __init__(
-        self,
-        path: Path,
-        admin_password_hash: str,
-        *,
-        clock: Callable[[], float] = time.time,
-    ) -> None:
+    def __init__(self, path: Path, *, clock: Callable[[], float] = time.time) -> None:
+        """`path` is `users.json`. The data directory is `path.parent`.
+        The positional `admin_password_hash` is removed."""
         self._path = path
-        self._admin_password_hash = admin_password_hash
         self._clock = clock  # the setup-code expiry reads it; a test moves it
         self._users: dict[str, dict] = {}
         self._groups: list[str] = []
@@ -212,36 +269,75 @@ class LocalIdentityProvider:
         self._dummy_hash = ""
 
     def load(self) -> None:
+        """Read `users.json`, apply the bootstrap rules and the admin
+        password file, and adopt the result. Steps S1 to S8 of the design,
+        in that order; `specs/tla/admin_password_file.tla` checks the order.
+        A raise at any step stops the start (the model's `Crash`)."""
+        # S1: parse. Raises on a malformed file or a conflicting legacy
+        # `admins` group, before the bootstrap rules and before any write.
         version = None
         if self._path.exists():
             data = json.loads(self._path.read_text())
             version = data.get("version") if isinstance(data, dict) else None
-            # Raises on a malformed file or a conflicting legacy `admins`
-            # group, before the bootstrap rules and before any write.
             parsed = _parse(data)
         else:
             parsed = ({}, [])
         users, groups = parsed
-        # The bootstrap rules, applied at every start. The environment owns
-        # the admin password, so a rotation of `ADMIN_PASSWORD` takes effect
-        # here; the membership of `admins` is forced back on, so a hand edit
-        # cannot demote it.
+        # S2: the bootstrap rules, applied at every start. `users.json` owns
+        # the admin hash: an existing record keeps it, a new one is pending
+        # (""). The membership of `admins` is forced back on and a `setup`
+        # object is dropped, so a hand edit can neither demote `admin` nor
+        # give it a setup code (D6).
         if ADMINS_GROUP not in groups:
             groups = [*groups, ADMINS_GROUP]
         current = users.get(BOOTSTRAP_ADMIN_ID)
-        users = {
-            **users,
-            BOOTSTRAP_ADMIN_ID: {
-                "id": BOOTSTRAP_ADMIN_ID,
-                "name": current["name"] if current else BOOTSTRAP_ADMIN_ID,
-                "password_hash": self._admin_password_hash,
-                "groups": sorted({*(current["groups"] if current else ()), ADMINS_GROUP}),
-            },
+        admin = {
+            "id": BOOTSTRAP_ADMIN_ID,
+            "name": current["name"] if current else BOOTSTRAP_ADMIN_ID,
+            "password_hash": current["password_hash"] if current else "",
+            "groups": sorted({*(current["groups"] if current else ()), ADMINS_GROUP}),
         }
-        # One write: a version 1 file always migrates; a version 2 file that
-        # already satisfies the rules writes nothing (idempotent load).
+        data_dir = self._path.parent
+        main = data_dir / ADMIN_PASSWORD_FILE
+        claim = data_dir / ADMIN_PASSWORD_CLAIM
+        # S3: claim the file by a rename, with no check that it exists. A
+        # write after this rename makes a new file that the next start
+        # applies (D3). Any other OSError stops the start (R1): going on
+        # could apply an older claimed file past this newer one.
+        try:
+            os.replace(main, claim)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.error("cannot claim %s as %s (%s); the start stops", main, claim, type(exc).__name__)
+            raise
+        # S4: read the claimed file. An invalid one logs, stays, and gives
+        # no candidate; the start goes on (D4).
+        candidate = _read_claim(claim)
+        # S5: persist. One write only when the state changes: a version 1
+        # file always migrates; a version 2 file that already holds the
+        # rules and the claimed hash writes nothing (idempotent load, F3).
+        if candidate is not None:
+            admin["password_hash"] = candidate
+        users = {**users, BOOTSTRAP_ADMIN_ID: admin}
         if version == 1 or (users, groups) != parsed:
             self._save(users, groups)
+        # S6: delete the claimed file only now that `users.json` holds its
+        # hash (D2). A failed unlink stops the start (R2): going on would
+        # let a later start apply this old hash again.
+        if candidate is not None:
+            try:
+                claim.unlink(missing_ok=True)
+            except OSError as exc:
+                log.error("cannot delete %s (%s); the start stops", claim, type(exc).__name__)
+                raise
+            log.warning(
+                "admin password set from admin-password.hash; every admin browser "
+                "session has ended; bearer tokens stay valid, revoke them on the "
+                "tokens page"
+            )
+        # S7: adopt the state that holds the applied hash, never the parsed
+        # one, or the next mutation would write the old hash back.
         self._users, self._groups = users, groups
         # Never lowers an entry: a second `load` keeps a re-created id.
         for uid in users:
@@ -251,6 +347,10 @@ class LocalIdentityProvider:
         # The iteration count is the `hash_password` default, the one
         # every stored hash uses.
         self._dummy_hash = hash_password(secrets.token_hex(16))
+        # S8: a pending `admin` has no way in until the operator runs the
+        # command and restarts (D5).
+        if not users[BOOTSTRAP_ADMIN_ID]["password_hash"]:
+            log.warning(ADMIN_PENDING_NOTE)
 
     def _save(self, users: dict[str, dict], groups: list[str]) -> None:
         """Write a candidate state. The caller adopts it only after this returns."""
@@ -484,15 +584,19 @@ class LocalIdentityProvider:
 
     def _credential_state(self, user_id: str) -> str | None:
         """The opaque value `replace_credential` compares. The hash for an
-        active user, `"setup:" + sha256` for a pending one, `None` for an
-        unknown one. Neither a salted hash nor a code repeats, so a state
-        never returns to an earlier value (no ABA)."""
+        active user, `"setup:" + sha256` for a pending one with a `setup`
+        object, `None` for a pending one without it and for an unknown one.
+        Neither a salted hash nor a code repeats, so a state never returns
+        to an earlier value (no ABA). A pending user with no code has no
+        state at all, so no swap can activate it, the pending `admin`
+        included (design D6)."""
         rec = self._users.get(user_id)
         if rec is None:
             return None
         if rec["password_hash"]:
             return rec["password_hash"]
-        return "setup:" + rec.get("setup", {}).get("sha256", "")
+        setup = rec.get("setup")
+        return None if setup is None else "setup:" + setup["sha256"]
 
     def replace_credential(self, user_id: str, expected_state: str | None, new_hash: str) -> bool:
         """Compare-and-swap of the credential. Synchronous on purpose: no
@@ -501,8 +605,10 @@ class LocalIdentityProvider:
         Return `False` when the user is gone or its state is no longer
         `expected_state`; else write `new_hash`, drop `setup`, and return
         `True`. The caller issues the session cookie in the same
-        synchronous run, with no `await` after this returns (design D6)."""
-        self._refuse_bootstrap(user_id, "replace the credential of")
+        synchronous run, with no `await` after this returns (design D6).
+        The bootstrap user `admin` follows the same rules: an active
+        `admin` swaps with its session binding; a pending one has the
+        state `None`, so every swap returns `False`."""
         if not isinstance(new_hash, str) or not new_hash:
             raise ValueError("new_hash must be a non-empty string")
         state = self._credential_state(user_id)

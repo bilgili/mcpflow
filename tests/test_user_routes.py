@@ -25,7 +25,7 @@ from user_servers import fake_npx, npm_spec, path_with
 
 from mcpflow.auth import SessionGate, TokenStore, hash_password
 from mcpflow.gateway import build_app
-from mcpflow.identity import LocalIdentityProvider
+from mcpflow.identity import LocalIdentityProvider, write_admin_password_file
 from mcpflow.registry import Registry, ServerKey, revision
 from mcpflow.web import USER_ROUTES
 
@@ -135,8 +135,8 @@ def seed(data: Path) -> tuple[str, str]:
     Return the id of a token of alice and an admin token (clear text).
     """
     (data / "logs").mkdir(parents=True)
-    ident = LocalIdentityProvider(data / "users.json",
-                                  hash_password("secret", iterations=1000))
+    write_admin_password_file(data, hash_password("secret", iterations=1000))
+    ident = LocalIdentityProvider(data / "users.json")
     ident.load()
     for uid, pw in PASSWORDS.items():
         make_user(ident, uid, pw)

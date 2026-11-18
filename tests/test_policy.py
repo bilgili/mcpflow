@@ -23,7 +23,12 @@ import pytest
 from conftest import make_user
 
 from mcpflow.auth import HashedTokenVerifier, TokenStore, hash_password
-from mcpflow.identity import ADMINS_GROUP, LocalIdentityProvider, User
+from mcpflow.identity import (
+    ADMINS_GROUP,
+    LocalIdentityProvider,
+    User,
+    write_admin_password_file,
+)
 from mcpflow.policy import AccessPolicy, GrantRule, RuleStore, resolve
 from mcpflow.registry import Registry, ServerKey, ServerSpec, revision
 from mcpflow.usage import UsageStore
@@ -187,9 +192,8 @@ def make_world(tmp_path: Path, servers=(("time", None, True),)):
 
     `servers` holds `(namespace, owner, approved)` triples.
     """
-    ident = LocalIdentityProvider(
-        tmp_path / "users.json", hash_password("pw", iterations=1000)
-    )
+    write_admin_password_file(tmp_path, hash_password("pw", iterations=1000))
+    ident = LocalIdentityProvider(tmp_path / "users.json")
     ident.load()
     for g in ("eng", "ops", "interns"):
         ident._create_group(g)

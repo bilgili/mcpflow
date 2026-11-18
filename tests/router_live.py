@@ -36,7 +36,7 @@ import uvicorn
 from conftest import make_settings, make_user
 
 from mcpflow.auth import TokenStore, hash_password
-from mcpflow.identity import LocalIdentityProvider
+from mcpflow.identity import LocalIdentityProvider, write_admin_password_file
 from mcpflow.registry import Registry, ServerKey, ServerSpec, revision
 
 CHILD = str(Path(__file__).parent / "fake_router_child.py")
@@ -102,9 +102,8 @@ def _env(child: Child, log: Path) -> dict[str, str]:
 
 def _seed(data_dir: Path, children, procs: list) -> dict[str, str]:
     """Seed users, groups, tokens, and the registry. Return the clear tokens."""
-    ident = LocalIdentityProvider(
-        data_dir / "users.json", hash_password("secret", iterations=1000)
-    )
+    write_admin_password_file(data_dir, hash_password("secret", iterations=1000))
+    ident = LocalIdentityProvider(data_dir / "users.json")
     ident.load()
     for group in GROUPS:
         ident._create_group(group)

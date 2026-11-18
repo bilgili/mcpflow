@@ -49,7 +49,6 @@ def test_settings_fields_frozen():
         "data_dir",
         "host",
         "port",
-        "admin_password_hash",
         "secret_key",
         "cookie_secure",
         "session_ttl",
@@ -59,6 +58,7 @@ def test_settings_fields_frozen():
         "public_url",
         "max_user_servers",
         "max_user_tokens",
+        "ignored_admin_env",
     ]
     assert config.Settings.__dataclass_params__.frozen is True
     defaults = {f.name: f.default for f in dataclasses.fields(config.Settings)}
@@ -313,7 +313,7 @@ def test_identity_interface():
     assert identity.User.__dataclass_params__.frozen is True
     L = identity.LocalIdentityProvider
     assert L.kind == "local"
-    assert _params(L.__init__) == ["self", "path", "admin_password_hash", "clock"]
+    assert _params(L.__init__) == ["self", "path", "clock"]
     assert _params(L._create_user) == [
         "self", "user_id", "name", "admin", "groups",
     ]

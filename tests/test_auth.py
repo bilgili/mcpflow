@@ -20,7 +20,7 @@ from mcpflow.auth import (
     verify_password,
     verify_session,
 )
-from mcpflow.identity import LocalIdentityProvider
+from mcpflow.identity import LocalIdentityProvider, write_admin_password_file
 
 SECRET = b"unit-test-secret-key"
 
@@ -254,9 +254,8 @@ async def test_verifier_valid_and_revoked(tmp_path):
     store = TokenStore(tmp_path / "tokens.json", tmp_path / "user_tokens.json")
     store.load()
     record, clear = store.create("laptop", "mcp", "admin")
-    identity = LocalIdentityProvider(
-        tmp_path / "users.json", hash_password("pw", iterations=1000)
-    )
+    write_admin_password_file(tmp_path, hash_password("pw", iterations=1000))
+    identity = LocalIdentityProvider(tmp_path / "users.json")
     identity.load()
     verifier = HashedTokenVerifier(store, identity)
     access = await verifier.verify_token(clear)
@@ -293,9 +292,8 @@ def _tokens(tmp_path: Path) -> TokenStore:
 
 
 def _identity(tmp_path: Path) -> LocalIdentityProvider:
-    ident = LocalIdentityProvider(
-        tmp_path / "users.json", hash_password("admin-pw", iterations=1000)
-    )
+    write_admin_password_file(tmp_path, hash_password("admin-pw", iterations=1000))
+    ident = LocalIdentityProvider(tmp_path / "users.json")
     ident.load()
     return ident
 
@@ -448,9 +446,8 @@ ALICE_PW = "alice-pw"
 
 
 def _seed_users(data_dir: Path) -> None:
-    ident = LocalIdentityProvider(
-        data_dir / "users.json", hash_password("secret", iterations=1000)
-    )
+    write_admin_password_file(data_dir, hash_password("secret", iterations=1000))
+    ident = LocalIdentityProvider(data_dir / "users.json")
     ident.load()
     make_user(ident, "alice", ALICE_PW)
     make_user(ident, "bob", "bob-pw")
@@ -599,14 +596,13 @@ def test_password_change_invalidates_sessions_through_the_dashboard(tmp_path):
     _assert_unauthenticated(client, headers, calls)
 
 
-def test_password_change_invalidates_sessions_through_the_environment(tmp_path):
+def test_password_change_invalidates_sessions_through_the_admin_password_file(tmp_path):
     ident = _identity(tmp_path)
-    headers = _cookie(ident, "admin")  # signed under the old ADMIN_PASSWORD
+    headers = _cookie(ident, "admin")  # signed under the old admin password
     calls: list[str] = []
-    # A restart with a new ADMIN_PASSWORD builds a new provider on the same file.
-    restarted = LocalIdentityProvider(
-        tmp_path / "users.json", hash_password("changed-admin-pw", iterations=1000)
-    )
+    # A restart after a new admin password file builds a new provider on the same file.
+    write_admin_password_file(tmp_path, hash_password("changed-admin-pw", iterations=1000))
+    restarted = LocalIdentityProvider(tmp_path / "users.json")
     restarted.load()
     _assert_unauthenticated(_gate(tmp_path, restarted, calls), headers, calls)
 
@@ -780,9 +776,8 @@ async def test_token_of_a_removed_user_is_refused(tmp_path):
 
 def _seed_tokens(holder: dict):
     def seed(data_dir: Path) -> None:
-        ident = LocalIdentityProvider(
-            data_dir / "users.json", hash_password("secret", iterations=1000)
-        )
+        write_admin_password_file(data_dir, hash_password("secret", iterations=1000))
+        ident = LocalIdentityProvider(data_dir / "users.json")
         ident.load()
         make_user(ident, "alice", ALICE_PW)
         make_user(ident, "dave", "pw", admin=True)

@@ -249,7 +249,7 @@ async def test_dashboard_marks_a_failed_child(tmp_path):
     from mcpflow.identity import LocalIdentityProvider
     from mcpflow.web import USER_ROUTES
 
-    identity = LocalIdentityProvider(data_dir / "users.json", settings.admin_password_hash)
+    identity = LocalIdentityProvider(data_dir / "users.json")
     identity.load()
     from mcpflow.usage import UsageStore
 
@@ -271,7 +271,7 @@ async def test_dashboard_marks_a_failed_child(tmp_path):
     cookie = sign_session(
         settings.secret_key,
         "admin",
-        settings.admin_password_hash,
+        identity.session_binding("admin"),
         int(time.time()) + 3600,
     )
     transport = httpx.ASGITransport(app=app)

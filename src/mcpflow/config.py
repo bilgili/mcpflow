@@ -1,7 +1,12 @@
 """Process settings from environment variables and CLI overrides.
 
-`config.py` imports `hash_password` and the cap defaults from `auth.py` and
-`registry.py`. Neither takes a `Settings`, so there is no import cycle.
+`config.py` imports the cap defaults from `auth.py` and `registry.py`.
+Neither takes a `Settings`, so there is no import cycle.
+
+The admin password is not a setting: `users.json` owns it, and
+`identity.py` applies the admin password file at start. `load_settings`
+only records the legacy variables that are still set, so the gateway can
+warn that it ignores them.
 """
 
 from __future__ import annotations
@@ -12,14 +17,13 @@ import re
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Final
 
-from .auth import DEFAULT_MAX_USER_TOKENS, hash_password
+from .auth import DEFAULT_MAX_USER_TOKENS
 from .registry import DEFAULT_MAX_USER_SERVERS
 
-# A usable hash needs a positive iteration count, a salt of at least 16 hex
-# chars, and a full 64-hex-char SHA-256 digest. Checked with fullmatch, so a
-# placeholder like `pbkdf2_sha256$0$00$00` is rejected.
-_HASH_RE = re.compile(r"pbkdf2_sha256\$[1-9]\d*\$[0-9a-f]{16,}\$[0-9a-f]{64}")
+# No value of these is used; a set one is named in `Settings.ignored_admin_env`.
+LEGACY_ADMIN_ENV: Final = ("ADMIN_PASSWORD", "ADMIN_PASSWORD_HASH")
 
 
 class ConfigError(Exception):
@@ -31,7 +35,6 @@ class Settings:
     data_dir: Path
     host: str
     port: int
-    admin_password_hash: str
     secret_key: bytes
     cookie_secure: bool
     session_ttl: int
@@ -42,12 +45,20 @@ class Settings:
     # Per-user caps on stored servers and tokens; the admin is exempt (D2).
     max_user_servers: int = DEFAULT_MAX_USER_SERVERS
     max_user_tokens: int = DEFAULT_MAX_USER_TOKENS
+    # The names from `LEGACY_ADMIN_ENV` that are set and not empty (D9).
+    ignored_admin_env: tuple[str, ...] = ()
 
 
 def _get(overrides: dict[str, str], name: str, default: str | None) -> str | None:
     if name in overrides and overrides[name] is not None:
         return overrides[name]
     return os.environ.get(name, default)
+
+
+def data_dir_path(overrides: dict[str, str] | None = None) -> Path:
+    """`DATA_DIR` from `overrides`, else the environment, else `./data`.
+    Creates nothing."""
+    return Path(_get(overrides or {}, "DATA_DIR", "./data"))
 
 
 def _resolve_secret_key(data_dir: Path, env_value: str | None) -> bytes:
@@ -81,22 +92,15 @@ def load_settings(overrides: dict[str, str] | None = None) -> Settings:
     """Read the environment, apply CLI overrides, and prepare the data dir."""
     overrides = overrides or {}
 
-    data_dir = Path(_get(overrides, "DATA_DIR", "./data"))
+    data_dir = data_dir_path(overrides)
     data_dir.mkdir(parents=True, exist_ok=True)
     (data_dir / "logs").mkdir(parents=True, exist_ok=True)
 
     host = _get(overrides, "HOST", "127.0.0.1")
     port = int(_get(overrides, "PORT", "8000"))
 
-    password_hash = _get(overrides, "ADMIN_PASSWORD_HASH", None)
-    if password_hash:
-        if not _HASH_RE.fullmatch(password_hash):
-            raise ConfigError("ADMIN_PASSWORD_HASH is not a valid pbkdf2_sha256 hash")
-    else:
-        clear = _get(overrides, "ADMIN_PASSWORD", None)
-        if not clear:
-            raise ConfigError("set ADMIN_PASSWORD or ADMIN_PASSWORD_HASH")
-        password_hash = hash_password(clear)
+    # Names only: no value of these variables is read into a setting.
+    ignored_admin_env = tuple(n for n in LEGACY_ADMIN_ENV if _get(overrides, n, None))
 
     secret_key = _resolve_secret_key(data_dir, _get(overrides, "SECRET_KEY", None))
 
@@ -118,7 +122,6 @@ def load_settings(overrides: dict[str, str] | None = None) -> Settings:
         data_dir=data_dir,
         host=host,
         port=port,
-        admin_password_hash=password_hash,
         secret_key=secret_key,
         cookie_secure=cookie_secure,
         session_ttl=session_ttl,
@@ -128,4 +131,5 @@ def load_settings(overrides: dict[str, str] | None = None) -> Settings:
         public_url=public_url,
         max_user_servers=max_user_servers,
         max_user_tokens=max_user_tokens,
+        ignored_admin_env=ignored_admin_env,
     )

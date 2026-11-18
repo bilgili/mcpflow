@@ -130,26 +130,54 @@ pip install mcpflow
 
 ## Set the admin password
 
-The process needs an admin password. Create a password hash first.
+A fresh install starts with a pending admin: the user `admin` has no password,
+and the login page shows a note. Set the password with the command below. Then
+restart the server.
 
 ```sh
-mcpflow hash-password
+mcpflow set-admin-password
 ```
 
-The command prints one line that starts with `pbkdf2_sha256$`. Set the line as
-`ADMIN_PASSWORD_HASH`. You can also set the clear-text `ADMIN_PASSWORD` instead,
-but the hash is safer.
+The command asks for the password twice and writes the hash to the file
+`admin-password.hash` in the data directory. The next start reads the file,
+saves the hash in `users.json`, and deletes the file. `users.json` owns the
+password of the user `admin`. After the start, you can also change the password
+on the `/settings` page.
 
-`ADMIN_PASSWORD_HASH` or `ADMIN_PASSWORD` owns the password of the user `admin`.
-The process sets that password from the environment at every start. To change it,
-change the environment variable and restart. See [Multiple users](#multiple-users).
+Run the command as the server user. A run as `root` makes a file that the server
+cannot read.
+
+To recover a lost admin password, run `mcpflow set-admin-password`, then restart.
+Every admin browser session ends. Bearer tokens stay valid. Revoke them on the
+tokens page.
+
+With Docker, run the command in the container, then restart it.
+
+```sh
+docker compose exec mcpflow mcpflow set-admin-password
+docker compose restart mcpflow
+```
+
+### Write the file by hand
+
+You can make `admin-password.hash` yourself. Make the line with
+`mcpflow hash-password`. Follow these three rules.
+
+1. Write a temporary file in the data directory under `umask 077`. Then `mv` it
+   to `admin-password.hash`. A shell `>` onto the final name makes a copy of the
+   hash that all users can read under the default umask. A start can also claim a
+   file that is only partly written. No hash is lost, but the start logs a false
+   ERROR.
+2. Make a new line with `mcpflow hash-password` for each change. Do not use a
+   line again. A line used again makes every cookie bound to that hash valid again.
+3. `mcpflow hash-password` does not apply the minimum of 8 characters. Only
+   `set-admin-password` applies it.
 
 ## Run the server
 
 Start the gateway with `serve`. The flags override the environment variables.
 
 ```sh
-export ADMIN_PASSWORD_HASH='pbkdf2_sha256$...'
 mcpflow serve --host 127.0.0.1 --port 8000 --data-dir ./data
 ```
 
@@ -162,8 +190,10 @@ Copy the example environment file and set the values.
 
 ```sh
 cp .env.example .env
-# set ADMIN_PASSWORD_HASH and SECRET_KEY in .env
+# set SECRET_KEY in .env
 docker compose up -d
+docker compose exec mcpflow mcpflow set-admin-password
+docker compose restart mcpflow
 ```
 
 The compose file builds the image, maps port `8000`, and mounts a named volume
@@ -181,8 +211,8 @@ command builds the wheel and passes it to Docker through a named build context.
 | `DATA_DIR` | `./data` (Docker: `/data`) | registry, tokens, logs, caches |
 | `HOST` | `127.0.0.1` (Docker: `0.0.0.0`) | bind address |
 | `PORT` | `8000` | bind port |
-| `ADMIN_PASSWORD` | unset | clear-text password of the user `admin`; hashed in memory at start |
-| `ADMIN_PASSWORD_HASH` | unset | password hash of the user `admin`; output of `mcpflow hash-password`; wins over `ADMIN_PASSWORD` |
+| `ADMIN_PASSWORD` | ignored | no effect; the start logs a WARNING when it is set; a downgrade needs it again |
+| `ADMIN_PASSWORD_HASH` | ignored | no effect; the start logs a WARNING when it is set; a downgrade needs it again |
 | `SECRET_KEY` | unset | cookie signing key; else `DATA_DIR/secret_key` |
 | `COOKIE_SECURE` | `0` | set `1` behind HTTPS |
 | `SESSION_TTL_SECONDS` | `604800` | session lifetime |

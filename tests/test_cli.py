@@ -29,7 +29,6 @@ def _patch_uvicorn(monkeypatch):
 
 def test_serve_with_flags(monkeypatch, tmp_path):
     captured = _patch_uvicorn(monkeypatch)
-    monkeypatch.setenv("ADMIN_PASSWORD", "pw")
     rc = main(
         [
             "serve",
@@ -48,7 +47,6 @@ def test_serve_with_flags(monkeypatch, tmp_path):
 
 def test_serve_with_environment(monkeypatch, tmp_path):
     captured = _patch_uvicorn(monkeypatch)
-    monkeypatch.setenv("ADMIN_PASSWORD", "pw")
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("PORT", "9001")
     rc = main(["serve"])
@@ -72,9 +70,9 @@ def test_version_flag(capsys):
 
 
 def test_exit_code_2(monkeypatch, tmp_path, capsys):
-    # Neither ADMIN_PASSWORD nor ADMIN_PASSWORD_HASH set.
-    monkeypatch.delenv("ADMIN_PASSWORD", raising=False)
-    monkeypatch.delenv("ADMIN_PASSWORD_HASH", raising=False)
+    # A bad setting (a negative cache TTL) causes the exit code 2. A missing
+    # admin password is no error: the admin stays pending.
+    monkeypatch.setenv("CHILD_CACHE_TTL", "-1")
     rc = main(["serve", "--data-dir", str(tmp_path)])
     assert rc == 2
     assert capsys.readouterr().err.strip() != ""

@@ -4,6 +4,16 @@ This file records the user-visible changes of MCP Flow, a gateway for Model Cont
 
 ## Unreleased
 
+### Added
+
+- The command `mcpflow set-admin-password` sets the password of the user `admin`. It writes the file `admin-password.hash` in the data directory. The next start saves the hash in `users.json` and deletes the file. A fresh install starts with a pending admin, and the login page shows a note.
+- The user `admin` now changes its password on the `/settings` form, as every other user does.
+- Recovery: run `mcpflow set-admin-password`, then restart. Every admin browser session ends. Bearer tokens stay valid. Revoke them on the tokens page. With Docker, run `docker compose exec mcpflow mcpflow set-admin-password`, then `docker compose restart mcpflow`.
+
+### Breaking
+
+- `ADMIN_PASSWORD` and `ADMIN_PASSWORD_HASH` are ignored. The start logs a WARNING when one is set. An install with no `users.json` starts with a pending admin and does not take the password from these variables. A downgrade needs them again.
+
 ### Fixed
 
 - The `Mcp-Param` header check of a modern `tools/call` now uses the tool list of the caller. Before, the listing of one user could refuse a good call of another user, or skip the check. Two answers change for a modern client. A call without a declared header, sent before any listing, now gets HTTP 400. A caller that does not reach the tool name now gets the unknown-tool error in place of HTTP 400.

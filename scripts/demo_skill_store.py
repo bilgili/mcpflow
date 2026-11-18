@@ -14,9 +14,10 @@ import uvicorn
 from fastmcp import Client
 from fastmcp.client.transports import StdioTransport
 
-from mcpflow.auth import TokenStore
+from mcpflow.auth import TokenStore, hash_password
 from mcpflow.config import load_settings
 from mcpflow.gateway import build_app
+from mcpflow.identity import write_admin_password_file
 from mcpflow.registry import Registry, ServerSpec
 
 WELCOME = """---
@@ -111,8 +112,9 @@ def main() -> None:
             args=["-m", "skill_store"], env={"SKILLS_STATE_DIR": str(root / "child")},
             actions=True, cache_ttl=0,
         ))
+    write_admin_password_file(gateway_dir, hash_password(values["admin_password"]))
     settings = load_settings({
-        "DATA_DIR": str(gateway_dir), "ADMIN_PASSWORD": values["admin_password"],
+        "DATA_DIR": str(gateway_dir),
         "SECRET_KEY": values["secret_key"], "COOKIE_SECURE": "0",
         "PUBLIC_URL": f"http://127.0.0.1:{args.port}",
     })

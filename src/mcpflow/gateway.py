@@ -109,11 +109,16 @@ def build_app(settings: Settings) -> Starlette:
     _mask_access_log()
     install_log_redaction()
     # Identity first: it creates the bootstrap `admin` on the first start and
-    # sets its hash from the environment, and every later owner asks it.
-    identity = LocalIdentityProvider(
-        settings.data_dir / "users.json", settings.admin_password_hash
-    )
+    # applies `admin-password.hash` from the data dir, and every later owner
+    # asks it.
+    identity = LocalIdentityProvider(settings.data_dir / "users.json")
     identity.load()
+    if settings.ignored_admin_env:
+        logging.getLogger("mcpflow.gateway").warning(
+            "%s set but ignored: users.json owns the admin password; "
+            "use mcpflow set-admin-password",
+            ", ".join(settings.ignored_admin_env),
+        )
 
     tokens = TokenStore(
         settings.data_dir / "tokens.json",

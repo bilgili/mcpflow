@@ -24,7 +24,7 @@ from dashboard_site import api_headers, bearer, make_mu_site, mcp_tools  # noqa:
 from reresolve_race import make_admin_user, make_second_admin
 from test_policy import make_world
 
-from mcpflow.auth import TokenStore, hash_password
+from mcpflow.auth import TokenStore
 from mcpflow.identity import LocalIdentityProvider
 from mcpflow.policy import AccessPolicy
 from mcpflow.usage import UsageStore
@@ -232,7 +232,7 @@ def test_a_failed_identity_write_leaves_an_active_user_with_no_token(tmp_path, m
     # The write to users.json failed, so bob is active, in memory and on disk.
     assert w.ident.get_user("bob").pending is False
     assert w.ident.authenticate("bob", "pw") is not None  # the old password still works
-    fresh = LocalIdentityProvider(tmp_path / "users.json", hash_password("pw", iterations=1000))
+    fresh = LocalIdentityProvider(tmp_path / "users.json")
     fresh.load()
     assert fresh.get_user("bob").pending is False
     assert fresh.authenticate("bob", "pw") is not None
