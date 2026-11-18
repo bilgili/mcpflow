@@ -38,6 +38,7 @@ from .identity import (
     User,
 )
 from .registry import Registry, ServerKey, _atomic_write
+from .usage import UsageStore
 
 Level = Literal["global", "server", "tool"]
 Effect = Literal["allow", "deny"]
@@ -273,11 +274,13 @@ class AccessPolicy:
         rules: RuleStore,
         tokens: TokenStore,
         registry: Registry,
+        usage: UsageStore,
     ) -> None:
         self._identity = identity
         self._rules = rules
         self._tokens = tokens
         self._registry = registry
+        self._usage = usage
 
     def current_user(self) -> User | None:
         """The user of the current MCP request; `None` without one."""
@@ -324,18 +327,37 @@ class AccessPolicy:
 
     # --- rules -----------------------------------------------------------
 
+    def _current(self, user: User) -> User | None:
+        """The one owner of the rule "this snapshot still names the same
+        user": the current record of `user.id` when it holds the snapshot's
+        incarnation, else `None`. Reads `self._identity.get_user` once; a
+        provider error passes through."""
+        current = self._identity.get_user(user.id)
+        if current is None or current.incarnation != user.incarnation:
+            return None
+        return current
+
+    def is_current(self, user: User) -> bool:
+        """Whether the snapshot `user` still holds (usage-stats D4). Never
+        raises: a provider error is `False`, so a call records under `''`."""
+        try:
+            return self._current(user) is not None
+        except Exception:  # noqa: BLE001 -- D4: never raises; an unknown answer records under ''
+            return False
+
     def require_current(self, actor: User) -> None:
         """Refuse a write whose actor snapshot no longer holds.
 
         Synchronous on purpose: the caller writes after this returns, with
         no `await` between. Reads `self._identity.get_user(actor.id)` once
-        and writes nothing; a provider error passes through. The current
-        record only takes a right away: it never grants one and never
-        changes the branch the snapshot chose. A snapshot of another
-        incarnation of the id is an unknown actor: the user it names no
-        longer exists. Order: unknown id, other incarnation, lost role."""
-        current = self._identity.get_user(actor.id)
-        if current is None or current.incarnation != actor.incarnation:
+        (through `_current`, the rule `is_current` shares) and writes
+        nothing; a provider error passes through. The current record only
+        takes a right away: it never grants one and never changes the branch
+        the snapshot chose. A snapshot of another incarnation of the id is
+        an unknown actor: the user it names no longer exists. Order: unknown
+        id, other incarnation, lost role."""
+        current = self._current(actor)
+        if current is None:
             raise PermissionError(UNKNOWN_ACTOR)
         if actor.is_admin and not current.is_admin:
             raise PermissionError(ADMIN_REQUIRED)
@@ -446,7 +468,8 @@ class AccessPolicy:
         return self._identity
 
     def delete_user(self, actor: User, user_id: str) -> None:
-        """Refuse an owner; then delete the user, revoke tokens, drop rules.
+        """Refuse an owner; then delete the user, revoke tokens, drop rules,
+        and forget the user's usage counts (usage-stats D14).
 
         The identity goes first: the token verifier and the session gate
         re-resolve the user on every request, so from that write on its
@@ -454,7 +477,10 @@ class AccessPolicy:
         only unreachable residue (tokens, rules) and never removes a deny
         from a user who can still act; `create_user` clears that residue
         before an id is reused. The actor check runs before the first store
-        write of the cascade, so a refusal leaves all three stores unchanged."""
+        write of the cascade, so a refusal leaves every store unchanged. The
+        usage forget is synchronous and comes last, with no `await` in the
+        method: the old holder's counts move to `''`, which only an admin
+        reads."""
         self._require_admin(actor)
         local = self.local_identity()
         if user_id == BOOTSTRAP_ADMIN_ID:
@@ -469,6 +495,7 @@ class AccessPolicy:
         local._delete_user(user_id)
         self._tokens.revoke_user(user_id)
         self._rules.drop_subject("user", user_id)
+        self._usage.forget_user(user_id)
 
     def delete_group(self, actor: User, name: str) -> None:
         """Delete the group, then drop its rules. A crash between the two
@@ -501,16 +528,17 @@ class AccessPolicy:
         """Create a pending user; return it and its one-time setup code.
 
         A new id starts clean: after every refusal of the pre-check
-        `check_create_user`, clear any tokens and rules an interrupted
-        `delete_user` left on the id (D8b), then write the identity. A
-        refused create changes no store; a crash never leaves a live user
-        with residue."""
+        `check_create_user`, clear any tokens, rules, and usage counts an
+        interrupted `delete_user` left on the id (D8b, usage-stats D14),
+        then write the identity. A refused create changes no store; a crash
+        never leaves a live user with residue."""
         self._require_admin(actor)
         local = self.local_identity()
         groups = tuple(groups)  # read once: the pre-check and the create see the same names
         local.check_create_user(user_id, name=name, admin=admin, groups=groups)
         self._tokens.revoke_user(user_id)
         self._rules.drop_subject("user", user_id)
+        self._usage.forget_user(user_id)
         return local._create_user(user_id, name=name, admin=admin, groups=groups)
 
     def issue_setup_code(self, actor: User, user_id: str) -> str:

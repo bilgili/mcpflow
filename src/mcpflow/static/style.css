@@ -328,3 +328,52 @@ td.row-end { width: 1%; text-align: right; }
 .btn-sm { padding: .1rem .45rem; font-size: .85rem; }
 .nowrap { white-space: nowrap; }
 .nowrap form { margin: 0; }
+
+/* Usage: the bar, the stacked chart, the header count, the `Usage` cell. */
+:root {
+  --series-0: #3987e5; --series-1: #d95926; --series-2: #199e70; --series-3: #c98500;
+  --series-4: #d55181; --series-5: #2f9e2f; --series-6: #9085e9; --series-7: #6b7280;
+}
+.usage-bar { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; margin: .25rem 0 .75rem; }
+.usage-bar .small { color: var(--muted); }
+/* The bucket radios look like one segmented button row. */
+.usage-bar .seg { display: inline-flex; position: relative; }
+.usage-bar .seg label { margin: 0; color: inherit; }
+.usage-bar .seg input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.usage-bar .seg span {
+  display: inline-block; padding: .3rem .65rem; margin-left: -1px; cursor: pointer;
+  background: var(--panel); color: var(--fg); border: 1px solid var(--border);
+}
+.usage-bar .seg label:first-child span { border-radius: 5px 0 0 5px; margin-left: 0; }
+.usage-bar .seg label:last-child span { border-radius: 0 5px 5px 0; }
+.usage-bar .seg span:hover { border-color: var(--accent); position: relative; }
+.usage-bar .seg input:checked + span { border-color: var(--accent); color: var(--chip-fg); background: var(--chip-bg); position: relative; }
+.usage-bar .seg input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* The range: two compact date fields on one line, with the picker icon. */
+.usage-bar .range { display: inline-flex; align-items: center; gap: .35rem; }
+.usage-bar input[type="date"] { width: 9.5rem; padding: .3rem .5rem; color-scheme: dark; cursor: pointer; }
+.usage-chart { border: 1px solid var(--border); border-radius: 6px; background: var(--panel); padding: .6rem .8rem .3rem; margin-bottom: 1rem; }
+.usage-chart .legend { display: flex; flex-wrap: wrap; gap: .3rem 1rem; font-size: .8rem; color: var(--muted); margin-bottom: .3rem; }
+.usage-chart .legend i { display: inline-block; width: .65rem; height: .65rem; border-radius: 2px; margin-right: .3rem; vertical-align: -1px; }
+.usage-chart svg { width: 100%; height: auto; display: block; }
+.usage-chart text { fill: var(--muted); font: 11px system-ui, sans-serif; }
+.usage-chart line.grid { stroke: var(--border); stroke-width: 1; }
+.usage-chart p { margin: 0 0 .3rem; }
+.series-0 { fill: var(--series-0); background: var(--series-0); }
+.series-1 { fill: var(--series-1); background: var(--series-1); }
+.series-2 { fill: var(--series-2); background: var(--series-2); }
+.series-3 { fill: var(--series-3); background: var(--series-3); }
+.series-4 { fill: var(--series-4); background: var(--series-4); }
+.series-5 { fill: var(--series-5); background: var(--series-5); }
+.series-6 { fill: var(--series-6); background: var(--series-6); }
+.series-7 { fill: var(--series-7); background: var(--series-7); }
+.ns-group > summary .usage { font-variant-numeric: tabular-nums; min-width: 6.5rem; text-align: right; }
+td.usage { text-align: right; font-variant-numeric: tabular-nums; }
+td.usage .errs { color: var(--err); font-size: .8rem; }
+td.usage.zero { color: var(--muted); }
+.ns-group > table th:nth-child(1), .ns-group > table td:nth-child(1) { width: 7%; }
+.ns-group > table th:nth-child(2), .ns-group > table td:nth-child(2) { width: 27%; }
+.ns-group > table th:nth-child(3), .ns-group > table td:nth-child(3) { width: 34%; }
+.ns-group > table th:nth-child(4), .ns-group > table td:nth-child(4) { width: 20%; }
+.ns-group > table th:nth-child(5), .ns-group > table td:nth-child(5) { width: 12%; text-align: right; }
+

@@ -26,10 +26,16 @@
   identity an app mounted twice gives its two copies.
 - `--http <port>`: serve Streamable HTTP at `/mcp` on 127.0.0.1, so a
   user-owned `remote` server (no host code, D7b) can point at this child.
+- `--header <token>`: the `timezone` argument of every tool declares
+  `x-mcp-header: <token>`, so a modern client must mirror it into the
+  `Mcp-Param-<token>` header (schema-cache-per-caller).
 """
 
 import os
 import sys
+from typing import Annotated
+
+from pydantic import Field
 
 from fastmcp import FastMCP
 from fastmcp.server.middleware import Middleware
@@ -41,6 +47,10 @@ TOOLS = [t for t in sys.argv[2].split(",") if t]
 CHILD_ID = sys.argv[sys.argv.index("--id") + 1] if "--id" in sys.argv else APP
 LOG = os.environ.get("MCPFLOW_CALL_LOG")
 HASH_AS = sys.argv[sys.argv.index("--hash-as") + 1] if "--hash-as" in sys.argv else None
+HEADER = sys.argv[sys.argv.index("--header") + 1] if "--header" in sys.argv else None
+Timezone = (
+    Annotated[str, Field(json_schema_extra={"x-mcp-header": HEADER})] if HEADER else str
+)
 
 
 def _record(line: str) -> None:
@@ -60,7 +70,7 @@ mcp.add_middleware(_Count())
 
 
 def _make(name: str):
-    def tool(timezone: str = "UTC") -> str:
+    def tool(timezone: Timezone = "UTC") -> str:
         _record("call:" + name)
         return f"{CHILD_ID}:{name}"
 

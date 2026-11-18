@@ -27,6 +27,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import NotFoundError, ToolError
 from fastmcp.server.providers.addressing import hash_tool
 from fastmcp.server.transforms import Namespace, Visibility
+from hashed_name import hashed_name
 from mcp.server.auth.middleware.auth_context import auth_context_var
 from test_visibility import _seed, admin, call_log, mute, ns_path, tool_path, unmute
 
@@ -619,15 +620,15 @@ def test_admin_session_sees_and_calls_an_action(server_factory):
 def test_hashed_name_of_an_action_is_unknown_to_an_mcp_session(server_factory):
     server, h = start(server_factory, store_spec())
     for name in (
-        f"{hash_tool('fake', 'set_writable')}_set_writable",
-        f"{hash_tool('store', 'set_writable')}_store_set_writable",
-        f"{'0' * 12}_set_writable",
+        hashed_name(hash_tool('fake', 'set_writable'), 'set_writable'),
+        hashed_name(hash_tool('store', 'set_writable'), 'store_set_writable'),
+        hashed_name('0' * 12, 'set_writable'),
         # F1: the hash of the violator `hashed` used to resolve to `hashed` for
         # an mcp session (ProxyProvider matches the hash alone). The
         # `AuthorizedHashProvider` now re-runs the named decision, which the
         # filter refuses for a non-admin caller, so this residual is closed.
-        f"{hash_tool('fake', 'hashed')}_set_writable",
-        f"{hash_tool('fake', 'hashed')}_hashed",
+        hashed_name(hash_tool('fake', 'hashed'), 'set_writable'),
+        hashed_name(hash_tool('fake', 'hashed'), 'hashed'),
     ):
         with pytest.raises(ToolError, match="Unknown tool"):
             call(server.base_url, h["mcp"], name, {"name": "x"})
@@ -646,7 +647,7 @@ def test_hashed_path_honours_scope_and_mute(server_factory):
         with pytest.raises(ToolError, match="Unknown tool"):
             call(server.base_url, token, "store_hashed")
         with pytest.raises(ToolError, match="Unknown tool"):
-            call(server.base_url, token, f"{hash_tool('fake', 'hashed')}_hashed")
+            call(server.base_url, token, hashed_name(hash_tool('fake', 'hashed'), 'hashed'))
     assert call_log(server) == []
 
 
@@ -831,7 +832,7 @@ def test_mcp_session_cannot_reach_a_hash_reachable_violator(server_factory):
     # `AuthorizedHashProvider` closes the residual the old model accepted.
     server, h = start(server_factory, store_spec())
     with pytest.raises(ToolError, match="Unknown tool"):
-        call(server.base_url, h["mcp"], f"{hash_tool('fake', 'hashed')}_hashed")
+        call(server.base_url, h["mcp"], hashed_name(hash_tool('fake', 'hashed'), 'hashed'))
     assert call_log(server) == []
 
 

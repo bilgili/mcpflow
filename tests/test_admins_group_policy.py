@@ -22,6 +22,7 @@ from mcpflow.auth import TokenStore
 from mcpflow.identity import ADMINS_GROUP, LocalIdentityProvider
 from mcpflow.policy import AccessPolicy, RuleStore
 from mcpflow.registry import ServerKey
+from mcpflow.usage import UsageStore
 
 TIME = ServerKey(None, "time")
 NO_EFFECT = ("subject: members of admins skip rule resolution; "
@@ -41,7 +42,7 @@ def world_with_a_rule_on_admins(tmp_path, effect="deny"):
     rules = RuleStore(path)
     rules.load()
     w.rules = rules
-    w.policy = AccessPolicy(w.ident, rules, w.tokens, w.reg)
+    w.policy = AccessPolicy(w.ident, rules, w.tokens, w.reg, UsageStore(tmp_path / "usage.sqlite3"))
     return w, seeded.id
 
 
@@ -98,7 +99,7 @@ def test_the_actor_gate_runs_before_the_provider_checks(tmp_path, name):
     non-Local provider gets `PermissionError`; an admin gets `ValueError`."""
     w = make_world(tmp_path)
     external = SimpleNamespace(kind="keycloak", get_user=w.ident.get_user)
-    policy = AccessPolicy(external, w.rules, w.tokens, w.reg)
+    policy = AccessPolicy(external, w.rules, w.tokens, w.reg, UsageStore(tmp_path / "usage.sqlite3"))
     before = _files(tmp_path)
     with pytest.raises(PermissionError):
         CALLS[name](policy, w.bob)

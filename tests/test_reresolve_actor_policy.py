@@ -22,6 +22,7 @@ from mcpflow.identity import IdentityProvider, LocalIdentityProvider, User
 from mcpflow.policy import ADMIN_REQUIRED, UNKNOWN_ACTOR, AccessPolicy
 from mcpflow.registry import ServerKey
 from mcpflow.supervisor import Supervisor
+from mcpflow.usage import UsageStore
 
 GHOST = User(id="ghost", name="ghost", groups=frozenset({"admins"}), provider="local")
 STORES = ("users.json", "rules.json", "tokens.json", "user_tokens.json")
@@ -250,7 +251,7 @@ class Delegate:
 def test_require_current_reads_the_provider_once(tmp_path):
     w = make_world(tmp_path)
     counting = Delegate(w.ident)
-    policy = AccessPolicy(counting, w.rules, w.tokens, w.reg)
+    policy = AccessPolicy(counting, w.rules, w.tokens, w.reg, UsageStore(tmp_path / "usage.sqlite3"))
     before = _files(tmp_path)
     assert policy.require_current(w.bob) is None
     assert counting.calls == 1
@@ -261,7 +262,8 @@ def test_require_current_reads_the_provider_once(tmp_path):
 def test_a_provider_error_passes_through(tmp_path, name):
     w = seeded(tmp_path)
     boom = RuntimeError("provider down")
-    policy = AccessPolicy(Delegate(w.ident, fail=boom), w.rules, w.tokens, w.reg)
+    policy = AccessPolicy(Delegate(w.ident, fail=boom), w.rules, w.tokens, w.reg,
+                          UsageStore(tmp_path / "usage.sqlite3"))
     before = _files(tmp_path)
     with pytest.raises(RuntimeError) as exc:
         writes(w)[name](policy, w.ident.get_user("alice"))

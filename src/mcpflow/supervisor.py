@@ -85,6 +85,7 @@ from .registry import (
     revision as spec_revision,
 )
 from .sources import SourceStore, total_bytes
+from .usage import UsageAttribution
 
 # The four states a child can hold. `configured` used to sit at the front of
 # this list; nothing ever assigned it, so a reader had to handle a case that
@@ -829,7 +830,10 @@ class Supervisor:
            marked them. It needs no tool inventory, so the visibility mutators
            stay synchronous, and a future admin tool still falls under a muted
            namespace.
-        4. The namespace, which publishes every tool as `mcpflow_<tool>`.
+        4. The usage attribution (usage-stats D3). It sees the bare tool name
+           and writes the call's holder when a tool resolves. It sits outside
+           the scope filter, so a non-admin session resolves nothing here.
+        5. The namespace, which publishes every tool as `mcpflow_<tool>`.
 
         `admin_mcp` imports `api`, and `api` imports this module, so the scope
         filter is imported here and not at module level.
@@ -846,6 +850,7 @@ class Supervisor:
         return (
             provider.wrap_transform(visibility)
             .wrap_transform(Visibility(True, names=set(PINNED_ADMIN_TOOLS)))
+            .wrap_transform(UsageAttribution())
             .wrap_transform(Namespace(RESERVED_NAMESPACE))
         )
 

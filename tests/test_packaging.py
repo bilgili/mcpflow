@@ -94,3 +94,23 @@ def test_image_runs_tini_as_process_one():
     assert json.loads(entrypoint[0].removeprefix("ENTRYPOINT ")) == ["/usr/bin/tini", "-s", "--"]
     assert len(cmd) == 1, f"expected one CMD, got {cmd}"
     assert json.loads(cmd[0].removeprefix("CMD ")) == ["mcpflow", "serve"]
+
+
+def test_fastmcp_floor_carries_the_hashed_lookup_contract():
+    """Scenario from `specs/packaging/spec.md` (The FastMCP floor carries the hashed lookup contract)."""
+    import tomllib
+    from importlib.metadata import version
+
+    deps = tomllib.loads((_ROOT / "pyproject.toml").read_text())["project"]["dependencies"]
+    assert "fastmcp>=4.2.0,<5" in deps, deps
+    assert tuple(int(p) for p in version("fastmcp").split(".")[:2]) >= (4, 2)
+    from fastmcp.server.providers.addressing import (
+        is_app_tool_with_identity,  # noqa: F401
+    )
+
+
+def test_fastmcp_floor_carries_the_hashed_name_format():
+    """Scenario from `specs/packaging/spec.md` (The FastMCP floor carries the hashed name format)."""
+    from fastmcp.server.providers.addressing import hashed_backend_name
+
+    assert hashed_backend_name("app", "tool").startswith("__")

@@ -478,6 +478,7 @@ def test_build_routes_signature():
         "creds",
         "flows",
         "identity",
+        "usage",
     ]
 
 

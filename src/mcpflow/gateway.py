@@ -31,6 +31,7 @@ from .policy import AccessPolicy, RuleStore
 from .registry import Registry
 from .router import CallerRouter
 from .supervisor import Supervisor, install_log_redaction
+from .usage import UsageMiddleware, UsageStore
 from .web import USER_ROUTES, WEB_EXCEPTION_HANDLERS, build_routes
 
 # Bearer-only paths: no cookie, so `SessionGate` exempts them from the
@@ -132,7 +133,10 @@ def build_app(settings: Settings) -> Starlette:
     # reads all four owners and is the one owner of every access decision.
     rules = RuleStore(settings.data_dir / "rules.json")
     rules.load()
-    policy = AccessPolicy(identity, rules, tokens, registry)
+    # The usage store does no file I/O until `start`; the policy forgets a
+    # re-created user through it (D14).
+    usage = UsageStore(settings.data_dir / "usage.sqlite3")
+    policy = AccessPolicy(identity, rules, tokens, registry, usage)
 
     # One credential store and one pending-flow table, shared by the
     # supervisor (the owner of teardown) and the web layer (the owner of the
@@ -156,6 +160,8 @@ def build_app(settings: Settings) -> Starlette:
     # Each new session carries the live instructions of the running children
     # that the session's user may reach.
     gateway.add_middleware(ChildInstructionsMiddleware(supervisor, policy))
+    # Counts each `tools/call` that a child tool answers (D1, D3).
+    gateway.add_middleware(UsageMiddleware(usage, policy))
 
     # Mount the built-in admin server beside the router. The
     # supervisor owns the whole provider chain, the namespace `mcpflow` included,
@@ -168,6 +174,17 @@ def build_app(settings: Settings) -> Starlette:
 
     mcp_app = gateway.http_app(path="/mcp")
 
+    # F1: FastMCP 4.2 keeps one server-wide input-schema cache keyed by the wire
+    # tool name. `ns@user` servers share names, so one caller's listing would decide
+    # another caller's `Mcp-Param-*` check. The SDK hook is not caller-scoped. With
+    # no hook the SDK checks against the caller's own `tools/list`, and
+    # `CallerRouter` owns that view. The guard fires when FastMCP stops setting
+    # the old name (it follows an SDK rename): its hook would then stay live under
+    # the new name. An SDK-only rename leaves the SDK hook unset, which is safe.
+    if not hasattr(gateway._mcp_server, "get_tool_input_schema"):
+        raise RuntimeError("FastMCP no longer has get_tool_input_schema; re-check F1")
+    gateway._mcp_server.get_tool_input_schema = None
+
     async def health(request: Request) -> JSONResponse:
         counts = {"running": 0, "failed": 0, "starting": 0}
         for child in supervisor.children():
@@ -177,12 +194,18 @@ def build_app(settings: Settings) -> Starlette:
 
     @contextlib.asynccontextmanager
     async def lifespan(app: Starlette):
-        async with mcp_app.lifespan(app):
-            await supervisor.startup()
-            try:
-                yield
-            finally:
-                await supervisor.shutdown()
+        # D7: the store outlives the MCP app. Its exit waits for every MCP
+        # request task, so the last `record` runs before the final flush.
+        await usage.start()
+        try:
+            async with mcp_app.lifespan(app):
+                await supervisor.startup()
+                try:
+                    yield
+                finally:
+                    await supervisor.shutdown()
+        finally:
+            await usage.stop()
 
     static_dir = Path(__file__).parent / "static"
 
@@ -200,7 +223,7 @@ def build_app(settings: Settings) -> Starlette:
     app = Starlette(
         routes=[
             Route("/health", health),
-            *build_routes(supervisor, tokens, settings, creds, flows, identity),
+            *build_routes(supervisor, tokens, settings, creds, flows, identity, usage),
             Mount("/static", app=StaticFiles(directory=static_dir), name="static"),
             Mount("/api", app=api_app),
             Mount("/", app=mcp_app),

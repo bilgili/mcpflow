@@ -11,6 +11,7 @@ from mcpflow.auth import TokenStore, hash_password
 from mcpflow.identity import ADMINS_GROUP, LocalIdentityProvider, User
 from mcpflow.policy import AccessPolicy, RuleStore, resolve
 from mcpflow.registry import Registry, ServerKey, ServerSpec, revision
+from mcpflow.usage import UsageStore
 
 
 def _user(uid: str, *groups: str, admin: bool = False) -> User:
@@ -37,7 +38,7 @@ def world(tmp_path):
     reg.add(ServerSpec(namespace="time", kind="npm", package="t"))
     rules = RuleStore(tmp_path / "rules.json")
     rules.load()
-    return AccessPolicy(ident, rules, tokens, reg), ident, tokens, rules, tmp_path
+    return AccessPolicy(ident, rules, tokens, reg, UsageStore(tmp_path / "usage.sqlite3")), ident, tokens, rules, tmp_path
 
 
 def test_resolve_order(world):

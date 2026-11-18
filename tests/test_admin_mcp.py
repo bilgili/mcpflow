@@ -361,13 +361,15 @@ def test_a_reference_with_an_owner_is_not_found_over_mcp(env):
 def test_one_provider_for_the_children(env):
     """One provider for the children. Invariant: NoMcpLeak (the router is the
     only reader of the child table)."""
+    from fastmcp.server.providers import LocalProvider
+
     from mcpflow.router import CallerRouter
 
     providers = env.gateway.providers
     table = env.supervisor.table
     assert table not in providers
     assert all(getattr(p, "_inner", None) is not table for p in providers)
-    added = [p for p in providers if type(p).__name__ != "LocalProvider"]
+    added = [p for p in providers if not isinstance(p, LocalProvider)]
     assert len(added) == 2, providers
     assert sum(isinstance(p, CallerRouter) for p in added) == 1
     admin_provider = next(p for p in added if not isinstance(p, CallerRouter))
@@ -384,7 +386,7 @@ def test_one_provider_for_the_children(env):
         finally:
             auth_context_var.reset(reset)
 
-    local = [p for p in providers if type(p).__name__ == "LocalProvider"]
+    local = [p for p in providers if isinstance(p, LocalProvider)]
     assert all(env.run(names(p)) == set() for p in local)
     assert env.run(names(admin_provider)) >= {"mcpflow_list_servers"}
 

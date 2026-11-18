@@ -41,6 +41,8 @@ from fastmcp.server.transforms.visibility import is_enabled
 from fastmcp.utilities.async_utils import gather
 from fastmcp.utilities.versions import version_sort_key
 
+from . import usage
+
 if TYPE_CHECKING:
     from fastmcp.tools.base import Tool
 
@@ -124,6 +126,13 @@ class CallerRouter(Provider):
         # The protocol part of `Namespace._URI_PATTERN` (`^([^:]+://)`).
         return re.match(rf"[^:]+://{key.namespace}/", ident) is not None
 
+    @staticmethod
+    def _bare(key: ServerKey, name: str) -> str:
+        """The child's own tool name: `name` without the `<namespace>_` prefix.
+        The one bare-name rule of the router; `_passes` filters with it and
+        `_named` attributes with it (usage-stats D2)."""
+        return name[len(key.namespace) + 1 :]
+
     @classmethod
     def _passes(cls, reach: Reach, key: ServerKey, tool: Tool) -> bool:
         """TLA+ `Base`: the child chain does not mute the tool, and the `Reach`
@@ -132,7 +141,7 @@ class CallerRouter(Provider):
         return (
             is_enabled(tool)
             and cls._owns(key, "tool", tool.name)
-            and reach.allows_tool(key, tool.name[len(key.namespace) + 1 :])
+            and reach.allows_tool(key, cls._bare(key, tool.name))
         )
 
     @staticmethod
@@ -204,10 +213,18 @@ class CallerRouter(Provider):
     ) -> tuple[Tool | None, list[ServerKey]]:
         """The named-path decision, which the hash and app paths reuse: the one
         passing tool that publishes `name`, or `None` when none or two do or a
-        failed key may own it. The failed keys come back for `_identity_call`."""
+        failed key may own it. The failed keys come back for `_identity_call`.
+
+        A returned tool attributes the current `tools/call` to its key
+        (usage-stats D1); outside a call `usage.attribute` writes nothing."""
         hits, failed = await self._ask(routed, lambda p: p.get_tool(name, version))
         passed = [(k, t) for k, t in hits if t is not None and self._passes(reach, k, t)]
-        return self._single("tool", name, passed, failed), failed
+        tool = self._single("tool", name, passed, failed)
+        if tool is not None:
+            # `_single` returned a tool, so every passing entry has one key.
+            key = passed[0][0]
+            usage.attribute(key.ref, self._bare(key, tool.name))
+        return tool, failed
 
     async def _identity_call(
         self,

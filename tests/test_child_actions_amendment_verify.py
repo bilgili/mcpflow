@@ -34,6 +34,7 @@ from fastmcp.exceptions import NotFoundError, ToolError
 from fastmcp.server.providers.addressing import hash_tool
 from fastmcp.server.providers.proxy import ProxyProvider
 from fastmcp.server.transforms import Namespace, Visibility
+from hashed_name import hashed_name
 from mcp.server.auth.middleware.auth_context import auth_context_var
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
@@ -352,14 +353,14 @@ LISTED = {
     "muted_action": (False, False), "muted_hashed": (False, False),
 }
 HASHED_NAMES = {
-    "action": [f"{hash_tool('child', 'action')}_action", f"{'0' * 12}_action"],
-    "hashed": [f"{hash_tool('child', 'hashed')}_hashed"],
+    "action": [hashed_name(hash_tool('child', 'action'), 'action'), hashed_name('0' * 12, 'action')],
+    "hashed": [hashed_name(hash_tool('child', 'hashed'), 'hashed')],
     "fakehash": [f"{UPPER}_fakehash", f"{UPPER.lower()}_fakehash"],
-    "half": [f"{hash_tool('child', 'half')}_half"],
-    "nonhex": [f"{hash_tool('child', 'nonhex')}_nonhex"],
-    "short": [f"{hash_tool('child', 'short')}_short"],
-    "long": [f"{hash_tool('child', 'long')}_long"],
-    "muted_hashed": [f"{hash_tool('child', 'muted_hashed')}_muted_hashed"],
+    "half": [hashed_name(hash_tool('child', 'half'), 'half')],
+    "nonhex": [hashed_name(hash_tool('child', 'nonhex'), 'nonhex')],
+    "short": [hashed_name(hash_tool('child', 'short'), 'short')],
+    "long": [hashed_name(hash_tool('child', 'long'), 'long')],
+    "muted_hashed": [hashed_name(hash_tool('child', 'muted_hashed'), 'muted_hashed')],
 }
 
 

@@ -26,6 +26,7 @@ from mcpflow.auth import HashedTokenVerifier, TokenStore, hash_password
 from mcpflow.identity import ADMINS_GROUP, LocalIdentityProvider, User
 from mcpflow.policy import AccessPolicy, GrantRule, RuleStore, resolve
 from mcpflow.registry import Registry, ServerKey, ServerSpec, revision
+from mcpflow.usage import UsageStore
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -205,7 +206,7 @@ def make_world(tmp_path: Path, servers=(("time", None, True),)):
             reg.set_approved_revision(spec.key, revision(spec))
     rules = RuleStore(tmp_path / "rules.json")
     rules.load()
-    policy = AccessPolicy(ident, rules, tokens, reg)
+    policy = AccessPolicy(ident, rules, tokens, reg, UsageStore(tmp_path / "usage.sqlite3"))
     return SimpleNamespace(
         policy=policy, ident=ident, tokens=tokens, reg=reg, rules=rules,
         root=ident.get_user("admin"), path=tmp_path,
@@ -704,7 +705,7 @@ def test_a_non_local_provider_refuses_creates_and_resets(tmp_path):
     """The Local-provider check: an external provider owns its own users."""
     w = make_world(tmp_path)
     external = SimpleNamespace(kind="keycloak", get_user=w.ident.get_user)
-    policy = AccessPolicy(external, w.rules, w.tokens, w.reg)
+    policy = AccessPolicy(external, w.rules, w.tokens, w.reg, UsageStore(tmp_path / "usage.sqlite3"))
     with pytest.raises(ValueError):
         policy.local_identity()
     with pytest.raises(ValueError):
@@ -719,7 +720,7 @@ def test_a_non_local_provider_refuses_remove_member_and_writes_nothing(tmp_path)
     """`remove_member` checks the admin first, then the Local provider."""
     w = make_world(tmp_path)
     external = SimpleNamespace(kind="keycloak", get_user=w.ident.get_user)
-    policy = AccessPolicy(external, w.rules, w.tokens, w.reg)
+    policy = AccessPolicy(external, w.rules, w.tokens, w.reg, UsageStore(tmp_path / "usage.sqlite3"))
     before = _files(tmp_path)
     with pytest.raises(PermissionError):
         policy.remove_member(w.alice, "eng", "alice")
@@ -732,7 +733,7 @@ def test_a_non_local_provider_refuses_remove_member_and_writes_nothing(tmp_path)
 def test_the_admin_check_runs_before_the_provider_check(tmp_path):
     w = make_world(tmp_path)
     external = SimpleNamespace(kind="keycloak", get_user=lambda uid: None)
-    policy = AccessPolicy(external, w.rules, w.tokens, w.reg)
+    policy = AccessPolicy(external, w.rules, w.tokens, w.reg, UsageStore(tmp_path / "usage.sqlite3"))
     with pytest.raises(PermissionError):
         policy.create_user(w.alice, "dave")
     with pytest.raises(PermissionError):

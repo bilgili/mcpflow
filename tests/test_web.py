@@ -251,7 +251,11 @@ async def test_dashboard_marks_a_failed_child(tmp_path):
 
     identity = LocalIdentityProvider(data_dir / "users.json", settings.admin_password_hash)
     identity.load()
-    routes = build_routes(sup, tokens, settings, sup.creds, sup.flows, identity)
+    from mcpflow.usage import UsageStore
+
+    routes = build_routes(
+        sup, tokens, settings, sup.creds, sup.flows, identity, UsageStore(data_dir / "usage.db")
+    )
     app = Starlette(
         routes=routes,
         middleware=[

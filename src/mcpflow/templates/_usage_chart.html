@@ -1,0 +1,28 @@
+{# The usage chart: server-rendered SVG, no script (design D10). `chart` is a
+   `usage.ChartView`. The `<title>` text is built here with `count_label`, so
+   the count format keeps one owner. #}
+<div class="usage-chart">
+  {% if chart.degraded %}<p class="muted">Usage is not available.</p>{% endif %}
+  {% if chart.empty %}
+  <p class="muted">No calls in this range.</p>
+  {% else %}
+  <div class="legend">
+    {% for row in chart.legend %}
+    <span><i class="series-{{ row.slot }}"></i>{{ row.label }} {{ row.calls | count_label('') }}</span>
+    {% endfor %}
+  </div>
+  <svg viewBox="0 0 {{ chart.width }} {{ chart.height }}" role="img"
+       aria-label="Calls per {{ range.bucket }} per server, {{ range.start.isoformat() }} to {{ range.end.isoformat() }}">
+    {% for t in chart.ticks %}
+    <line x1="{{ chart.plot_left }}" x2="{{ chart.width }}" y1="{{ t.y }}" y2="{{ t.y }}" class="grid"/>
+    <text x="{{ chart.plot_left - 6 }}" y="{{ t.y + 4 }}" text-anchor="end">{{ t.value | count_label('') }}</text>
+    {% endfor %}
+    {% for b in chart.bars %}
+    <rect x="{{ b.x }}" y="{{ b.y }}" width="{{ b.width }}" height="{{ b.height }}" class="series-{{ b.slot }}"><title>{{ b.label }}, {{ b.day.isoformat() }}: {{ b.calls | count_label('call') }}</title></rect>
+    {% endfor %}
+    {% for l in chart.xlabels %}
+    <text x="{{ l.x }}" y="{{ chart.height - 6 }}" text-anchor="middle">{{ l.day.isoformat()[5:] }}</text>
+    {% endfor %}
+  </svg>
+  {% endif %}
+</div>

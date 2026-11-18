@@ -24,6 +24,7 @@ from conftest import ADMIN_ACTOR
 from fastmcp.exceptions import NotFoundError, ToolError
 from fastmcp.server.auth.auth import AccessToken
 from fastmcp.server.providers.addressing import hash_tool
+from hashed_name import hashed_name
 from mcp.server.auth.middleware.auth_context import auth_context_var
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from router_live import Child, start_live
@@ -80,7 +81,7 @@ def router_of(live) -> CallerRouter:
 
 
 def hashed(app: str, tool: str) -> str:
-    return f"{hash_tool(app, tool)}_{tool}"
+    return hashed_name(hash_tool(app, tool), tool)
 
 
 # --- 10.10 The list path, the named call path, and the policy layers ----------
@@ -991,7 +992,7 @@ def test_a_tool_sharing_the_listed_name_does_not_replace_the_found_tool():
         gateway = FastMCP("gw")
         gateway.add_provider(_router(ga=provider))
         try:
-            return (await gateway.call_tool(f"{ident}_x", {})).structured_content
+            return (await gateway.call_tool(hashed_name(ident, "x"), {})).structured_content
         except (NotFoundError, ToolError) as exc:
             assert "Unknown tool" in str(exc), exc
             return None

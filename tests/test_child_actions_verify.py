@@ -20,6 +20,7 @@ from action_browser import action_post
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.providers.addressing import hash_tool
+from hashed_name import hashed_name
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
 from test_child_actions import PAGE, SECRET, call, cards, list_names, start, store_spec
@@ -159,8 +160,8 @@ def test_no_hashed_name_reaches_a_conforming_action(server_factory):
         for app in apps:
             for tool in (action, f"store_{action}"):
                 digest = hash_tool(app, tool)
-                names += [f"{digest}_{action}", f"{digest}_store_{action}"]
-        names += [f"{'f' * 12}_{action}", f"{'0' * 12}_store_{action}"]
+                names += [hashed_name(digest, action), hashed_name(digest, f"store_{action}")]
+        names += [hashed_name('f' * 12, action), hashed_name('0' * 12, f"store_{action}")]
     for name in names:
         with pytest.raises(ToolError, match="Unknown tool"):
             call(server.base_url, h["mcp"], name, {"name": "x"})

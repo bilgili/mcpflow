@@ -27,6 +27,7 @@ from test_policy import make_world
 from mcpflow.auth import TokenStore, hash_password
 from mcpflow.identity import LocalIdentityProvider
 from mcpflow.policy import AccessPolicy
+from mcpflow.usage import UsageStore
 
 STORES = ("users.json", "tokens.json", "user_tokens.json")
 BOOTSTRAP_TEXT = "cannot issue a setup code for the bootstrap user admin"
@@ -189,7 +190,7 @@ def _refused_reset_case(w, case):
     else:
         assert case == "non-local"
         policy = AccessPolicy(SimpleNamespace(kind="keycloak", get_user=w.ident.get_user),
-                              w.rules, w.tokens, w.reg)
+                              w.rules, w.tokens, w.reg, UsageStore(w.path / "usage.sqlite3"))
         exc = ValueError
     return policy, actor, target, exc
 

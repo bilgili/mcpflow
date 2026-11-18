@@ -208,6 +208,7 @@ def make_policy(data_dir: Path, registry: Registry):
     from mcpflow.auth import TokenStore, hash_password
     from mcpflow.identity import LocalIdentityProvider
     from mcpflow.policy import AccessPolicy, RuleStore
+    from mcpflow.usage import UsageStore
 
     identity = LocalIdentityProvider(
         data_dir / "users.json", hash_password("secret", iterations=1000)
@@ -217,7 +218,9 @@ def make_policy(data_dir: Path, registry: Registry):
     tokens.load()
     rules = RuleStore(data_dir / "rules.json")
     rules.load()
-    return AccessPolicy(identity, rules, tokens, registry)
+    return AccessPolicy(
+        identity, rules, tokens, registry, UsageStore(data_dir / "usage.sqlite3")
+    )
 
 
 def admin_reach(sup, surface: str = "dashboard"):

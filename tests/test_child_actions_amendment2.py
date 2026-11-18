@@ -27,6 +27,7 @@ from action_browser import action_post, control
 from conftest import ADMIN_ACTOR, fake_child_spec, seed_registry
 from fastmcp.exceptions import ToolError
 from fastmcp.server.providers.addressing import hash_tool
+from hashed_name import hashed_name
 from test_child_actions import (
     PAGE,
     SECRET,
@@ -66,14 +67,14 @@ def test_f1_4_hash_reachable_violator_hidden_and_refused(server_factory):
     server, h = start(server_factory, store_spec())
     assert "store_hashed" not in list_names(server.base_url, h["mcp"])
     with pytest.raises(ToolError, match="Unknown tool"):
-        call(server.base_url, h["mcp"], f"{HASH}_hashed")
+        call(server.base_url, h["mcp"], hashed_name(HASH, 'hashed'))
     assert call_log(server) == []
 
 
 # 15.F1.5 -- scenario "An admin runs a hash-reachable tagged tool".
 def test_f1_5_admin_runs_hash_reachable_tagged_tool(server_factory):
     server, h = start(server_factory, store_spec())
-    assert call(server.base_url, h["admin"], f"{HASH}_hashed") == "hashed"
+    assert call(server.base_url, h["admin"], hashed_name(HASH, 'hashed')) == "hashed"
     assert call_log(server) == ["hashed"]
 
 
@@ -83,7 +84,7 @@ def test_f1_6_hashed_path_honours_a_mute(server_factory):
     with admin(server) as client:
         mute(client, tool_path("store"), tool="hashed")
     with pytest.raises(ToolError, match="Unknown tool"):
-        call(server.base_url, h["admin"], f"{HASH}_hashed")
+        call(server.base_url, h["admin"], hashed_name(HASH, 'hashed'))
     assert call_log(server) == []
 
 
@@ -195,7 +196,7 @@ def test_f2_14_hash_address_of_a_tagged_tool_is_closed_for_mcp(server_factory):
     server, h = start(server_factory, store_spec())
     assert "store_hashed" not in list_names(server.base_url, h["mcp"])
     with pytest.raises(ToolError, match="Unknown tool"):
-        call(server.base_url, h["mcp"], f"{HASH}_hashed")
+        call(server.base_url, h["mcp"], hashed_name(HASH, 'hashed'))
     assert call_log(server) == []
 
 

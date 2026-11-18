@@ -278,7 +278,7 @@ class AuthorizedHashProvider(Provider):
     This provider wraps the whole child chain and delegates every ordinary
     method to it, so the named `list_tools` and `get_tool` are unchanged.
 
-    `FastMCP.call_tool` resolves a `<hash>_<name>` call through
+    `FastMCP.call_tool` resolves a `__<hash>_<name>` call through
     `get_tool_by_hash`. Since FastMCP 4.0.11 that is a template: the chain's
     own template applies the namespace transform, the visibility mark, and
     `ActionScopeFilter` once, and returns the transformed tool. This provider

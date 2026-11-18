@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import json
 import logging
 import re
@@ -17,8 +18,10 @@ import secrets
 import shlex
 import time
 from dataclasses import dataclass, replace
+from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
+from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 from jinja2 import Environment, FileSystemLoader, select_autoescape
@@ -34,6 +37,7 @@ from starlette.responses import (
 from starlette.routing import BaseRoute, Route
 
 from . import oauth as _oauth
+from . import usage as _usage
 from .actions import (
     ActionView,
     FormField,
@@ -74,10 +78,12 @@ from .supervisor import LeaseRefused, RevisionConflict, Supervisor
 
 if TYPE_CHECKING:
     from .identity import IdentityProvider
+    from .usage import UsageRange, UsageStore
 
 logger = logging.getLogger(__name__)
 
 _TEMPLATES = Path(__file__).parent / "templates"
+_STYLE = Path(__file__).parent / "static" / "style.css"
 
 # One path segment, the same as Starlette's default `{ref}` converter. The
 # gate only admits the shape; `server_key` owns the parse and the ownership.
@@ -291,6 +297,26 @@ def _err_refusal(request: Request, exc: Exception) -> Response:
 WEB_EXCEPTION_HANDLERS: Final = {PermissionError: _err_refusal}
 
 
+def count_label(n: int, word: str) -> str:
+    """The one owner of the count format (D11): `3,412 calls`, `1 call`."""
+    num = f"{n:,}"
+    if not word:
+        return num
+    return f"{num} {word if n == 1 else word + 's'}"
+
+
+def usage_range(request: Request) -> UsageRange:
+    """The usage range of a request (D9): its own query when it holds a range
+    field, else the query of the page that sent it (`HX-Current-URL`). It only
+    selects a display range and grants nothing."""
+    params = dict(request.query_params)
+    if not params.keys() & {"from", "to", "bucket"}:
+        current = request.headers.get("HX-Current-URL", "")
+        params = dict(parse_qsl(urlsplit(current).query))
+    # The range is in the local calendar of the gateway (TZ), by design.
+    return _usage.parse_range(params, date.today())  # noqa: DTZ011
+
+
 def build_routes(
     supervisor: Supervisor,
     tokens: TokenStore,
@@ -298,11 +324,15 @@ def build_routes(
     creds: CredStore,
     flows: PendingFlows,
     identity: IdentityProvider,
+    usage: UsageStore,
 ) -> list[BaseRoute]:
     env = Environment(
         loader=FileSystemLoader(str(_TEMPLATES)),
         autoescape=select_autoescape(),
     )
+    env.filters["count_label"] = count_label
+    # A new stylesheet gets a new URL, so no browser keeps a stale copy.
+    env.globals["static_v"] = hashlib.sha256(_STYLE.read_bytes()).hexdigest()[:12]
     action_snapshots: dict[str, _PageSnapshot] = {}
 
     def render(
@@ -521,6 +551,7 @@ def build_routes(
         # Right after the rows, with no await between: the poll mark sees the
         # probe this render started, and the rows and the mark are one state.
         probing = supervisor.probing(reach)
+        totals = await usage.totals(usage_range(request), reach)
         # The groups come from the same `Reach` as the rows, so a non-admin
         # user gets no group for a key outside it: their own servers in every
         # approval state and their CallerView, nothing else (D6).
@@ -530,6 +561,9 @@ def build_routes(
             "_tools_tree.html",
             request,
             tools=views,
+            usage=totals.by_tool,
+            usage_by_ref=totals.by_server,
+            usage_degraded=totals.degraded,
             children=children,
             probing=probing,
             # The policy owns "may this user manage this server"; the template
@@ -553,7 +587,13 @@ def build_routes(
         # The shell only. The page loads the tree from `/tools/tree` after it
         # paints. The tree reads the snapshots and awaits no child, and that
         # load is a probing render: it starts the probe of a stale snapshot.
-        return render("dashboard.html", request)
+        # The shell awaits one SQLite read (the chart series) and no child.
+        reach = supervisor.policy.keys_for(request.state.user, "dashboard")
+        rng = usage_range(request)
+        series = await usage.series(rng, reach)
+        return render(
+            "dashboard.html", request, range=rng, chart=_usage.chart_view(series)
+        )
 
     async def tools_tree_partial(request: Request) -> Response:
         """The load and poll route. `poll=1` only skips a probe; the tree

@@ -41,6 +41,7 @@ from mcpflow.registry import (
     redact_spec,
     revision,
 )
+from mcpflow.usage import UsageStore
 
 SHA = "0123456789abcdef0123456789abcdef01234567"
 
@@ -79,7 +80,8 @@ def _world(tmp_path: Path, *, servers: int | None = None, tokens: int | None = N
     rules = RuleStore(tmp_path / "rules.json")
     rules.load()
     return SimpleNamespace(
-        policy=AccessPolicy(ident, rules, store, reg), tokens=store, reg=reg,
+        policy=AccessPolicy(ident, rules, store, reg, UsageStore(tmp_path / "usage.sqlite3")),
+        tokens=store, reg=reg,
         root=ident.get_user("admin"), alice=ident.get_user("alice"),
         bob=ident.get_user("bob"),
     )

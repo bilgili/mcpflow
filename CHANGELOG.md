@@ -6,10 +6,12 @@ This file records the user-visible changes of MCP Flow, a gateway for Model Cont
 
 ### Fixed
 
+- The `Mcp-Param` header check of a modern `tools/call` now uses the tool list of the caller. Before, the listing of one user could refuse a good call of another user, or skip the check. Two answers change for a modern client. A call without a declared header, sent before any listing, now gets HTTP 400. A caller that does not reach the tool name now gets the unknown-tool error in place of HTTP 400.
 - The Docker image runs `tini` as process 1 (`ENTRYPOINT ["/usr/bin/tini", "-s", "--"]`). `tini` reaps orphan processes. Before, an orphan of a child server (for example a detached `git maintenance`) stayed as a zombie, and the zombies exhausted the container process limit.
 
 ### Changed
 
+- The package now needs `fastmcp` 4.2.0 or newer, and older than 5. FastMCP 4.2.0 changes the hashed name of an app tool. The name was `<hash>_<tool>`. The name is now `__<hash>_<tool>`. The gateway reads the name from FastMCP, so the gateway code does not change. A client that builds the hashed name by hand must add the `__` prefix. The Docker image installs `fastmcp` unpinned, so a new image takes the new format.
 - A stop by `SIGTERM` now exits the container with status 143. Before, it exited with status 0, because the gateway was process 1.
 
 ## 2026-10-13

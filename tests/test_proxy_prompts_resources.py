@@ -60,7 +60,7 @@ def resource_uris(base: str, token: str) -> list[str]:
 
 def template_uris(base: str, token: str) -> list[str]:
     async def fn(c):
-        return [t.uriTemplate for t in await c.list_resource_templates()]
+        return [t.uri_template for t in await c.list_resource_templates()]
 
     return _with_client(base, token, fn)
 

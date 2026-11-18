@@ -30,6 +30,7 @@ from mcpflow.oauth import CredStore, PendingFlows
 from mcpflow.policy import AccessPolicy, RuleStore
 from mcpflow.registry import Registry, ServerKey, ServerSpec
 from mcpflow.supervisor import Supervisor
+from mcpflow.usage import UsageStore
 
 
 def _user(uid: str, admin: bool = False) -> User:
@@ -63,7 +64,8 @@ class Env:
         tokens.load()
         self.rules = RuleStore(data_dir / "rules.json")
         self.rules.load()
-        self.policy = AccessPolicy(ident, self.rules, tokens, self.reg)
+        self.policy = AccessPolicy(ident, self.rules, tokens, self.reg,
+                                   UsageStore(data_dir / "usage.sqlite3"))
         self.sup = Supervisor(self.reg, make_settings(data_dir), CredStore(data_dir),
                               PendingFlows(), self.policy)
 

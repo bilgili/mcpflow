@@ -14,10 +14,11 @@ import httpx
 import pytest
 from fastmcp.exceptions import ToolError
 from fastmcp.server.providers.addressing import hash_tool
+from hashed_name import hashed_name
 from router_live import Child, start_live
 
 DUP = (Child("dup", "crm", ("left_save", "right_save"), args=("--hash-as", "save")),)
-SAVE = f"{hash_tool('crm', 'save')}_save"
+SAVE = hashed_name(hash_tool('crm', 'save'), 'save')
 
 
 @pytest.fixture(scope="module")

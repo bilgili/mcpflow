@@ -46,11 +46,13 @@
     only on a server the user manages; a granted shared server has no window
     for them and shows its allowed tools only.
 #}
+{% set empty_counts = {'calls': 0, 'errors': 0} %}
 {% set admin = current_user is not none and current_user.is_admin %}
 {% set polling = probing or (children | selectattr('status', 'equalto', 'starting') | list | length > 0) %}
 <div id="tools-tree" hx-disinherit="*"
      {% if polling %}hx-get="/tools/tree?poll=1" hx-trigger="every 3s"
      hx-target="#tools-tree" hx-swap="outerHTML" hx-sync="this:drop"{% endif %}>
+{% if usage_degraded %}<p class="muted">Usage is not available.</p>{% endif %}
 {% if admin %}
 <form class="vis-root" hx-post="/visibility/root" hx-target="#tools-tree"
       hx-swap="outerHTML" hx-sync="#tools-tree:replace">
@@ -70,6 +72,7 @@
     <span class="ns">mcpflow</span>
     <span class="count">{{ mcpflow_shown }} of {{ mcpflow_tools | length }} tools</span>
     <span class="status status-builtin">built-in</span>
+    <span class="usage">{{ (usage_by_ref.get('mcpflow') or empty_counts).calls | count_label('call') }}</span>
   </summary>
   <form class="vis-ns" hx-post="/visibility/namespaces/mcpflow"
         hx-target="#tools-tree" hx-swap="outerHTML"
@@ -82,7 +85,7 @@
   </form>
   <table>
     <thead>
-      <tr><th>Publish</th><th>Tool</th><th>Description</th><th>Schema</th></tr>
+      <tr><th>Publish</th><th>Tool</th><th>Description</th><th>Schema</th><th>Usage</th></tr>
     </thead>
     <tbody>
       {% for t in mcpflow_tools %}
@@ -104,6 +107,8 @@
         <td><code>{{ t.name }}</code>{% if t.pinned %} <span class="pin">pinned</span>{% endif %}</td>
         <td>{{ t.description }}</td>
         <td>{{ t.schema_summary }}</td>
+        {% set u = usage.get((t.ref, t.tool)) %}
+        <td class="usage{% if not u %} zero{% endif %}">{{ (u.calls if u else 0) | count_label('') }}{% if u and u.errors %}<div class="errs">{{ u.errors | count_label('error') }}</div>{% endif %}</td>
       </tr>
       {% endfor %}
     </tbody>
@@ -124,6 +129,7 @@
     <span class="status status-{{ c.status }}">{{ c.status }}</span>
     {% if c.spec.approval == 'pending' %}<span class="awaiting">awaiting approval</span>{% endif %}
     {% if c.spec.key.ref in awaiting %}<span class="awaiting" title="Delete this server and connect again to retry.">awaiting authorization</span>{% endif %}
+    <span class="usage">{{ (usage_by_ref.get(ns) or empty_counts).calls | count_label('call') }}</span>
   </summary>
   {# The server row. The command shows the source redacted; the raw value
      lives in the window's form input only. The row holds no action other
@@ -158,7 +164,7 @@
   {% if ns_tools %}
   <table>
     <thead>
-      <tr>{% if admin %}<th>Publish</th>{% endif %}<th>Tool</th><th>Description</th><th>Schema</th></tr>
+      <tr>{% if admin %}<th>Publish</th>{% endif %}<th>Tool</th><th>Description</th><th>Schema</th><th>Usage</th></tr>
     </thead>
     <tbody>
       {% for t in ns_tools %}
@@ -178,6 +184,8 @@
         <td><code>{{ t.name }}</code></td>
         <td>{{ t.description }}</td>
         <td>{{ t.schema_summary }}</td>
+        {% set u = usage.get((t.ref, t.tool)) %}
+        <td class="usage{% if not u %} zero{% endif %}">{{ (u.calls if u else 0) | count_label('') }}{% if u and u.errors %}<div class="errs">{{ u.errors | count_label('error') }}</div>{% endif %}</td>
       </tr>
       {% endfor %}
     </tbody>

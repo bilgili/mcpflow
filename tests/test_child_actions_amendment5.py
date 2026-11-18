@@ -109,7 +109,7 @@ def harness(make_supervisor, monkeypatch):
             raise state.error
 
     monkeypatch.setattr(sup, "_lease", lease)
-    routes = build_routes(sup, None, sup.settings, None, None, None)
+    routes = build_routes(sup, None, sup.settings, None, None, None, None)
     endpoint = next(r.endpoint for r in routes if r.path.endswith("/actions/{action}"))
     snapshots = inspect.getclosurevars(endpoint).nonlocals["action_snapshots"]
     with TestClient(Starlette(routes=routes, middleware=[Middleware(_AsAdmin)])) as client:

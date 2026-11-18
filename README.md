@@ -121,7 +121,7 @@ full sign-in page, not a sign-in form inside the tool tree. A plain browser
 ## Install
 
 Install the package with pip. The package needs Python 3.12 or newer. The package
-needs `fastmcp` 4.1.0 or newer, and older than 5. Pip installs it for you. The
+needs `fastmcp` 4.2.0 or newer, and older than 5. Pip installs it for you. The
 source is at `https://github.com/bilgili/mcpflow`.
 
 ```sh
@@ -194,6 +194,8 @@ command builds the wheel and passes it to Docker through a named build context.
 | `MAX_USER_TOKENS` | `10` | maximum count of tokens that one non-admin user holds; `0` allows none; an admin mint has no limit |
 | `UV_CACHE_DIR` | Docker: `/data/cache/uv` | uvx cache |
 | `npm_config_cache` | Docker: `/data/cache/npm` | npx cache |
+
+The usage chart and the usage counts on the dashboard group calls by local day. The gateway reads the `TZ` variable of the container for the local day, and uses UTC when `TZ` is not set.
 
 A child's `cache_ttl` in `servers.json` or the form overrides it; `0` disables the cache for that child.
 

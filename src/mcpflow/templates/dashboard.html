@@ -6,6 +6,34 @@
      hx-target="#detail" hx-swap="innerHTML">Add server</a>
 </div>
 
+{# The usage bar is a plain GET form: it works without JavaScript and keeps the
+   range in the page URL (design D9). It carries no `hx-*` attribute. #}
+<form class="usage-bar" method="get" action="/">
+  <span class="small">Usage</span>
+  {# The bucket is a radio group, so every submit (Apply, or Enter in a date
+     field) sends the checked bucket. A change submits the form at once. #}
+  <span class="seg" role="radiogroup" aria-label="Bar size">
+    {% for value, label in (('day', 'Daily'), ('week', 'Weekly'), ('month', 'Monthly')) %}
+    <label><input type="radio" name="bucket" value="{{ value }}"
+                  {% if range.bucket == value %}checked{% endif %}
+                  onchange="this.form.requestSubmit()"><span>{{ label }}</span></label>
+    {% endfor %}
+  </span>
+  {# The two native date fields are the range. Each one opens the browser's
+     date picker on a click; the field also takes typed dates. #}
+  <span class="range">
+    <input type="date" name="from" value="{{ range.start.isoformat() }}"
+           aria-label="From"
+           onclick="this.showPicker && this.showPicker()">
+    <span class="small">–</span>
+    <input type="date" name="to" value="{{ range.end.isoformat() }}"
+           aria-label="To" onclick="this.showPicker && this.showPicker()">
+  </span>
+  <button type="submit">Apply</button>
+</form>
+
+{% include "_usage_chart.html" %}
+
 {# The placeholder takes the tree's id, so the first answer of `/tools/tree`
    replaces it like any later swap, and the open-state script below needs no
    special case. A failed load leaves a message, not a stuck placeholder. #}
@@ -14,7 +42,7 @@
      hx-on::response-error="this.textContent = 'Could not load the tools. Reload the page.'"
      hx-on::send-error="this.textContent = 'Could not load the tools. Reload the page.'">
   <p class="muted">Loading tools…</p>
-  <noscript><p><a href="/tools/tree">Open the tool list</a></p></noscript>
+  <noscript><p><a href="/tools/tree?from={{ range.start.isoformat() }}&to={{ range.end.isoformat() }}&bucket={{ range.bucket }}">Open the tool list</a></p></noscript>
 </div>
 
 {# The server window and the add-server window land here. The dialog sits
